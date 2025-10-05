@@ -1,0 +1,26 @@
+# /etc/systemd/system/kiosk-monitor.service
+[Unit]
+Description=Kiosk Monitor Watchdog
+Documentation=https://github.com/extremeshok/kiosk-monitor
+After=network-online.target graphical.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=spaceman
+Environment=GUI_USER=spaceman
+Environment=BROWSER=chromium
+Environment=DISPLAY=:2
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+EnvironmentFile=-/etc/kiosk-monitor/kiosk-monitor.conf
+ExecStart=/usr/local/bin/kiosk-monitor.sh
+ExecStop=/bin/kill -s TERM $MAINPID
+Restart=always
+RestartSec=5
+SyslogIdentifier=kiosk-monitor
+StandardOutput=journal
+StandardError=journal
+SuccessExitStatus=0 130 143
+
+[Install]
+WantedBy=multi-user.target

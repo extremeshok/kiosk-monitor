@@ -1,0 +1,30 @@
+# kiosk-monitor configuration
+# Copy to /etc/kiosk-monitor/kiosk-monitor.conf and adjust values as needed.
+
+URL="http://192.168.3.222:30059/?Birdseye"
+GUI_USER=""          # set to the desktop user if auto-detection fails
+BROWSER="chromium"    # set to "firefox" to use Mozilla Firefox
+# CHROMIUM_BIN="/usr/bin/chromium-browser"
+# FIREFOX_BIN="/usr/bin/firefox"
+DEBUG=false
+PROFILE_ROOT=""       # override kiosk profile directory if needed
+WAIT_FOR_URL=true
+CHROME_LAUNCH_DELAY=3
+CHROME_READY_DELAY=2
+PROFILE_TMPFS=false
+PROFILE_TMPFS_PATH="/dev/shm/kiosk-monitor"
+PROFILE_SYNC_BACK=false
+PROFILE_TMPFS_PURGE=false
+PROFILE_ARCHIVE=""
+PROFILE_SYNC_INTERVAL=0
+PREWARM_ENABLED=true
+PREWARM_PATHS=""
+PREWARM_MAX_FILES=512
+PREWARM_SLICE_SIZE=262144
+SESSION_READY_DELAY=0
+SESSION_READY_CMD=""
+SESSION_READY_TIMEOUT=0
+LOCK_FILE="/var/lock/kiosk-monitor.lock"
+INSTALL_DIR="/usr/local/bin"
+SERVICE_PATH="/etc/systemd/system/kiosk-monitor.service"
+BASE_URL="https://raw.githubusercontent.com/extremeshok/kiosk-monitor/main"
