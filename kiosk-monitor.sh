@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 5.3.0
+# kiosk-monitor.sh :: version 5.3.1
 #======================================================================
 # Monitors a Chromium or Firefox kiosk session on Raspberry Pi:
 #  - Launches the browser in fullscreen (kiosk‑style) to a specified URL
@@ -81,7 +81,7 @@ else
   set --
 fi
 
-SCRIPT_VERSION="5.3.0"
+SCRIPT_VERSION="5.3.1"
 
 CONFIG_DIR_DEFAULT="/etc/kiosk-monitor"
 CONFIG_DIR_ENV="${CONFIG_DIR:-}"
