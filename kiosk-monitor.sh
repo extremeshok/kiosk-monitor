@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 5.0.0
+# kiosk-monitor.sh :: version 5.2.1
 #======================================================================
 # Monitors a Chromium or Firefox kiosk session on Raspberry Pi:
 #  - Launches the browser in fullscreen (kiosk‑style) to a specified URL
@@ -28,10 +28,11 @@
 # Usage:
 #   ./kiosk-monitor.sh --install
 #   ./kiosk-monitor.sh --help
+#   ./kiosk-monitor.sh --reconfig
 #======================================================================
 # Configuration:
 #   Override behaviour via /etc/kiosk-monitor/kiosk-monitor.conf (shell-style) or environment vars.
-#
+#   --reconfig will update/create a new configuration file
 # ======================================================================
 
 # requires:
@@ -39,13 +40,57 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="5.0.0"
+CONFIG_FILE_OVERRIDE=""
+CONFIG_ARGV=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --config=*)
+      CONFIG_FILE_OVERRIDE="${1#--config=}"
+      shift
+      continue
+      ;;
+    --config)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo "Error: --config requires a path" >&2
+        exit 1
+      fi
+      CONFIG_FILE_OVERRIDE="$1"
+      shift
+      continue
+      ;;
+    --)
+      CONFIG_ARGV+=("$1")
+      shift
+      while [ "$#" -gt 0 ]; do
+        CONFIG_ARGV+=("$1")
+        shift
+      done
+      break
+      ;;
+    *)
+      CONFIG_ARGV+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [ "${#CONFIG_ARGV[@]}" -gt 0 ]; then
+  set -- "${CONFIG_ARGV[@]}"
+else
+  set --
+fi
+
+SCRIPT_VERSION="5.2.1"
 
 CONFIG_DIR_DEFAULT="/etc/kiosk-monitor"
 CONFIG_DIR_ENV="${CONFIG_DIR:-}"
 CONFIG_FILE_ENV="${CONFIG_FILE:-}"
 
-if [ -n "$CONFIG_FILE_ENV" ]; then
+if [ -n "$CONFIG_FILE_OVERRIDE" ]; then
+  CONFIG_FILE="$CONFIG_FILE_OVERRIDE"
+  CONFIG_DIR=$(dirname "$CONFIG_FILE")
+elif [ -n "$CONFIG_FILE_ENV" ]; then
   CONFIG_FILE="$CONFIG_FILE_ENV"
   if [ -n "$CONFIG_DIR_ENV" ]; then
     CONFIG_DIR="$CONFIG_DIR_ENV"
@@ -72,25 +117,54 @@ SERVICE_PATH="${SERVICE_PATH:-/etc/systemd/system/kiosk-monitor.service}"
 LOCK_FILE="${LOCK_FILE:-/var/lock/kiosk-monitor.lock}"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 WAIT_FOR_URL="${WAIT_FOR_URL:-true}"
-CHROME_LAUNCH_DELAY="${CHROME_LAUNCH_DELAY:-3}"
-CHROME_READY_DELAY="${CHROME_READY_DELAY:-2}"
+if [ -n "${CHROME_LAUNCH_DELAY:-}" ] && [ -z "${CHROME_LAUNCH_DELAY_SECONDS:-}" ]; then
+  CHROME_LAUNCH_DELAY_SECONDS="$CHROME_LAUNCH_DELAY"
+fi
+if [ -n "${CHROME_READY_DELAY:-}" ] && [ -z "${CHROME_READY_DELAY_SECONDS:-}" ]; then
+  CHROME_READY_DELAY_SECONDS="$CHROME_READY_DELAY"
+fi
+CHROME_LAUNCH_DELAY_SECONDS="${CHROME_LAUNCH_DELAY_SECONDS:-30}"
+CHROME_READY_DELAY_SECONDS="${CHROME_READY_DELAY_SECONDS:-20}"
 PROFILE_TMPFS="${PROFILE_TMPFS:-false}"
 PROFILE_TMPFS_PATH="${PROFILE_TMPFS_PATH:-/dev/shm/kiosk-monitor}"
 PROFILE_SYNC_BACK="${PROFILE_SYNC_BACK:-false}"
 PROFILE_ARCHIVE="${PROFILE_ARCHIVE:-}"
 PROFILE_TMPFS_PURGE="${PROFILE_TMPFS_PURGE:-false}"
 PROFILE_SYNC_INTERVAL="${PROFILE_SYNC_INTERVAL:-0}"
-PREWARM_ENABLED="${PREWARM_ENABLED:-true}"
-PREWARM_PATHS="${PREWARM_PATHS:-}"
-PREWARM_MAX_FILES="${PREWARM_MAX_FILES:-512}"
-PREWARM_SLICE_SIZE="${PREWARM_SLICE_SIZE:-262144}"
 SESSION_READY_DELAY="${SESSION_READY_DELAY:-0}"
 SESSION_READY_CMD="${SESSION_READY_CMD:-}"
 SESSION_READY_TIMEOUT="${SESSION_READY_TIMEOUT:-0}"
 BROWSER="${BROWSER:-chromium}"
 BROWSER=$(printf '%s' "$BROWSER" | tr '[:upper:]' '[:lower:]')
+BIRDSEYE_AUTO_FILL="${BIRDSEYE_AUTO_FILL:-true}"
+BIRDSEYE_MATCH_PATTERN="${BIRDSEYE_MATCH_PATTERN:-}"
+BIRDSEYE_EXTENSION_DIR="${BIRDSEYE_EXTENSION_DIR:-}"
+GUI_SESSION_WAIT_TIMEOUT="${GUI_SESSION_WAIT_TIMEOUT:-120}"
+SCREEN_SAMPLE_BYTES="${SCREEN_SAMPLE_BYTES:-524288}"
+SCREEN_SAMPLE_MODE="${SCREEN_SAMPLE_MODE:-sample}"
+BIRDSEYE_EXTENSION_PATH=""
+SCREEN_DELAY=${SCREEN_DELAY:-120}
+HEALTH_INTERVAL=${HEALTH_INTERVAL:-30}
+HEALTH_CONNECT_TIMEOUT=${HEALTH_CONNECT_TIMEOUT:-3}
+HEALTH_TOTAL_TIMEOUT=${HEALTH_TOTAL_TIMEOUT:-8}
+WAIT_FOR_URL_TIMEOUT=${WAIT_FOR_URL_TIMEOUT:-0}
+STALL_RETRIES=${STALL_RETRIES:-3}
+HEALTH_RETRIES=${HEALTH_RETRIES:-6}
+RESTART_WINDOW=${RESTART_WINDOW:-600}
+MAX_RESTARTS=${MAX_RESTARTS:-10}
+CLEAN_RESET=${CLEAN_RESET:-600}
+DEVTOOLS_AUTO_OPEN="${DEVTOOLS_AUTO_OPEN:-false}"
+DEVTOOLS_REMOTE_PORT="${DEVTOOLS_REMOTE_PORT:-}"
+PROFILE_SYNC_PID=""
 
-PREWARM_COMPLETED=false
+if ! [[ "$SCREEN_SAMPLE_BYTES" =~ ^[0-9]+$ ]] || [ "$SCREEN_SAMPLE_BYTES" -le 0 ]; then
+  SCREEN_SAMPLE_BYTES=524288
+fi
+case "$SCREEN_SAMPLE_MODE" in
+  full|sample) ;;
+  *) SCREEN_SAMPLE_MODE="sample" ;;
+esac
+
 DEFERRED_LAUNCH_DONE=false
 SHUTDOWN_REQUESTED=false
 
@@ -130,7 +204,7 @@ esac
 
 ACTION="run"
 case "${1:-}" in
-  --install|--remove|--update)
+  --install|--remove|--update|--reconfig)
     ACTION="${1#--}"
     shift
     ;;
@@ -150,6 +224,79 @@ need_cmd() {
     printf 'Error: required command %s not found in PATH\n' "$1" >&2
     exit 1
   fi
+}
+
+init_log_file() {
+  local target=$1
+  local dir
+  dir=$(dirname "$target")
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    return 1
+  fi
+  if ! ( : > "$target" ) 2>/dev/null; then
+    rm -f "$target" 2>/dev/null || true
+    if ! ( : > "$target" ) 2>/dev/null; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
+derive_match_pattern() {
+  local raw=$1
+  local fallback="http://*/*"
+  if [ -z "$raw" ]; then
+    printf '%s\n' "$fallback"
+    return
+  fi
+  if [[ "$raw" != *"://"* ]]; then
+    raw="http://$raw"
+  fi
+  local scheme="${raw%%://*}"
+  local remainder="${raw#*://}"
+  if [ "$scheme" = "$raw" ]; then
+    scheme="http"
+    remainder="$raw"
+  fi
+  local netloc="${remainder%%/*}"
+  if [ -z "$netloc" ]; then
+    netloc="*"
+  fi
+  printf '%s://%s/*\n' "$scheme" "$netloc"
+}
+
+open_lock_file() {
+  local requested=$1
+  local uid="${EUID:-$(id -u)}"
+  local -a candidates=()
+
+  if [ -n "$requested" ]; then
+    candidates+=( "$requested" )
+  fi
+  if [ "$uid" -ne 0 ]; then
+    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+      candidates+=( "${XDG_RUNTIME_DIR%/}/kiosk-monitor.lock" )
+    fi
+    candidates+=( "/tmp/kiosk-monitor-${uid}.lock" )
+  fi
+  candidates+=( "/tmp/kiosk-monitor-${uid}.lock" )
+
+  local target dir
+  for target in "${candidates[@]}"; do
+    [ -n "$target" ] || continue
+    dir=$(dirname "$target")
+    if ! mkdir -p "$dir" 2>/dev/null; then
+      continue
+    fi
+    if { exec 200>"$target"; } 2>/dev/null; then
+      if [ -n "$requested" ] && [ "$target" != "$requested" ]; then
+        printf 'Warning: unable to use lock file %s; switched to %s\n' "$requested" "$target" >&2
+      fi
+      LOCK_FILE="$target"
+      return 0
+    fi
+  done
+  return 1
 }
 
 regex_escape() {
@@ -195,90 +342,124 @@ extract_archive() {
   return 0
 }
 
-run_low_priority() {
-  if command -v ionice >/dev/null 2>&1; then
-    ionice -c3 nice -n 15 "$@" >/dev/null 2>&1 || nice -n 15 "$@" >/dev/null 2>&1 || "$@" >/dev/null 2>&1
-  else
-    nice -n 15 "$@" >/dev/null 2>&1 || "$@" >/dev/null 2>&1
+auto_detect_gui_user() {
+  if [ -n "${GUI_USER:-}" ] && [ "$GUI_USER" != "root" ]; then
+    return 0
   fi
-}
 
-prewarm_file_chunk() {
-  local file=$1
-  local slice=$2
-  [ -f "$file" ] || return 0
-  if command -v dd >/dev/null 2>&1; then
-    run_low_priority dd if="$file" of=/dev/null bs="$slice" count=1 status=none
-  else
-    run_low_priority head -c "$slice" "$file"
-  fi
-}
+  local candidate=""
+  if command -v loginctl >/dev/null 2>&1; then
+    while read -r session _ user seat _; do
+      [ -n "$session" ] || continue
+      [ -n "$user" ] || continue
+      [ "$user" = "root" ] && continue
 
-warm_path() {
-  local target=$1
-  local slice=$2
-  local limit=$3
-  [ -n "$target" ] || return 0
-  if [ -f "$target" ]; then
-    prewarm_file_chunk "$target" "$slice"
-    return
-  fi
-  if [ -d "$target" ]; then
-    local count=0
-    while IFS= read -r -d '' file; do
-      prewarm_file_chunk "$file" "$slice"
-      count=$((count + 1))
-      if [ "$count" -ge "$limit" ]; then
-        break
+      local active type
+      active=$(loginctl show-session "$session" -p Active --value 2>/dev/null | tr '[:upper:]' '[:lower:]') || active=""
+      type=$(loginctl show-session "$session" -p Type --value 2>/dev/null | tr '[:upper:]' '[:lower:]') || type=""
+      if [ "$active" = "yes" ] && { [ "$type" = "wayland" ] || [ "$type" = "x11" ] || [ -z "$type" ]; }; then
+        if [ -z "$seat" ] || [ "$seat" = "seat0" ]; then
+          candidate="$user"
+          break
+        fi
       fi
-    done < <(find "$target" -type f -size -10M -print0 2>/dev/null || true)
+      if [ -z "$candidate" ]; then
+        candidate="$user"
+      fi
+    done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
   fi
+
+  if [ -z "$candidate" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    candidate="$SUDO_USER"
+  fi
+  if [ -z "$candidate" ] && [ -n "${USER:-}" ] && [ "$USER" != "root" ]; then
+    candidate="$USER"
+  fi
+
+  if [ -z "$candidate" ] || [ "$candidate" = "root" ]; then
+    echo "No GUI user detected; set GUI_USER explicitly." >&2
+    return 1
+  fi
+
+  GUI_USER="$candidate"
+  export GUI_USER
+  return 0
 }
 
-prewarm_browser_artifacts() {
-  if [ "$PREWARM_ENABLED" != "true" ] || [ "$PREWARM_COMPLETED" = "true" ]; then
-    return
+auto_detect_display() {
+  local target_user=${1:-${GUI_USER:-}}
+  if [ -n "${DISPLAY:-}" ]; then
+    return 0
+  fi
+  if [ -z "$target_user" ]; then
+    return 1
   fi
 
-  local slice="$PREWARM_SLICE_SIZE"
-  if ! [[ "$slice" =~ ^[0-9]+$ ]]; then
-    slice=262144
-  fi
-  local limit="$PREWARM_MAX_FILES"
-  if ! [[ "$limit" =~ ^[0-9]+$ ]] || [ "$limit" -le 0 ]; then
-    limit=512
-  fi
-
-  debug "Pre-warming $BROWSER_LABEL artifacts (slice=${slice}B, max_files=$limit)"
-  warm_path "$CHROME" "$slice" "$limit"
-  warm_path "$PROFILE_ROOT" "$slice" "$limit"
-
-  local -a extras=()
-  extras+=( "$(dirname "$CHROME")" )
-  if [ "$BROWSER_FLAVOR" = "chromium" ]; then
-    extras+=( /usr/lib/chromium-browser /usr/lib/chromium /opt/chromium )
-  else
-    extras+=( /usr/lib/firefox /usr/lib/firefox-esr /opt/firefox )
-  fi
-  if [ -n "$PREWARM_PATHS" ]; then
-    IFS=':' read -r -a custom_paths <<< "$PREWARM_PATHS"
-    extras+=( "${custom_paths[@]}" )
+  if command -v loginctl >/dev/null 2>&1; then
+    while read -r session _ user _; do
+      [ "$user" = "$target_user" ] || continue
+      local display
+      display=$(loginctl show-session "$session" -p Display --value 2>/dev/null | tr -d '\n') || display=""
+      if [ -n "$display" ]; then
+        DISPLAY="$display"
+        export DISPLAY
+        return 0
+      fi
+    done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
   fi
 
-  local -A seen=()
-  for extra in "${extras[@]}"; do
-    [ -n "$extra" ] || continue
-    local resolved
-    resolved=$(readlink -f "$extra" 2>/dev/null || printf '%s' "$extra")
-    [ -e "$resolved" ] || continue
-    if [ "${seen[$resolved]+isset}" ]; then
-      continue
+  if [ -z "${DISPLAY:-}" ]; then
+    DISPLAY=":0"
+    export DISPLAY
+  fi
+  return 0
+}
+
+write_service_unit() {
+  local gui_user=$1
+  local display=$2
+  local runtime_dir=$3
+  local wayland_display=${4:-}
+  local target_path=${5:-$SERVICE_PATH}
+
+  local tmp
+  tmp=$(mktemp)
+  {
+    cat <<EOF
+[Unit]
+Description=Kiosk Monitor Watchdog
+Documentation=https://github.com/extremeshok/kiosk-monitor
+After=network-online.target graphical.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$gui_user
+Environment=GUI_USER=$gui_user
+Environment=DISPLAY=$display
+Environment=XDG_RUNTIME_DIR=$runtime_dir
+EOF
+    if [ -n "$wayland_display" ]; then
+      printf 'Environment=WAYLAND_DISPLAY=%s\n' "$wayland_display"
     fi
-    seen[$resolved]=1
-    warm_path "$resolved" "$slice" "$limit"
-  done
+    cat <<EOF
+EnvironmentFile=-$CONFIG_FILE
+ExecStart=$INSTALL_DIR/kiosk-monitor.sh
+ExecStop=/bin/kill -s TERM \$MAINPID
+Restart=always
+RestartSec=5
+SyslogIdentifier=kiosk-monitor
+StandardOutput=journal
+StandardError=journal
+SuccessExitStatus=0 130 143
 
-  PREWARM_COMPLETED=true
+[Install]
+WantedBy=multi-user.target
+WantedBy=graphical.target
+EOF
+  } > "$tmp"
+  install -m 0644 "$tmp" "$target_path"
+  rm -f "$tmp"
 }
 
 trim_chromium_cache() {
@@ -340,6 +521,7 @@ Usage:
   kiosk-monitor.sh --install [--url URL] [--gui-user USER] [--browser BROWSER] [--no-start] [--base-url URL]
   kiosk-monitor.sh --update [--base-url URL] [--browser BROWSER]
   kiosk-monitor.sh --remove [--purge]
+  kiosk-monitor.sh --reconfig [--config PATH]
   kiosk-monitor.sh --help | --version
 
 Environment overrides:
@@ -349,6 +531,8 @@ Environment overrides:
   CONFIG_DIR    Directory for config files (default: /etc/kiosk-monitor)
   CONFIG_FILE   Main config file path (default: /etc/kiosk-monitor/kiosk-monitor.conf)
   LOCK_FILE     Flock lock location (default: /var/lock/kiosk-monitor.lock)
+Command-line override:
+  --config PATH Use an alternate config file for this invocation
 
 Management commands must be run as root. For kiosk runtime behaviour, see README.
 EOF
@@ -378,6 +562,25 @@ download_component() {
   fi
   install -m "$mode" "$tmp" "$destination"
   rm -f "$tmp"
+}
+
+ensure_script_installed() {
+  local source=$1
+  local target=$2
+  local dir
+  dir=$(dirname "$target")
+  mkdir -p "$dir"
+
+  local source_real target_real=""
+  source_real=$(readlink -f "$source" 2>/dev/null || printf '%s' "$source")
+  target_real=$(readlink -f "$target" 2>/dev/null || printf '')
+
+  if [ -n "$target_real" ] && [ "$source_real" = "$target_real" ]; then
+    chmod 0755 "$target"
+    return 0
+  fi
+
+  install -m 0755 "$source" "$target"
 }
 
 render_config_file() {
@@ -421,6 +624,68 @@ render_config_file() {
     echo '# INSTALL_DIR="/usr/local/bin"'
     echo '# SERVICE_PATH="/etc/systemd/system/kiosk-monitor.service"'
     echo '# BASE_URL="https://raw.githubusercontent.com/extremeshok/kiosk-monitor/main"'
+  } > "$tmp"
+  install -m 0644 "$tmp" "$target"
+  rm -f "$tmp"
+}
+
+escape_config_value() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+emit_config_line() {
+  local key=$1
+  local value=$2
+  printf '%s="%s"\n' "$key" "$(escape_config_value "$value")"
+}
+
+write_effective_config_file() {
+  local target=$1
+  need_cmd install
+  mkdir -p "$(dirname "$target")"
+  local launch_delay="${CHROME_LAUNCH_DELAY_SECONDS:-30}"
+  local ready_delay="${CHROME_READY_DELAY_SECONDS:-20}"
+  local tmp
+  tmp=$(mktemp)
+  {
+    cat <<'EOF'
+# kiosk-monitor configuration
+# This file was generated by `kiosk-monitor.sh --reconfig`.
+# Edit values as needed and restart the kiosk-monitor service.
+EOF
+    emit_config_line URL "${URL:-$DEFAULT_URL}"
+    emit_config_line GUI_USER "${GUI_USER:-}"
+    emit_config_line BROWSER "${BROWSER:-chromium}"
+    emit_config_line CHROMIUM_BIN "${CHROMIUM_BIN:-}"
+    emit_config_line FIREFOX_BIN "${FIREFOX_BIN:-}"
+    emit_config_line DEBUG "${DEBUG:-false}"
+    emit_config_line PROFILE_ROOT "${PROFILE_ROOT:-}"
+    emit_config_line WAIT_FOR_URL "${WAIT_FOR_URL:-true}"
+    emit_config_line CHROME_LAUNCH_DELAY "$launch_delay"
+    emit_config_line CHROME_READY_DELAY "$ready_delay"
+    emit_config_line PROFILE_TMPFS "${PROFILE_TMPFS:-false}"
+    emit_config_line PROFILE_TMPFS_PATH "${PROFILE_TMPFS_PATH:-/dev/shm/kiosk-monitor}"
+    emit_config_line PROFILE_SYNC_BACK "${PROFILE_SYNC_BACK:-false}"
+    emit_config_line PROFILE_TMPFS_PURGE "${PROFILE_TMPFS_PURGE:-false}"
+    emit_config_line PROFILE_ARCHIVE "${PROFILE_ARCHIVE:-}"
+    emit_config_line PROFILE_SYNC_INTERVAL "${PROFILE_SYNC_INTERVAL:-0}"
+    emit_config_line PREWARM_ENABLED "${PREWARM_ENABLED:-true}"
+    emit_config_line PREWARM_PATHS "${PREWARM_PATHS:-}"
+    emit_config_line PREWARM_MAX_FILES "${PREWARM_MAX_FILES:-512}"
+    emit_config_line PREWARM_SLICE_SIZE "${PREWARM_SLICE_SIZE:-262144}"
+    emit_config_line SESSION_READY_DELAY "${SESSION_READY_DELAY:-0}"
+    emit_config_line SESSION_READY_CMD "${SESSION_READY_CMD:-}"
+    emit_config_line SESSION_READY_TIMEOUT "${SESSION_READY_TIMEOUT:-0}"
+    emit_config_line GUI_SESSION_WAIT_TIMEOUT "${GUI_SESSION_WAIT_TIMEOUT:-120}"
+    emit_config_line LOCK_FILE "${LOCK_FILE:-/var/lock/kiosk-monitor.lock}"
+    emit_config_line INSTALL_DIR "${INSTALL_DIR:-/usr/local/bin}"
+    emit_config_line SERVICE_PATH "${SERVICE_PATH:-/etc/systemd/system/kiosk-monitor.service}"
+    emit_config_line BASE_URL "${BASE_URL:-$DEFAULT_BASE_URL}"
+    emit_config_line BIRDSEYE_AUTO_FILL "${BIRDSEYE_AUTO_FILL:-true}"
+    emit_config_line BIRDSEYE_MATCH_PATTERN "${BIRDSEYE_MATCH_PATTERN:-}"
+    emit_config_line BIRDSEYE_EXTENSION_DIR "${BIRDSEYE_EXTENSION_DIR:-}"
+    emit_config_line SCREEN_SAMPLE_BYTES "${SCREEN_SAMPLE_BYTES:-524288}"
+    emit_config_line SCREEN_SAMPLE_MODE "${SCREEN_SAMPLE_MODE:-sample}"
   } > "$tmp"
   install -m 0644 "$tmp" "$target"
   rm -f "$tmp"
@@ -470,10 +735,12 @@ ensure_config_file() {
 install_self() {
   require_root
   need_cmd systemctl
+  need_cmd install
 
   local url_override=""
   local gui_override=""
   local browser_override=""
+  local display_override=""
   local autostart="yes"
 
   while [ "$#" -gt 0 ]; do
@@ -487,6 +754,11 @@ install_self() {
         shift
         gui_override="${1:-}"
         [ -n "$gui_override" ] || { echo 'Error: --gui-user needs a value' >&2; exit 1; }
+        ;;
+      --display)
+        shift
+        display_override="${1:-}"
+        [ -n "$display_override" ] || { echo 'Error: --display needs a value' >&2; exit 1; }
         ;;
       --browser)
         shift
@@ -511,17 +783,54 @@ install_self() {
     shift
   done
 
-  mkdir -p "$INSTALL_DIR"
-  download_component "kiosk-monitor.sh" "$INSTALL_DIR/kiosk-monitor.sh" 755
-  download_component "kiosk-monitor.service" "$SERVICE_PATH" 644
-  mkdir -p "$CONFIG_DIR"
-  if [ ! -f "$CONFIG_DIR/kiosk-monitor.conf.sample" ]; then
-    download_component "config/kiosk-monitor.conf.sample" "$CONFIG_DIR/kiosk-monitor.conf.sample" 644
+  local effective_gui
+  if [ -n "$gui_override" ]; then
+    GUI_USER="$gui_override"
+    effective_gui="$gui_override"
+  else
+    if ! auto_detect_gui_user; then
+      echo 'Unable to determine GUI user automatically. Re-run with --gui-user.' >&2
+      exit 1
+    fi
+    effective_gui="$GUI_USER"
   fi
-  if [ -f "$LEGACY_ENV_FILE" ] && [ ! -f "$CONFIG_FILE" ] && [ "$LEGACY_ENV_FILE" != "$CONFIG_FILE" ]; then
-    mv "$LEGACY_ENV_FILE" "$CONFIG_FILE"
+
+  local effective_display
+  if [ -n "$display_override" ]; then
+    DISPLAY="$display_override"
+    effective_display="$display_override"
+  else
+    auto_detect_display "$effective_gui" || true
+    effective_display="${DISPLAY:-:0}"
+  fi
+
+  local gui_uid
+  gui_uid=$(id -u "$effective_gui")
+  local runtime_dir="/run/user/$gui_uid"
+
+  local wayland_display=""
+  if [ -d "$runtime_dir" ]; then
+    for socket in "$runtime_dir"/wayland-*; do
+      [ -S "$socket" ] || continue
+      wayland_display=$(basename "$socket")
+      break
+    done
+  fi
+
+  local resolved_script script_dir
+  resolved_script=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+  script_dir=$(dirname "$resolved_script")
+
+  mkdir -p "$INSTALL_DIR"
+  ensure_script_installed "$resolved_script" "$INSTALL_DIR/kiosk-monitor.sh"
+
+  mkdir -p "$CONFIG_DIR"
+  if [ ! -f "$CONFIG_DIR/kiosk-monitor.conf.sample" ] && [ -f "$script_dir/kiosk-monitor.conf.sample" ]; then
+    install -m 0644 "$script_dir/kiosk-monitor.conf.sample" "$CONFIG_DIR/kiosk-monitor.conf.sample"
   fi
   ensure_config_file "$url_override" "$gui_override" "$browser_override"
+
+  write_service_unit "$effective_gui" "$effective_display" "$runtime_dir" "$wayland_display" "$SERVICE_PATH"
 
   systemctl daemon-reload
   if [ "$autostart" = "yes" ]; then
@@ -536,21 +845,38 @@ install_self() {
 update_self() {
   require_root
   need_cmd systemctl
+  need_cmd install
 
+  local gui_override=""
+  local display_override=""
   local browser_override=""
+  local suppress_restart="no"
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --base-url)
+      --gui-user|--user)
         shift
-        BASE_URL="${1:-}"
-        [ -n "$BASE_URL" ] || { echo 'Error: --base-url needs a value' >&2; exit 1; }
+        gui_override="${1:-}"
+        [ -n "$gui_override" ] || { echo 'Error: --gui-user needs a value' >&2; exit 1; }
+        ;;
+      --display)
+        shift
+        display_override="${1:-}"
+        [ -n "$display_override" ] || { echo 'Error: --display needs a value' >&2; exit 1; }
         ;;
       --browser)
         shift
         browser_override="${1:-}"
         [ -n "$browser_override" ] || { echo 'Error: --browser needs a value' >&2; exit 1; }
         browser_override=$(printf '%s' "$browser_override" | tr '[:upper:]' '[:lower:]')
+        ;;
+      --no-restart)
+        suppress_restart="yes"
+        ;;
+      --base-url)
+        shift
+        [ -n "${1:-}" ] || { echo 'Error: --base-url needs a value' >&2; exit 1; }
+        echo 'Warning: --base-url is deprecated and ignored.' >&2
         ;;
       *)
         printf 'Error: unknown update option %s\n' "$1" >&2
@@ -561,25 +887,64 @@ update_self() {
     shift
   done
 
-  mkdir -p "$INSTALL_DIR"
-  mkdir -p "$CONFIG_DIR"
   local was_active="no"
   if systemctl is-active --quiet kiosk-monitor.service; then
     was_active="yes"
   fi
 
-  download_component "kiosk-monitor.sh" "$INSTALL_DIR/kiosk-monitor.sh" 755
-  download_component "kiosk-monitor.service" "$SERVICE_PATH" 644
-  download_component "config/kiosk-monitor.conf.sample" "$CONFIG_DIR/kiosk-monitor.conf.sample" 644
-  if [ -f "$LEGACY_ENV_FILE" ] && [ ! -f "$CONFIG_FILE" ] && [ "$LEGACY_ENV_FILE" != "$CONFIG_FILE" ]; then
-    mv "$LEGACY_ENV_FILE" "$CONFIG_FILE"
+  local effective_gui
+  if [ -n "$gui_override" ]; then
+    GUI_USER="$gui_override"
+    effective_gui="$gui_override"
+  else
+    if ! auto_detect_gui_user; then
+      echo 'Unable to determine GUI user automatically. Re-run with --gui-user.' >&2
+      exit 1
+    fi
+    effective_gui="$GUI_USER"
+  fi
+
+  local effective_display
+  if [ -n "$display_override" ]; then
+    DISPLAY="$display_override"
+    effective_display="$display_override"
+  else
+    auto_detect_display "$effective_gui" || true
+    effective_display="${DISPLAY:-:0}"
+  fi
+
+  local gui_uid
+  gui_uid=$(id -u "$effective_gui")
+  local runtime_dir="/run/user/$gui_uid"
+
+  local wayland_display=""
+  if [ -d "$runtime_dir" ]; then
+    for socket in "$runtime_dir"/wayland-*; do
+      [ -S "$socket" ] || continue
+      wayland_display=$(basename "$socket")
+      break
+    done
+  fi
+
+  local resolved_script script_dir
+  resolved_script=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+  script_dir=$(dirname "$resolved_script")
+
+  mkdir -p "$INSTALL_DIR"
+  ensure_script_installed "$resolved_script" "$INSTALL_DIR/kiosk-monitor.sh"
+
+  mkdir -p "$CONFIG_DIR"
+  if [ ! -f "$CONFIG_DIR/kiosk-monitor.conf.sample" ] && [ -f "$script_dir/kiosk-monitor.conf.sample" ]; then
+    install -m 0644 "$script_dir/kiosk-monitor.conf.sample" "$CONFIG_DIR/kiosk-monitor.conf.sample"
   fi
   if [ -n "$browser_override" ]; then
     ensure_config_file "" "" "$browser_override"
   fi
 
+  write_service_unit "$effective_gui" "$effective_display" "$runtime_dir" "$wayland_display" "$SERVICE_PATH"
+
   systemctl daemon-reload
-  if [ "$was_active" = "yes" ]; then
+  if [ "$was_active" = "yes" ] && [ "$suppress_restart" = "no" ]; then
     systemctl restart kiosk-monitor.service
     echo 'kiosk-monitor updated and restarted.'
   else
@@ -622,98 +987,33 @@ remove_self() {
   echo 'kiosk-monitor removed.'
 }
 
-case "$ACTION" in
-  install)
-    install_self "${ACTION_ARGS[@]}"
-    exit 0
-    ;;
-  update)
-    update_self "${ACTION_ARGS[@]}"
-    exit 0
-    ;;
-  remove)
-    remove_self "${ACTION_ARGS[@]}"
-    exit 0
-    ;;
-  help)
-    usage
-    exit 0
-    ;;
-  version)
-    echo "$SCRIPT_VERSION"
-    exit 0
-    ;;
-esac
-
-set -- "${ACTION_ARGS[@]}"
-
-DEBUG=${DEBUG:-false}
-for arg in "$@"; do
-  if [ "$arg" = "--debug" ]; then
-    DEBUG=true
-    # strip the flag so it doesn't interfere with any future arg parsing
-    set -- "${@/--debug/}"
-    break
+reconfigure_self() {
+  require_root
+  if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
   fi
-done
+  write_effective_config_file "$CONFIG_FILE"
+  echo "kiosk-monitor configuration written to $CONFIG_FILE."
+}
 
-# ——— Logging ———
-# Default to RAM to reduce SD wear; can override via env LOG=/path/file
-LOG="${LOG:-/dev/shm/kiosk.log}"
-mkdir -p "$(dirname "$LOG")" || true
-: > "$LOG"   # truncate existing log each start
-# Duplicate all stdout/stderr to both console and logfile
-exec > >(tee -a "$LOG") 2>&1
-need_cmd curl
-need_cmd flock
-mkdir -p "$(dirname "$LOCK_FILE")"
-exec 200>"$LOCK_FILE"
-if ! flock -n 200; then
-  echo "Another kiosk-monitor instance is already running (lock $LOCK_FILE)." >&2
-  exit 0
-fi
+# ------------------------------------------------------------------------------
+# Runtime helper functions
+# ------------------------------------------------------------------------------
 
-if [ "$DEBUG" = "true" ]; then
-  set -x
-fi
-
-# Enable debug logging if DEBUG=true
 debug() {
-  # Print debug messages to stderr so they aren’t captured in $(...)
   if [ "$DEBUG" = "true" ]; then
     printf 'DEBUG: %s\n' "$*" >&2
   fi
 }
 
-# Run a command as the GUI user with proper env; if already that user, run directly
 as_gui() {
-  if [ "$(id -u)" -eq "${GUI_UID:-999999}" ] 2>/dev/null; then
+  if [ "${EUID:-$(id -u)}" -eq "${GUI_UID:-999999}" ] 2>/dev/null; then
     "$@"
   else
     sudo -n -u "$GUI_USER" env XDG_RUNTIME_DIR="/run/user/$GUI_UID" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" DISPLAY="${DISPLAY:-}" "$@"
   fi
 }
-
-# ----- User / session info -----
-# Prefer pre-set GUI_USER (e.g., from systemd unit). Otherwise, try loginctl.
-if [ -z "${GUI_USER:-}" ]; then
-  if command -v loginctl >/dev/null 2>&1; then
-    GUI_USER=$(loginctl show-session "$(loginctl list-sessions --no-legend | awk '$3=="seat0" {print $1; exit}')" -p Name --value 2>/dev/null || true)
-  fi
-  # Fallback to SUDO_USER if available (but never fall back to root for GUI)
-  if [ -z "$GUI_USER" ] || [ "$GUI_USER" = "root" ]; then
-    GUI_USER="${SUDO_USER:-}"
-  fi
-  if [ -z "$GUI_USER" ] || [ "$GUI_USER" = "root" ]; then
-    echo "No valid GUI user detected (not in a graphical session). Set GUI_USER= in the service env." >&2
-    exit 1
-  fi
-fi
-GUI_UID=$(id -u "$GUI_USER")
-export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${GUI_UID}}"
-
-PROFILE_PERSIST_ROOT="${PROFILE_ROOT:-/home/${GUI_USER}/.local/share/kiosk-monitor}"
-PROFILE_RUNTIME_ROOT="$PROFILE_PERSIST_ROOT"
 
 prepare_profile_runtime() {
   local runtime="$PROFILE_PERSIST_ROOT"
@@ -747,7 +1047,142 @@ sync_profile_persist() {
   fi
 }
 
-PROFILE_SYNC_PID=""
+gui_session_active() {
+  if ! command -v loginctl >/dev/null 2>&1; then
+    return 0
+  fi
+  if loginctl show-user "$GUI_USER" -p Sessions --value 2>/dev/null | grep -q '[^[:space:]]'; then
+    return 0
+  fi
+  if loginctl list-sessions --no-legend 2>/dev/null | awk -v user="$GUI_USER" '$3 == user { found=1; exit 0 } END { exit (found?0:1) }'; then
+    return 0
+  fi
+  return 1
+}
+
+wait_for_gui_session() {
+  local timeout="$GUI_SESSION_WAIT_TIMEOUT"
+  if ! [[ "$timeout" =~ ^[0-9]+$ ]] || [ "$timeout" -le 0 ]; then
+    return
+  fi
+  if ! command -v loginctl >/dev/null 2>&1; then
+    return
+  fi
+  if gui_session_active; then
+    return
+  fi
+  echo "Waiting for GUI session for $GUI_USER (timeout ${timeout}s)…"
+  local waited=0
+  while [ "$waited" -lt "$timeout" ]; do
+    sleep 1
+    waited=$((waited + 1))
+    if gui_session_active; then
+      echo "GUI session detected for $GUI_USER."
+      return
+    fi
+  done
+  echo "GUI session for $GUI_USER not detected after ${timeout}s; continuing." >&2
+}
+
+ensure_birdseye_extension() {
+  if [ "$BROWSER_FLAVOR" != "chromium" ]; then
+    return
+  fi
+  if [ "$BIRDSEYE_AUTO_FILL" != "true" ]; then
+    return
+  fi
+  local -a candidates=()
+  if [ -n "${BIRDSEYE_EXTENSION_DIR:-}" ]; then
+    candidates+=( "${BIRDSEYE_EXTENSION_DIR%/}" )
+  fi
+  candidates+=( "${PROFILE_RUNTIME_ROOT%/}/birdseye-autofill" "/usr/local/share/kiosk-monitor/birdseye-autofill" )
+  local dir=""
+  local configured_dir="${BIRDSEYE_EXTENSION_DIR:-}"
+  for candidate in "${candidates[@]}"; do
+    [ -n "$candidate" ] || continue
+    if mkdir -p "$candidate" 2>/dev/null; then
+      dir="$candidate"
+      break
+    fi
+  done
+  if [ -z "$dir" ]; then
+    printf 'Error: could not create Birdseye extension directories (tried: %s)\n' "${candidates[*]}" >&2
+    return
+  fi
+  if [ -n "$configured_dir" ]; then
+    local normalized_configured="${configured_dir%/}"
+    if [ "$dir" != "$normalized_configured" ]; then
+      printf 'Warning: unable to write Birdseye extension to %s; using %s instead\n' "$normalized_configured" "$dir" >&2
+    fi
+  fi
+  local match_pattern="${BIRDSEYE_MATCH_PATTERN:-}"
+  if [ -z "$match_pattern" ]; then
+    match_pattern=$(derive_match_pattern "$URL")
+  fi
+  local css_file="$dir/fullscreen.css"
+  local manifest_file="$dir/manifest.json"
+  cat > "$css_file" <<'EOF'
+
+/* 1. Set the width and height for the birdseye grid container */
+#pageRoot > div > div > div > div.react-grid-layout.grid-layout {
+  height: 1000px !important; /* Ensure height is correct */
+  width: 100% !important; /* Allow it to stretch to 100% width of its parent */
+  max-width: 1800px !important; /* Max width at 1800px */
+  margin: 0 auto; /* Center the container if needed */
+}
+
+/* 2. Set the width and height for the canvas element */
+#pageRoot > div > div > div > div.react-grid-layout.grid-layout > div > div > div.size-full > div > div > div > canvas {
+  height: 1000px !important; /* Ensure canvas height is fixed */
+  width: 100% !important; /* Make the canvas take up the full width of its container */
+}
+
+/* 3. Ensure parent containers are flexible enough to accommodate the canvas width */
+#pageRoot > div > div > div > div.react-grid-layout.grid-layout > div {
+  display: flex;
+  flex-direction: column;
+  width: 100% !important;
+  max-width: 1800px !important;
+}
+
+/* Optional: Make the viewport fully responsive based on viewport size */
+#pageRoot > div > div > div > div.react-grid-layout.grid-layout {
+  width: 100vw !important;  /* Ensure it's responsive to viewport width */
+  height: 100vh !important; /* Fill the entire height of the viewport */
+}
+
+/* 6) Explicit canvas sizing for Frigate Birdseye widgets */
+#pageRoot > div > div > div > div.react-grid-layout.grid-layout {
+  height: 1000px !important;
+  width: 1800px !important;
+}
+
+#pageRoot > div > div > div > div.react-grid-layout.grid-layout > div > div > div.size-full > div > div > div > canvas {
+  height: 1000px !important;
+  width: 1800px !important;
+}
+
+EOF
+  cat > "$manifest_file" <<EOF
+{
+  "name": "Frigate Birdseye Auto-Fill",
+  "version": "1.0",
+  "manifest_version": 3,
+  "description": "Ensure the Frigate Birdseye grid fills the window and hides the resize handle.",
+  "content_scripts": [
+    {
+      "matches": ["$match_pattern"],
+      "css": ["fullscreen.css"],
+      "run_at": "document_start"
+    }
+  ]
+}
+EOF
+  chmod 0644 "$css_file" "$manifest_file"
+  chmod 0755 "$dir"
+  chown -R "$GUI_USER":"$GUI_USER" "$dir" 2>/dev/null || true
+  BIRDSEYE_EXTENSION_PATH="$dir"
+}
 
 start_profile_sync_timer() {
   if [ "$PROFILE_TMPFS" != "true" ]; then
@@ -775,7 +1210,11 @@ stop_other_browser_sessions() {
     local pattern
     case "$BROWSER_FLAVOR" in
       chromium)
-        pattern="${CHROMIUM_PGREP_PATTERN:-}"
+        if [ -n "${CHROMIUM_BROWSER_MATCH:-}" ]; then
+          pattern="$CHROMIUM_BROWSER_MATCH"
+        else
+          pattern="--type=browser"
+        fi
         ;;
       firefox)
         pattern="--profile=${PROFILE_ROOT}"
@@ -787,7 +1226,7 @@ stop_other_browser_sessions() {
     if [ -z "$pattern" ]; then
       pattern="--type=browser"
     fi
-    mapfile -t main_pids < <(pgrep -u "$GUI_USER" -f "$pattern" 2>/dev/null || true)
+    mapfile -t main_pids < <(pgrep -u "$GUI_USER" -f -- "$pattern" 2>/dev/null || true)
     local terminated=0
     for pid in "${main_pids[@]}"; do
       [ -n "$pid" ] || continue
@@ -813,17 +1252,19 @@ stop_other_browser_sessions() {
 
   case "$BROWSER_FLAVOR" in
     chromium)
-      if [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
-        mapfile -t dupes < <(pgrep -u "$GUI_USER" -f "${CHROMIUM_PGREP_PATTERN}" 2>/dev/null || true)
+      if [ -n "${CHROMIUM_BROWSER_MATCH:-}" ]; then
+        mapfile -t dupes < <(pgrep -u "$GUI_USER" -f -- "${CHROMIUM_BROWSER_MATCH}" 2>/dev/null || true)
+      elif [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
+        mapfile -t dupes < <(pgrep -u "$GUI_USER" -f -- "${CHROMIUM_PGREP_PATTERN}" 2>/dev/null || true)
       else
-        mapfile -t dupes < <(pgrep -u "$GUI_USER" -f "--type=browser" 2>/dev/null || true)
+        mapfile -t dupes < <(pgrep -u "$GUI_USER" -f -- "--type=browser" 2>/dev/null || true)
       fi
       ;;
     firefox)
-      mapfile -t dupes < <(pgrep -u "$GUI_USER" -f "--profile=${PROFILE_ROOT}" 2>/dev/null || true)
+      mapfile -t dupes < <(pgrep -u "$GUI_USER" -f -- "--profile=${PROFILE_ROOT}" 2>/dev/null || true)
       ;;
     *)
-      mapfile -t dupes < <(pgrep -u "$GUI_USER" -f "$(basename "$CHROME")" 2>/dev/null || true)
+      mapfile -t dupes < <(pgrep -u "$GUI_USER" -f -- "$(basename "$CHROME")" 2>/dev/null || true)
       ;;
   esac
   if [ "${#dupes[@]}" -gt 1 ]; then
@@ -883,160 +1324,6 @@ force_ps_browser_cleanup() {
   fi
 }
 
-prepare_profile_runtime
-start_profile_sync_timer
-
-PROFILE_ROOT="$PROFILE_RUNTIME_ROOT"
-if [ "$BROWSER_FLAVOR" = "chromium" ]; then
-  profile_regex=$(regex_escape "$PROFILE_ROOT")
-  CHROMIUM_PGREP_PATTERN="--user-data-dir=$profile_regex"
-  PROFILE_DIR="$PROFILE_ROOT/Default"
-  PROFILE_PREFS="$PROFILE_DIR/Preferences"
-else
-  CHROMIUM_PGREP_PATTERN=""
-  PROFILE_DIR="$PROFILE_ROOT"
-  PROFILE_PREFS="$PROFILE_DIR/prefs.js"
-fi
-mkdir -p "$PROFILE_DIR"
-
-BROWSER_PID=""                       # will hold the main browser PID
-SKIP_HEALTH_LOOP=false
-
-# ——— Environment ———
-# DISPLAY: prefer env; else infer from loginctl; else :0
-if [ -z "${DISPLAY:-}" ]; then
-  if command -v loginctl >/dev/null 2>&1; then
-    GUI_DISPLAY=$(loginctl show-user "$GUI_USER" -p Display --value 2>/dev/null || true)
-  fi
-  export DISPLAY=":${GUI_DISPLAY:-0}"
-fi
-# XAUTHORITY may be needed for X11 fallback; harmless on Wayland
-export XAUTHORITY="/home/${GUI_USER}/.Xauthority"
-
-# Ensure Wayland session vars exist (if Wayland is active)
-if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
-  if shopt -q nullglob 2>/dev/null; then
-    saved_nullglob=1
-  else
-    saved_nullglob=0
-    shopt -s nullglob 2>/dev/null || true
-  fi
-  for candidate in "$XDG_RUNTIME_DIR"/wayland-*; do
-    if [ -S "$candidate" ]; then
-      WAYLAND_DISPLAY=$(basename "$candidate")
-      export WAYLAND_DISPLAY
-      break
-    fi
-  done
-  if [ "$saved_nullglob" -eq 0 ]; then
-    shopt -u nullglob 2>/dev/null || true
-  fi
-fi
-
-# Identify whether we're on Wayland or X11
-if [ -n "${WAYLAND_DISPLAY:-}" ]; then
-  BACKEND="wayland"
-else
-  BACKEND="x11"
-fi
-printf 'Display backend detected: %s (%s)\n' "$BACKEND" "$(date -Is)"
-debug "Backend=$BACKEND"
-
-
-# ------------------------------------------------------------
-# Display‑resolution detection
-#   • On Wayland: use wayland-info logical_* entries (two quick greps)
-#   • Else:       fall back to fbset geometry
-# ------------------------------------------------------------
-if [ "$BACKEND" = "wayland" ] && command -v wayland-info >/dev/null 2>&1; then
-    max_try=5
-    try=1
-    width=""; height=""
-    while [ $try -le $max_try ]; do
-      width=$(as_gui wayland-info --outputs | grep -m1 'logical_width:' | sed -E 's/.*logical_width:[[:blank:]]*([0-9]+).*/\1/')
-      height=$(as_gui wayland-info --outputs | grep -m1 'logical_height:' | sed -E 's/.*logical_height:[[:blank:]]*([0-9]+).*/\1/')
-      if [ -n "$width" ] && [ -n "$height" ]; then
-        break
-      fi
-      echo "wayland-info did not yield logical_width/height (attempt $try/$max_try) — retrying in 1 s" >&2
-      sleep 1
-      try=$((try + 1))
-    done
-
-    if [ -z "$width" ] || [ -z "$height" ]; then
-        echo "ERROR: Could not determine resolution via wayland-info after $max_try attempts" >&2
-        exit 1
-    fi
-
-    res="${width}x${height}"
-    # Obtain first Wayland output name (may be empty on some compositors)
-    OUTPUT_NAME=$(as_gui wayland-info --outputs | awk '/^[[:space:]]*name:[[:space:]]*/ { gsub(/^'\''|'\''$/, "", $2); print $2; exit }')
-    if [ -n "$OUTPUT_NAME" ]; then
-      GRIM_OUT_OPT=( -o "$OUTPUT_NAME" )
-      debug "Primary Wayland output: $OUTPUT_NAME"
-    else
-      GRIM_OUT_OPT=()
-      debug "WARNING: Could not detect primary Wayland output; grim will capture all outputs"
-    fi
-
-elif command -v fbset >/dev/null 2>&1; then
-    res=$(fbset -s | awk '/geometry/ {print $2"x"$3}')
-    debug "Resolution detected via fbset: $res"
-
-else
-    printf "ERROR: Cannot determine resolution (install wayland-utils or fbset)\n" >&2
-    exit 1
-fi
-
-screen_w=${res%x*}; screen_h=${res#*x}
-printf 'Detected display: %dx%d\n' "$screen_w" "$screen_h"
-
-# ——— Configurable watchdog parameters ———
-HEALTH_INTERVAL=30        # seconds between probes
-HEALTH_RETRIES=6          # consecutive failures before restart
-RESTART_WINDOW=600        # seconds to look back for storm protection
-MAX_RESTARTS=10           # max restarts allowed within the window
-STALL_RETRIES=3          # unchanged screen cycles before restart
-SCREEN_DELAY=120           # seconds to wait before starting visual‑freeze checks
-
-URL="${URL:-$DEFAULT_URL}"
-case "$BROWSER_FLAVOR" in
-  chromium)
-    FLAGS=(
-      --kiosk
-      --start-fullscreen
-      --no-first-run
-      --no-default-browser-check
-      --disable-restore-session-state
-      --disable-translate
-      --disable-infobars
-      --disable-session-crashed-bubble
-      '--disable-features=TranslateUI,ChromeWhatsNewUI'
-      --disable-component-update
-      --disable-sync
-      --noerrdialogs
-      --disable-logging
-      --disable-logging-redirect
-      --log-level=3
-      --enable-features=OverlayScrollbar
-      --password-store=basic
-      --allow-running-insecure-content
-      --user-data-dir="$PROFILE_ROOT"
-      --app="$URL"
-    )
-    ;;
-  firefox)
-    FLAGS=(
-      --kiosk
-      --private-window
-      --no-remote
-      --profile="$PROFILE_ROOT"
-      "$URL"
-    )
-    ;;
-esac
-
-# ——— Prefs patcher ———
 patch_prefs() {
   if [ "$BROWSER_FLAVOR" = "chromium" ]; then
     mkdir -p "$PROFILE_DIR"
@@ -1077,8 +1364,7 @@ session['urls_to_restore_on_startup'] = []
 session['recently_closed_tabs'] = []
 
 browser = prefs.setdefault('browser', {})
-if target_url:
-    browser['last_opened_urls'] = [target_url]
+browser['last_opened_urls'] = [target_url] if target_url else []
 browser['show_home_button'] = False
 browser['check_default_browser'] = False
 
@@ -1117,7 +1403,6 @@ PYTHON
     return
   fi
 
-  # Firefox profile tuning
   mkdir -p "$PROFILE_DIR"
   local user_js="$PROFILE_DIR/user.js"
   local tmp
@@ -1162,38 +1447,85 @@ EOF
   chown -R "$GUI_USER":"$GUI_USER" "$PROFILE_ROOT"
 }
 
-# ——— Health‑check helpers ———
 health_check() {
-  CODE=$(curl -s --head --fail --connect-timeout 3 --max-time 5 -o /dev/null -w "%{http_code}" "$URL" || echo 000)
-  debug "health_check HTTP code=$CODE"
-  [ "$CODE" -ge 200 ] && [ "$CODE" -lt 400 ]
+  local connect="${HEALTH_CONNECT_TIMEOUT:-2}"
+  local total="${HEALTH_TOTAL_TIMEOUT:-6}"
+  local code cmd label
+
+  for mode in head get; do
+    if [ "$mode" = "head" ]; then
+      cmd=(curl -sS -I --connect-timeout "$connect" --max-time "$total" -o /dev/null -w "%{http_code}" "$URL")
+      label="HEAD"
+    else
+      cmd=(curl -sS --connect-timeout "$connect" --max-time "$total" -o /dev/null -w "%{http_code}" "$URL")
+      label="GET"
+    fi
+    code=$("${cmd[@]}" 2>/dev/null || echo 000)
+    debug "health_check ${label} HTTP code=$code"
+    if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then
+      return 0
+    fi
+  done
+  echo "Health check failed for $URL (last HTTP $code) at $(date)" >&2
+  return 1
 }
 
-# --- Screen-hash helper (detect visual freeze via half-screen) ---
+wait_for_url_ready() {
+  local timeout="${WAIT_FOR_URL_TIMEOUT:-0}"
+  local waited=0
+  while true; do
+    if health_check; then
+      echo "Target $URL is reachable at $(date) — continuing."
+      return 0
+    fi
+    echo "  still down at $(date)"
+    sleep 1
+    waited=$((waited + 1))
+    if [ "$timeout" -gt 0 ] && [ "$waited" -ge "$timeout" ]; then
+      echo "Health check still failing after ${timeout}s — continuing anyway." >&2
+      return 1
+    fi
+  done
+}
+
 capture_hash() {
+  local checksum=""
+  local -a cmd=()
   if [ "$BACKEND" = "wayland" ]; then
-    debug "Capturing full-screen sample on Wayland"
-    data=$(as_gui grim "${GRIM_OUT_OPT[@]}" -t ppm - - | head -c 65536 | base64 -w0)
-    debug "Full-screen sample base64 length=${#data}"
+    cmd=(as_gui grim "${GRIM_OUT_OPT[@]}" -t ppm - -)
+    debug "Capturing Wayland frame via grim (mode=$SCREEN_SAMPLE_MODE, bytes=$SCREEN_SAMPLE_BYTES)"
   else
-    # fallback: sample first 64KiB of full-screen dump to save CPU
-    debug "Fallback command: xwd -silent -root -display \"$DISPLAY\" | head -c 65536"
-    data=$(as_gui xwd -silent -root -display "$DISPLAY" | head -c 65536 | base64 -w0)
-    debug "Captured base64 length=${#data}"
+    cmd=(as_gui xwd -silent -root -display "$DISPLAY")
+    debug "Capturing X11 frame via xwd (mode=$SCREEN_SAMPLE_MODE, bytes=$SCREEN_SAMPLE_BYTES)"
   fi
-  # Return a 32‑bit checksum of the captured PPM/XWD bytes
-  checksum=$(printf '%s' "$data" | cksum | awk '{print $1}')
+
+  if [ "$SCREEN_SAMPLE_MODE" = "full" ]; then
+    checksum=$(
+      {
+        "${cmd[@]}" 2>/dev/null || true
+      } | cksum | awk '{print $1}'
+    )
+  else
+    checksum=$(
+      {
+        "${cmd[@]}" 2>/dev/null || true
+      } | head -c "$SCREEN_SAMPLE_BYTES" | cksum | awk '{print $1}'
+    )
+  fi
+
+  if [ -z "$checksum" ]; then
+    debug "capture_hash: no checksum computed (mode=$SCREEN_SAMPLE_MODE)"
+    return 1
+  fi
   debug "Computed hash: $checksum"
   printf '%s\n' "$checksum"
 }
 
-# Keep track of restart bursts so we don’t loop forever
 record_restart() {
   stop_browser
   now=$(date +%s)
   debug "Recording restart at $now (window size=${#restart_times[@]})"
   restart_times=( "${restart_times[@]}" "$now" )
-  # drop timestamps older than RESTART_WINDOW
   while (( ${#restart_times[@]} > 0 && now - restart_times[0] > RESTART_WINDOW )); do
     restart_times=( "${restart_times[@]:1}" )
   done
@@ -1209,37 +1541,42 @@ record_restart() {
   fi
 }
 
-# ——— Browser control ———
 start_browser() {
   need_cmd "$CHROME"
   maybe_defer_launch
-  prewarm_browser_artifacts
   stop_other_browser_sessions
   patch_prefs
-  EXTRA_FLAGS=()
+  local -a extra_flags=()
   if [ "$BROWSER_FLAVOR" = "chromium" ] && [ "$BACKEND" = "wayland" ]; then
-    EXTRA_FLAGS+=( --enable-features=UseOzonePlatform --ozone-platform=wayland )
+    extra_flags+=( --enable-features=UseOzonePlatform --ozone-platform=wayland )
   fi
-  debug "Starting $BROWSER_LABEL with flags: ${FLAGS[*]} ${EXTRA_FLAGS[*]}"
+  if [ "$BROWSER_FLAVOR" = "chromium" ] && [ "$BIRDSEYE_AUTO_FILL" = "true" ]; then
+    ensure_birdseye_extension
+    if [ -n "${BIRDSEYE_EXTENSION_PATH:-}" ]; then
+      extra_flags+=( "--load-extension=$BIRDSEYE_EXTENSION_PATH" "--disable-extensions-except=$BIRDSEYE_EXTENSION_PATH" )
+    fi
+  fi
+  debug "Starting $BROWSER_LABEL with flags: ${FLAGS[*]} ${extra_flags[*]}"
   local launcher=("$CHROME")
   if [ "$BROWSER_FLAVOR" = "firefox" ] && [ "$BACKEND" = "wayland" ]; then
     launcher=(env MOZ_ENABLE_WAYLAND=1 "$CHROME")
   fi
-  as_gui "${launcher[@]}" "${EXTRA_FLAGS[@]}" "${FLAGS[@]}" > /dev/null 2>&1 &
+  as_gui "${launcher[@]}" "${extra_flags[@]}" "${FLAGS[@]}" > /dev/null 2>&1 &
   debug "Launched $BROWSER_LABEL…"
-  sleep "$CHROME_LAUNCH_DELAY"
+  sleep "$CHROME_LAUNCH_DELAY_SECONDS"
 
   LAUNCHER_PID=$!
-  # Wait briefly for the browser to spin up the real process tree
-  sleep "$CHROME_READY_DELAY"
+  sleep "$CHROME_READY_DELAY_SECONDS"
   if [ "$BROWSER_FLAVOR" = "chromium" ]; then
-    if [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
-      BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f "${CHROMIUM_PGREP_PATTERN}" || true)
+    if [ -n "${CHROMIUM_BROWSER_MATCH:-}" ]; then
+      BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "${CHROMIUM_BROWSER_MATCH}" || true)
+    elif [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
+      BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "${CHROMIUM_PGREP_PATTERN}" || true)
     else
-      BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f "--type=browser" || true)
+      BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "--type=browser" || true)
     fi
   else
-    BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f "--profile=${PROFILE_ROOT}" || pgrep -u "$GUI_USER" -o "$(basename "$CHROME")" || true)
+    BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "--profile=${PROFILE_ROOT}" || pgrep -u "$GUI_USER" -o "$(basename "$CHROME")" || true)
   fi
   if [ -z "$BROWSER_PID" ] && kill -0 "$LAUNCHER_PID" 2>/dev/null; then
     BROWSER_PID=$(pgrep -P "$LAUNCHER_PID" -n || echo "$LAUNCHER_PID")
@@ -1253,14 +1590,13 @@ stop_browser() {
     debug "Stopping $BROWSER_LABEL PID=$BROWSER_PID"
     printf 'Stopping %s PID %s…\n' "$BROWSER_LABEL" "$BROWSER_PID"
     kill "$BROWSER_PID"
-    wait "$BROWSER_PID" || true
+    wait "$BROWSER_PID" 2>/dev/null || true
     BROWSER_PID=""
   else
     BROWSER_PID=""
   fi
 }
 
-# Ensure we exit cleanly when systemd (or a user) sends INT/TERM
 handle_shutdown_signal() {
   if [ "$SHUTDOWN_REQUESTED" = "true" ]; then
     return
@@ -1272,7 +1608,6 @@ handle_shutdown_signal() {
   exit 0
 }
 
-# ——— Startup/Shutdown trap ———
 cleanup() {
   local status=$?
   trap - EXIT
@@ -1291,19 +1626,246 @@ cleanup() {
   exit $status
 }
 
+case "$ACTION" in
+  install)
+    install_self "${ACTION_ARGS[@]}"
+    exit 0
+    ;;
+  update)
+    update_self "${ACTION_ARGS[@]}"
+    exit 0
+    ;;
+  remove)
+    remove_self "${ACTION_ARGS[@]}"
+    exit 0
+    ;;
+  reconfig)
+    reconfigure_self
+    exit 0
+    ;;
+  help)
+    usage
+    exit 0
+    ;;
+  version)
+    echo "$SCRIPT_VERSION"
+    exit 0
+    ;;
+esac
+
+set -- "${ACTION_ARGS[@]}"
+
+DEBUG=${DEBUG:-false}
+for arg in "$@"; do
+  if [ "$arg" = "--debug" ]; then
+    DEBUG=true
+    # strip the flag so it doesn't interfere with any future arg parsing
+    set -- "${@/--debug/}"
+    break
+  fi
+done
+
+# ——— Logging ———
+# Default to RAM to reduce SD wear; can override via env LOG=/path/file
+LOG_DEFAULT="/dev/shm/kiosk.log"
+LOG="${LOG:-$LOG_DEFAULT}"
+requested_log="$LOG"
+if ! init_log_file "$LOG"; then
+  fallback_log="/tmp/kiosk-monitor-${UID}.log"
+  if init_log_file "$fallback_log"; then
+    if [ "$requested_log" != "$fallback_log" ]; then
+      printf 'Warning: unable to write to %s; logging to %s instead\n' "$requested_log" "$fallback_log" >&2
+    fi
+    LOG="$fallback_log"
+  else
+    printf 'Error: could not initialise log file at %s or %s\n' "$requested_log" "$fallback_log" >&2
+    exit 1
+  fi
+fi
+# Duplicate all stdout/stderr to both console and logfile
+exec > >(tee -a "$LOG") 2>&1
+need_cmd curl
+need_cmd flock
+requested_lock="$LOCK_FILE"
+if ! open_lock_file "$requested_lock"; then
+  fallback_base="${XDG_RUNTIME_DIR:-}"
+  if [ -n "$fallback_base" ]; then
+    if ! mkdir -p "$fallback_base" 2>/dev/null; then
+      fallback_base=""
+    fi
+  fi
+  if [ -z "$fallback_base" ]; then
+    fallback_base="/tmp"
+  fi
+  lock_fallback="${fallback_base%/}/kiosk-monitor-${UID}.lock"
+  if open_lock_file "$lock_fallback"; then
+    if [ "$requested_lock" != "$lock_fallback" ]; then
+      printf 'Warning: unable to acquire lock at %s; using %s\n' "$requested_lock" "$lock_fallback" >&2
+    fi
+  else
+    printf 'Error: could not create lock file at %s or %s\n' "$requested_lock" "$lock_fallback" >&2
+    exit 1
+  fi
+fi
+if ! flock -n 200; then
+  echo "Another kiosk-monitor instance is already running (lock $LOCK_FILE)." >&2
+  exit 0
+fi
+
+if [ "$DEBUG" = "true" ]; then
+  set -x
+fi
+
+# ----- User / session info -----
+# Prefer pre-set GUI_USER (e.g., from systemd unit). Otherwise, try loginctl.
+if [ -z "${GUI_USER:-}" ]; then
+  if command -v loginctl >/dev/null 2>&1; then
+    GUI_USER=$(loginctl show-session "$(loginctl list-sessions --no-legend | awk '$3=="seat0" {print $1; exit}')" -p Name --value 2>/dev/null || true)
+  fi
+  # Fallback to SUDO_USER if available (but never fall back to root for GUI)
+  if [ -z "$GUI_USER" ] || [ "$GUI_USER" = "root" ]; then
+    GUI_USER="${SUDO_USER:-}"
+  fi
+  if [ -z "$GUI_USER" ] || [ "$GUI_USER" = "root" ]; then
+    echo "No valid GUI user detected (not in a graphical session). Set GUI_USER= in the service env." >&2
+    exit 1
+  fi
+fi
+GUI_UID=$(id -u "$GUI_USER")
+wait_for_gui_session
+if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+  chown "$GUI_USER":"$GUI_USER" "$LOG" 2>/dev/null || true
+fi
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${GUI_UID}}"
+if [ ! -d "$XDG_RUNTIME_DIR" ] && [ "${EUID:-$(id -u)}" -eq 0 ]; then
+  mkdir -p "$XDG_RUNTIME_DIR"
+  chown "$GUI_USER":"$GUI_USER" "$XDG_RUNTIME_DIR"
+  chmod 0700 "$XDG_RUNTIME_DIR"
+elif [ ! -d "$XDG_RUNTIME_DIR" ]; then
+  echo "Warning: XDG_RUNTIME_DIR $XDG_RUNTIME_DIR does not exist; display detection may fail." >&2
+fi
+
+PROFILE_PERSIST_ROOT="${PROFILE_ROOT:-/home/${GUI_USER}/.local/share/kiosk-monitor}"
+PROFILE_RUNTIME_ROOT="$PROFILE_PERSIST_ROOT"
+
+prepare_profile_runtime
+start_profile_sync_timer
+
+PROFILE_ROOT="$PROFILE_RUNTIME_ROOT"
+if [ "$BROWSER_FLAVOR" = "chromium" ]; then
+  profile_regex=$(regex_escape "$PROFILE_ROOT")
+  CHROMIUM_PGREP_PATTERN="--user-data-dir=$profile_regex"
+  CHROMIUM_BROWSER_MATCH="--type=browser"
+  PROFILE_DIR="$PROFILE_ROOT/Default"
+  PROFILE_PREFS="$PROFILE_DIR/Preferences"
+else
+  CHROMIUM_PGREP_PATTERN=""
+  CHROMIUM_BROWSER_MATCH=""
+  PROFILE_DIR="$PROFILE_ROOT"
+  PROFILE_PREFS="$PROFILE_DIR/prefs.js"
+fi
+mkdir -p "$PROFILE_DIR"
+
+BROWSER_PID=""
+SKIP_HEALTH_LOOP=false
+
+URL="${URL:-$DEFAULT_URL}"
+case "$BROWSER_FLAVOR" in
+  chromium)
+    FLAGS=(
+      --kiosk
+      --start-fullscreen
+      --no-first-run
+      --no-default-browser-check
+      --disable-restore-session-state
+      --disable-translate
+      --disable-infobars
+      --disable-session-crashed-bubble
+      '--disable-features=TranslateUI,ChromeWhatsNewUI'
+      --disable-component-update
+      --disable-sync
+      --noerrdialogs
+      --disable-logging
+      --disable-logging-redirect
+      --log-level=3
+      --enable-features=OverlayScrollbar
+      --password-store=basic
+      --allow-running-insecure-content
+      --user-data-dir="$PROFILE_ROOT"
+      --new-window
+      "$URL"
+    )
+    if [ "$DEVTOOLS_AUTO_OPEN" = "true" ]; then
+      FLAGS+=( --auto-open-devtools-for-tabs )
+    fi
+    if [ -n "$DEVTOOLS_REMOTE_PORT" ]; then
+      FLAGS+=( "--remote-debugging-port=$DEVTOOLS_REMOTE_PORT" )
+    fi
+    ;;
+  firefox)
+    FLAGS=(
+      --kiosk
+      --private-window
+      --no-remote
+      --profile="$PROFILE_ROOT"
+      "$URL"
+    )
+    ;;
+esac
+
+# ——— Environment ———
+if [ -z "${DISPLAY:-}" ]; then
+  if command -v loginctl >/dev/null 2>&1; then
+    GUI_DISPLAY=$(loginctl show-user "$GUI_USER" -p Display --value 2>/dev/null || true)
+  fi
+  export DISPLAY=":${GUI_DISPLAY:-0}"
+fi
+export XAUTHORITY="/home/${GUI_USER}/.Xauthority"
+
+# Ensure Wayland session vars exist (if Wayland is active)
+if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
+  if shopt -q nullglob 2>/dev/null; then
+    saved_nullglob=1
+  else
+    saved_nullglob=0
+    shopt -s nullglob 2>/dev/null || true
+  fi
+  for candidate in "$XDG_RUNTIME_DIR"/wayland-*; do
+    if [ -S "$candidate" ]; then
+      WAYLAND_DISPLAY=$(basename "$candidate")
+      export WAYLAND_DISPLAY
+      break
+    fi
+  done
+  if [ "$saved_nullglob" -eq 0 ]; then
+    shopt -u nullglob 2>/dev/null || true
+  fi
+fi
+
+# Identify whether we're on Wayland or X11
+if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+  BACKEND="wayland"
+else
+  BACKEND="x11"
+fi
+printf 'Display backend detected: %s (%s)\n' "$BACKEND" "$(date -Is)"
+debug "Backend=$BACKEND"
+
 trap cleanup EXIT
 trap handle_shutdown_signal INT TERM
 printf '==== START %s at %s ====\n' "$0" "$(date -Is)"
 
 # ——— Initial browser detection and launch ———
 if [ "$BROWSER_FLAVOR" = "chromium" ]; then
-  if [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
-    existing_pid=$(pgrep -u "$GUI_USER" -o -f "${CHROMIUM_PGREP_PATTERN}" || true)
+  if [ -n "${CHROMIUM_BROWSER_MATCH:-}" ]; then
+    existing_pid=$(pgrep -u "$GUI_USER" -o -f -- "${CHROMIUM_BROWSER_MATCH}" || true)
+  elif [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
+    existing_pid=$(pgrep -u "$GUI_USER" -o -f -- "${CHROMIUM_PGREP_PATTERN}" || true)
   else
-    existing_pid=$(pgrep -u "$GUI_USER" -o -f "--type=browser" || true)
+    existing_pid=$(pgrep -u "$GUI_USER" -o -f -- "--type=browser" || true)
   fi
 else
-  existing_pid=$(pgrep -u "$GUI_USER" -o -f "--profile=${PROFILE_ROOT}" || pgrep -u "$GUI_USER" -o "$(basename "$CHROME")" || true)
+  existing_pid=$(pgrep -u "$GUI_USER" -o -f -- "--profile=${PROFILE_ROOT}" || pgrep -u "$GUI_USER" -o "$(basename "$CHROME")" || true)
 fi
 if [ -n "$existing_pid" ]; then
   BROWSER_PID=$existing_pid
@@ -1313,10 +1875,7 @@ if [ -n "$existing_pid" ]; then
   # Ensure server is responding at least once
   if ! health_check; then
     echo "Initial health check failed, waiting for server... ($(date))"
-    until health_check; do
-      echo "  still down at $(date)"
-      sleep 1
-    done
+    wait_for_url_ready
   fi
   # Seed last_hash so display‐stall checking begins immediately
   last_hash=$(capture_hash)
@@ -1325,10 +1884,7 @@ if [ -n "$existing_pid" ]; then
 else
   if [ "$WAIT_FOR_URL" = "true" ]; then
     printf 'Waiting for %s …\n' "$URL"
-    until health_check; do
-      echo "  still down at $(date)"
-      sleep 1
-    done
+    wait_for_url_ready
   else
     echo "Skipping initial reachability wait (WAIT_FOR_URL=false)"
   fi
@@ -1346,7 +1902,7 @@ fi
 consecutive_failures=0
 restart_times=()          # ring‑buffer for storm protection
 last_good=$(date +%s)
-CLEAN_RESET=600   # seconds of healthy run to reset restart history
+# CLEAN_RESET controls how long a healthy run resets restart history
 
 while true; do
 
@@ -1361,26 +1917,30 @@ while true; do
 
   active_pattern=""
   if [ "$BROWSER_FLAVOR" = "chromium" ]; then
-    if [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
-      active_pattern="$CHROMIUM_PGREP_PATTERN"
+    if [ -n "${CHROMIUM_BROWSER_MATCH:-}" ]; then
+      active_pattern="${CHROMIUM_BROWSER_MATCH}"
+    elif [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
+      active_pattern="${CHROMIUM_PGREP_PATTERN}"
     else
       active_pattern="--type=browser"
     fi
   else
     active_pattern="--profile=${PROFILE_ROOT}"
   fi
-  mapfile -t active_browsers < <(pgrep -u "$GUI_USER" -f "$active_pattern" 2>/dev/null || true)
+  mapfile -t active_browsers < <(pgrep -u "$GUI_USER" -f -- "$active_pattern" 2>/dev/null || true)
   if [ "${#active_browsers[@]}" -gt 1 ]; then
     echo "Detected multiple $BROWSER_LABEL processes — pruning extras"
     stop_other_browser_sessions "$BROWSER_PID"
     if [ "$BROWSER_FLAVOR" = "chromium" ]; then
-      if [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
-        BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f "${CHROMIUM_PGREP_PATTERN}" || true)
+      if [ -n "${CHROMIUM_BROWSER_MATCH:-}" ]; then
+        BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "${CHROMIUM_BROWSER_MATCH}" || true)
+      elif [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
+        BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "${CHROMIUM_PGREP_PATTERN}" || true)
       else
-        BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f "--type=browser" || true)
+        BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "--type=browser" || true)
       fi
     else
-      BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f "--profile=${PROFILE_ROOT}" || pgrep -u "$GUI_USER" -o "$(basename "$CHROME")" || true)
+      BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "--profile=${PROFILE_ROOT}" || pgrep -u "$GUI_USER" -o "$(basename "$CHROME")" || true)
     fi
     if [ -z "$BROWSER_PID" ] && kill -0 "$LAUNCHER_PID" 2>/dev/null; then
       BROWSER_PID=$(pgrep -P "$LAUNCHER_PID" -n || true)
