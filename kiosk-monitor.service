@@ -4,6 +4,8 @@ Description=Kiosk Monitor Watchdog
 Documentation=https://github.com/extremeshok/kiosk-monitor
 After=network-online.target graphical.target
 Wants=network-online.target
+StartLimitIntervalSec=0
+StartLimitBurst=0
 
 [Service]
 Type=simple

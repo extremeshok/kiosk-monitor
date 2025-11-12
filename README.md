@@ -65,6 +65,7 @@ The installer seeds an override file. Edit it to customise runtime behaviour.
 | `PROFILE_ROOT`| Directory for the dedicated kiosk browser profile                            | `/home/<GUI_USER>/.local/share/kiosk-monitor` |
 | `LOCK_FILE`   | Path for the single-instance flock lock (non-root users automatically fall back to `$XDG_RUNTIME_DIR/kiosk-monitor.lock` or `/tmp`) | `/var/lock/kiosk-monitor.lock` |
 | `WAIT_FOR_URL`| `true` blocks Chromium until the dashboard responds; set `false` to start immediately | `true` |
+| `MIN_UPTIME_BEFORE_START` | Seconds the Pi must be up before kiosk-monitor proceeds (waits the remainder if boot is too fresh) | `60` |
 | `CHROME_LAUNCH_DELAY` | Seconds to pause after spawning Chromium before checking PIDs        | `3` |
 | `CHROME_READY_DELAY`  | Seconds to pause before detecting the main browser PID               | `2` |
 | `PROFILE_TMPFS` | `true` stages the browser profile in RAM (tmpfs) for faster cold starts | `false` |
@@ -126,6 +127,8 @@ Description=Kiosk Monitor Watchdog
 Documentation=https://github.com/extremeshok/kiosk-monitor
 After=network-online.target graphical.target
 Wants=network-online.target
+StartLimitIntervalSec=0
+StartLimitBurst=0
 
 [Service]
 Type=simple
@@ -149,7 +152,7 @@ WantedBy=graphical.target
 
 Reload systemd after any manual edits: `sudo systemctl daemon-reload`.
 
-`ExecStop` sends the main watchdog process a `TERM`, and `SuccessExitStatus` tells systemd those signal-driven exits are expected (preventing unwanted restarts after `systemctl stop`).
+`ExecStop` sends the main watchdog process a `TERM`, and `SuccessExitStatus` tells systemd those signal-driven exits are expected (preventing unwanted restarts after `systemctl stop`). `StartLimitIntervalSec=0`/`StartLimitBurst=0` disable systemd’s default back-off so kiosk-monitor keeps retrying even if the GUI session is still coming up when the unit first starts.
 
 The unit is tied to both `multi-user.target` and `graphical.target`, so it comes up automatically whether the system boots into a text console or a graphical desktop (no extra symlink juggling on different Pi images).
 

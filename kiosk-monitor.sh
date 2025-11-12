@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 5.2.1
+# kiosk-monitor.sh :: version 5.3.0
 #======================================================================
 # Monitors a Chromium or Firefox kiosk session on Raspberry Pi:
 #  - Launches the browser in fullscreen (kiosk‑style) to a specified URL
@@ -81,7 +81,7 @@ else
   set --
 fi
 
-SCRIPT_VERSION="5.2.1"
+SCRIPT_VERSION="5.3.0"
 
 CONFIG_DIR_DEFAULT="/etc/kiosk-monitor"
 CONFIG_DIR_ENV="${CONFIG_DIR:-}"
@@ -148,6 +148,8 @@ HEALTH_INTERVAL=${HEALTH_INTERVAL:-30}
 HEALTH_CONNECT_TIMEOUT=${HEALTH_CONNECT_TIMEOUT:-3}
 HEALTH_TOTAL_TIMEOUT=${HEALTH_TOTAL_TIMEOUT:-8}
 WAIT_FOR_URL_TIMEOUT=${WAIT_FOR_URL_TIMEOUT:-0}
+SERVICE_START_DELAY=${SERVICE_START_DELAY:-60}
+MIN_UPTIME_BEFORE_START=${MIN_UPTIME_BEFORE_START:-60}
 STALL_RETRIES=${STALL_RETRIES:-3}
 HEALTH_RETRIES=${HEALTH_RETRIES:-6}
 RESTART_WINDOW=${RESTART_WINDOW:-600}
@@ -421,6 +423,10 @@ write_service_unit() {
   local runtime_dir=$3
   local wayland_display=${4:-}
   local target_path=${5:-$SERVICE_PATH}
+  local start_delay="$SERVICE_START_DELAY"
+  if ! [[ "$start_delay" =~ ^[0-9]+$ ]]; then
+    start_delay=0
+  fi
 
   local tmp
   tmp=$(mktemp)
@@ -431,6 +437,8 @@ Description=Kiosk Monitor Watchdog
 Documentation=https://github.com/extremeshok/kiosk-monitor
 After=network-online.target graphical.target
 Wants=network-online.target
+StartLimitIntervalSec=0
+StartLimitBurst=0
 
 [Service]
 Type=simple
@@ -444,6 +452,11 @@ EOF
     fi
     cat <<EOF
 EnvironmentFile=-$CONFIG_FILE
+EOF
+    if [ "$start_delay" -gt 0 ]; then
+      printf 'ExecStartPre=/bin/sleep %s\n' "$start_delay"
+    fi
+    cat <<EOF
 ExecStart=$INSTALL_DIR/kiosk-monitor.sh
 ExecStop=/bin/kill -s TERM \$MAINPID
 Restart=always
@@ -1716,6 +1729,8 @@ if [ "$DEBUG" = "true" ]; then
   set -x
 fi
 
+ensure_minimum_uptime
+
 # ----- User / session info -----
 # Prefer pre-set GUI_USER (e.g., from systemd unit). Otherwise, try loginctl.
 if [ -z "${GUI_USER:-}" ]; then
@@ -1725,6 +1740,11 @@ if [ -z "${GUI_USER:-}" ]; then
   # Fallback to SUDO_USER if available (but never fall back to root for GUI)
   if [ -z "$GUI_USER" ] || [ "$GUI_USER" = "root" ]; then
     GUI_USER="${SUDO_USER:-}"
+  fi
+  if [ -z "$GUI_USER" ] || [ "$GUI_USER" = "root" ]; then
+    if [ "${EUID:-$(id -u)}" -ne 0 ] && [ -n "${USER:-}" ] && [ "$USER" != "root" ]; then
+      GUI_USER="$USER"
+    fi
   fi
   if [ -z "$GUI_USER" ] || [ "$GUI_USER" = "root" ]; then
     echo "No valid GUI user detected (not in a graphical session). Set GUI_USER= in the service env." >&2
@@ -2006,3 +2026,23 @@ while true; do
 
   sleep "$HEALTH_INTERVAL"
 done
+# Ensure the system has been up long enough before we start touching GUI/session state.
+ensure_minimum_uptime() {
+  local min="$MIN_UPTIME_BEFORE_START"
+  if ! [[ "$min" =~ ^[0-9]+$ ]] || [ "$min" -le 0 ]; then
+    return
+  fi
+  local elapsed=0
+  if [ -r /proc/uptime ]; then
+    elapsed=$(awk '{printf "%d\n",$1}' /proc/uptime 2>/dev/null || echo 0)
+  fi
+  if [ "$elapsed" -ge "$min" ]; then
+    return
+  fi
+  local wait=$((min - elapsed))
+  if [ "$wait" -le 0 ]; then
+    wait=60
+  fi
+  echo "System uptime ${elapsed}s < ${min}s — sleeping ${wait}s before kiosk start."
+  sleep "$wait"
+}

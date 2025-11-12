@@ -11,6 +11,7 @@ PROFILE_ROOT=""       # override kiosk profile directory if needed
 WAIT_FOR_URL=true
 CHROME_LAUNCH_DELAY=3
 CHROME_READY_DELAY=2
+MIN_UPTIME_BEFORE_START=60   # ensure the Pi has been up at least N seconds before launching
 PROFILE_TMPFS=false
 PROFILE_TMPFS_PATH="/dev/shm/kiosk-monitor"
 PROFILE_SYNC_BACK=false
