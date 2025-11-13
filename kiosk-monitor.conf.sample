@@ -3,9 +3,8 @@
 
 URL="http://192.168.3.222:30059/?Birdseye"
 GUI_USER=""          # set to the desktop user if auto-detection fails
-BROWSER="chromium"    # set to "firefox" to use Mozilla Firefox
+BROWSER="chromium"    # Chromium/Chrome only
 # CHROMIUM_BIN="/usr/bin/chromium-browser"
-# FIREFOX_BIN="/usr/bin/firefox"
 DEBUG=false
 PROFILE_ROOT=""       # override kiosk profile directory if needed
 WAIT_FOR_URL=true

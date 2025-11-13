@@ -2,9 +2,9 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 5.3.1
+# kiosk-monitor.sh :: version 5.3.2
 #======================================================================
-# Monitors a Chromium or Firefox kiosk session on Raspberry Pi:
+# Monitors a Chromium kiosk session on Raspberry Pi:
 #  - Launches the browser in fullscreen (kiosk‑style) to a specified URL
 #  - Patches browser preferences on every start to suppress crash/restore prompts
 #  - Health‑checks the target URL *and* compares screen hashes to detect visual freezes
@@ -18,7 +18,6 @@
 #       bash, curl, x11-apps, grim, wayland-utils, fbset, coreutils (cksum/base64)
 #   - A graphical session running on seat0 (user is auto‑detected via loginctl)
 #   - Chromium/Chrome installed as /usr/bin/chromium-browser (or set CHROMIUM_BIN)
-#   - Firefox/Firefox-ESR installed as /usr/bin/firefox when BROWSER=firefox
 #======================================================================
 # DEBUGGING:
 #   • Enable verbose output by either:
@@ -81,7 +80,7 @@ else
   set --
 fi
 
-SCRIPT_VERSION="5.3.1"
+SCRIPT_VERSION="5.3.2"
 
 CONFIG_DIR_DEFAULT="/etc/kiosk-monitor"
 CONFIG_DIR_ENV="${CONFIG_DIR:-}"
@@ -184,22 +183,9 @@ case "$BROWSER" in
       CHROME="/usr/bin/chromium-browser"
     fi
     ;;
-  firefox|firefox-esr|ff)
-    BROWSER_FLAVOR="firefox"
-    BROWSER_LABEL="Firefox"
-    if [ -n "${FIREFOX_BIN:-}" ]; then
-      CHROME="$FIREFOX_BIN"
-    elif command -v firefox >/dev/null 2>&1; then
-      CHROME="$(command -v firefox)"
-    elif command -v firefox-esr >/dev/null 2>&1; then
-      CHROME="$(command -v firefox-esr)"
-    else
-      CHROME="/usr/bin/firefox"
-    fi
-    ;;
   *)
     echo "Unsupported BROWSER value: $BROWSER" >&2
-    echo "Set BROWSER to 'chromium' or 'firefox'." >&2
+    echo "Set BROWSER to 'chromium'." >&2
     exit 1
     ;;
 esac
@@ -487,16 +473,6 @@ trim_chromium_cache() {
     "$base/Application Cache" 2>/dev/null || true
 }
 
-trim_firefox_cache() {
-  local base="$PROFILE_DIR"
-  rm -rf \
-    "$base/cache2" \
-    "$base/startupCache" \
-    "$base/OfflineCache" \
-    "$base/shader-cache" \
-    "$base/Crash Reports" 2>/dev/null || true
-}
-
 maybe_defer_launch() {
   if [ "$DEFERRED_LAUNCH_DONE" = "true" ]; then
     return
@@ -612,9 +588,8 @@ render_config_file() {
     else
       echo '# GUI_USER=""   # uncomment to pin the desktop user'
     fi
-    echo 'BROWSER="chromium"   # set to "firefox" to use Mozilla Firefox'
+    echo 'BROWSER="chromium"   # only Chromium/Chrome is supported'
     echo '# CHROMIUM_BIN="/usr/bin/chromium-browser"'
-    echo '# FIREFOX_BIN="/usr/bin/firefox"'
     echo '# DEBUG=false'
     echo '# PROFILE_ROOT=""   # override kiosk profile directory if needed'
     echo '# WAIT_FOR_URL=true   # set to false to skip initial connectivity wait'
@@ -670,7 +645,6 @@ EOF
     emit_config_line GUI_USER "${GUI_USER:-}"
     emit_config_line BROWSER "${BROWSER:-chromium}"
     emit_config_line CHROMIUM_BIN "${CHROMIUM_BIN:-}"
-    emit_config_line FIREFOX_BIN "${FIREFOX_BIN:-}"
     emit_config_line DEBUG "${DEBUG:-false}"
     emit_config_line PROFILE_ROOT "${PROFILE_ROOT:-}"
     emit_config_line WAIT_FOR_URL "${WAIT_FOR_URL:-true}"
@@ -1220,23 +1194,12 @@ stop_other_browser_sessions() {
   local keep_pid=${1:-}
   local tries=0
   while [ $tries -lt 3 ]; do
-    local pattern
-    case "$BROWSER_FLAVOR" in
-      chromium)
-        if [ -n "${CHROMIUM_BROWSER_MATCH:-}" ]; then
-          pattern="$CHROMIUM_BROWSER_MATCH"
-        else
-          pattern="--type=browser"
-        fi
-        ;;
-      firefox)
-        pattern="--profile=${PROFILE_ROOT}"
-        ;;
-      *)
-        pattern="$(basename "$CHROME")"
-        ;;
-    esac
-    if [ -z "$pattern" ]; then
+    local pattern=""
+    if [ -n "${CHROMIUM_BROWSER_MATCH:-}" ]; then
+      pattern="$CHROMIUM_BROWSER_MATCH"
+    elif [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
+      pattern="$CHROMIUM_PGREP_PATTERN"
+    else
       pattern="--type=browser"
     fi
     mapfile -t main_pids < <(pgrep -u "$GUI_USER" -f -- "$pattern" 2>/dev/null || true)
@@ -1263,23 +1226,13 @@ stop_other_browser_sessions() {
     keep_pid=""
   fi
 
-  case "$BROWSER_FLAVOR" in
-    chromium)
-      if [ -n "${CHROMIUM_BROWSER_MATCH:-}" ]; then
-        mapfile -t dupes < <(pgrep -u "$GUI_USER" -f -- "${CHROMIUM_BROWSER_MATCH}" 2>/dev/null || true)
-      elif [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
-        mapfile -t dupes < <(pgrep -u "$GUI_USER" -f -- "${CHROMIUM_PGREP_PATTERN}" 2>/dev/null || true)
-      else
-        mapfile -t dupes < <(pgrep -u "$GUI_USER" -f -- "--type=browser" 2>/dev/null || true)
-      fi
-      ;;
-    firefox)
-      mapfile -t dupes < <(pgrep -u "$GUI_USER" -f -- "--profile=${PROFILE_ROOT}" 2>/dev/null || true)
-      ;;
-    *)
-      mapfile -t dupes < <(pgrep -u "$GUI_USER" -f -- "$(basename "$CHROME")" 2>/dev/null || true)
-      ;;
-  esac
+  if [ -n "${CHROMIUM_BROWSER_MATCH:-}" ]; then
+    mapfile -t dupes < <(pgrep -u "$GUI_USER" -f -- "${CHROMIUM_BROWSER_MATCH}" 2>/dev/null || true)
+  elif [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
+    mapfile -t dupes < <(pgrep -u "$GUI_USER" -f -- "${CHROMIUM_PGREP_PATTERN}" 2>/dev/null || true)
+  else
+    mapfile -t dupes < <(pgrep -u "$GUI_USER" -f -- "--type=browser" 2>/dev/null || true)
+  fi
   if [ "${#dupes[@]}" -gt 1 ]; then
     for pid in "${dupes[@]}"; do
       [ -n "$pid" ] || continue
@@ -1296,19 +1249,11 @@ stop_other_browser_sessions() {
 
 force_ps_browser_cleanup() {
   local keep_pid=${1:-}
-  local keyword=""
-
-  case "$BROWSER_FLAVOR" in
-    chromium)
-      keyword="chromium"
-      ;;
-    firefox)
-      keyword="firefox"
-      ;;
-    *)
-      return
-      ;;
-  esac
+  local keyword
+  keyword="$(basename "$CHROME")"
+  if [ -z "$keyword" ]; then
+    keyword="chromium"
+  fi
 
   need_cmd ps
 
@@ -1338,17 +1283,16 @@ force_ps_browser_cleanup() {
 }
 
 patch_prefs() {
-  if [ "$BROWSER_FLAVOR" = "chromium" ]; then
-    mkdir -p "$PROFILE_DIR"
-    local pref="$PROFILE_PREFS"
-    local local_state="$PROFILE_ROOT/Local State"
+  mkdir -p "$PROFILE_DIR"
+  local pref="$PROFILE_PREFS"
+  local local_state="$PROFILE_ROOT/Local State"
 
-    if [ ! -f "$pref" ]; then
-      printf '{}\n' > "$pref"
-    fi
+  if [ ! -f "$pref" ]; then
+    printf '{}\n' > "$pref"
+  fi
 
-    if command -v python3 >/dev/null 2>&1; then
-      PREF_PATH="$pref" STATE_PATH="$local_state" TARGET_URL="$URL" python3 <<'PYTHON'
+  if command -v python3 >/dev/null 2>&1; then
+    PREF_PATH="$pref" STATE_PATH="$local_state" TARGET_URL="$URL" python3 <<'PYTHON'
 import json
 import os
 
@@ -1396,67 +1340,22 @@ state_profile.setdefault('last_used', 'Default')
 with open(state_path, 'w', encoding='utf-8') as fh:
     json.dump(state, fh, indent=2, sort_keys=True)
 PYTHON
-    else
-      sed -i -E \
-        -e 's/"exited_cleanly":[[:space:]]*false/"exited_cleanly":true/g' \
-        -e 's/"exit_type":[[:space:]]*"Crashed"/"exit_type":"Normal"/g' \
-        "$pref"
-    fi
-
-    find "$PROFILE_DIR" -maxdepth 1 -type f \
-      \( -name 'Current *' -o -name 'Last *' -o -name 'Singleton*' -o -name 'Tabs_*' \) \
-      -delete -print |
-      while read -r f; do echo "  removed $(basename "$f")"; done
-
-    rm -rf "$PROFILE_DIR/Sessions" "$PROFILE_DIR/Session Storage" 2>/dev/null || true
-    rm -f "$PROFILE_DIR"/Singleton* "$PROFILE_ROOT"/Singleton* 2>/dev/null || true
-
-    trim_chromium_cache
-    chown -R "$GUI_USER":"$GUI_USER" "$PROFILE_ROOT"
-    return
+  else
+    sed -i -E \
+      -e 's/"exited_cleanly":[[:space:]]*false/"exited_cleanly":true/g' \
+      -e 's/"exit_type":[[:space:]]*"Crashed"/"exit_type":"Normal"/g' \
+      "$pref"
   fi
 
-  mkdir -p "$PROFILE_DIR"
-  local user_js="$PROFILE_DIR/user.js"
-  local tmp
-  tmp=$(mktemp)
-  cat > "$tmp" <<'EOF'
-user_pref("app.update.auto", false);
-user_pref("app.update.enabled", false);
-user_pref("browser.aboutwelcome.enabled", false);
-user_pref("browser.cache.disk.enable", false);
-user_pref("browser.fullscreen.autohide", false);
-user_pref("browser.fullscreen.animate", false);
-user_pref("browser.shell.checkDefaultBrowser", false);
-user_pref("browser.startup.homepage", "about:blank");
-user_pref("browser.startup.page", 0);
-user_pref("browser.tabs.warnOnClose", false);
-user_pref("browser.tabs.warnOnOpen", false);
-user_pref("browser.warnOnQuitShortcut", false);
-user_pref("browser.sessionstore.resume_from_crash", false);
-user_pref("browser.sessionstore.max_resumed_crashes", 0);
-user_pref("datareporting.healthreport.uploadEnabled", false);
-user_pref("datareporting.policy.dataSubmissionEnabled", false);
-user_pref("dom.disable_open_during_load", false);
-user_pref("media.autoplay.default", 0);
-user_pref("media.ffmpeg.vaapi.enabled", true);
-user_pref("media.hardware-video-decoding.enabled", true);
-user_pref("media.gmp-gmpopenh264.enabled", true);
-user_pref("media.gmp-manager.updateEnabled", true);
-user_pref("sanitizer.promptOnSanitize", false);
-user_pref("signon.rememberSignons", false);
-user_pref("toolkit.startup.max_resumed_crashes", 0);
-EOF
-  install -m 0644 "$tmp" "$user_js"
-  rm -f "$tmp"
+  find "$PROFILE_DIR" -maxdepth 1 -type f \
+    \( -name 'Current *' -o -name 'Last *' -o -name 'Singleton*' -o -name 'Tabs_*' \) \
+    -delete -print |
+    while read -r f; do echo "  removed $(basename "$f")"; done
 
-  rm -f "$PROFILE_DIR"/sessionstore*.jsonlz4 2>/dev/null || true
-  rm -f "$PROFILE_DIR"/sessionCheckpoints*.json 2>/dev/null || true
-  rm -rf "$PROFILE_DIR"/sessionstore-backups 2>/dev/null || true
-  rm -rf "$PROFILE_DIR"/crashes 2>/dev/null || true
-  rm -rf "$PROFILE_DIR"/"Crash Reports" 2>/dev/null || true
+  rm -rf "$PROFILE_DIR/Sessions" "$PROFILE_DIR/Session Storage" 2>/dev/null || true
+  rm -f "$PROFILE_DIR"/Singleton* "$PROFILE_ROOT"/Singleton* 2>/dev/null || true
 
-  trim_firefox_cache
+  trim_chromium_cache
   chown -R "$GUI_USER":"$GUI_USER" "$PROFILE_ROOT"
 }
 
@@ -1560,10 +1459,10 @@ start_browser() {
   stop_other_browser_sessions
   patch_prefs
   local -a extra_flags=()
-  if [ "$BROWSER_FLAVOR" = "chromium" ] && [ "$BACKEND" = "wayland" ]; then
+  if [ "$BACKEND" = "wayland" ]; then
     extra_flags+=( --enable-features=UseOzonePlatform --ozone-platform=wayland )
   fi
-  if [ "$BROWSER_FLAVOR" = "chromium" ] && [ "$BIRDSEYE_AUTO_FILL" = "true" ]; then
+  if [ "$BIRDSEYE_AUTO_FILL" = "true" ]; then
     ensure_birdseye_extension
     if [ -n "${BIRDSEYE_EXTENSION_PATH:-}" ]; then
       extra_flags+=( "--load-extension=$BIRDSEYE_EXTENSION_PATH" "--disable-extensions-except=$BIRDSEYE_EXTENSION_PATH" )
@@ -1571,25 +1470,18 @@ start_browser() {
   fi
   debug "Starting $BROWSER_LABEL with flags: ${FLAGS[*]} ${extra_flags[*]}"
   local launcher=("$CHROME")
-  if [ "$BROWSER_FLAVOR" = "firefox" ] && [ "$BACKEND" = "wayland" ]; then
-    launcher=(env MOZ_ENABLE_WAYLAND=1 "$CHROME")
-  fi
   as_gui "${launcher[@]}" "${extra_flags[@]}" "${FLAGS[@]}" > /dev/null 2>&1 &
   debug "Launched $BROWSER_LABEL…"
   sleep "$CHROME_LAUNCH_DELAY_SECONDS"
 
   LAUNCHER_PID=$!
   sleep "$CHROME_READY_DELAY_SECONDS"
-  if [ "$BROWSER_FLAVOR" = "chromium" ]; then
-    if [ -n "${CHROMIUM_BROWSER_MATCH:-}" ]; then
-      BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "${CHROMIUM_BROWSER_MATCH}" || true)
-    elif [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
-      BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "${CHROMIUM_PGREP_PATTERN}" || true)
-    else
-      BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "--type=browser" || true)
-    fi
+  if [ -n "${CHROMIUM_BROWSER_MATCH:-}" ]; then
+    BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "${CHROMIUM_BROWSER_MATCH}" || true)
+  elif [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
+    BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "${CHROMIUM_PGREP_PATTERN}" || true)
   else
-    BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "--profile=${PROFILE_ROOT}" || pgrep -u "$GUI_USER" -o "$(basename "$CHROME")" || true)
+    BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "--type=browser" || true)
   fi
   if [ -z "$BROWSER_PID" ] && kill -0 "$LAUNCHER_PID" 2>/dev/null; then
     BROWSER_PID=$(pgrep -P "$LAUNCHER_PID" -n || echo "$LAUNCHER_PID")
@@ -1772,66 +1664,46 @@ prepare_profile_runtime
 start_profile_sync_timer
 
 PROFILE_ROOT="$PROFILE_RUNTIME_ROOT"
-if [ "$BROWSER_FLAVOR" = "chromium" ]; then
-  profile_regex=$(regex_escape "$PROFILE_ROOT")
-  CHROMIUM_PGREP_PATTERN="--user-data-dir=$profile_regex"
-  CHROMIUM_BROWSER_MATCH="--type=browser"
-  PROFILE_DIR="$PROFILE_ROOT/Default"
-  PROFILE_PREFS="$PROFILE_DIR/Preferences"
-else
-  CHROMIUM_PGREP_PATTERN=""
-  CHROMIUM_BROWSER_MATCH=""
-  PROFILE_DIR="$PROFILE_ROOT"
-  PROFILE_PREFS="$PROFILE_DIR/prefs.js"
-fi
+profile_regex=$(regex_escape "$PROFILE_ROOT")
+CHROMIUM_PGREP_PATTERN="--user-data-dir=$profile_regex"
+CHROMIUM_BROWSER_MATCH="--type=browser"
+PROFILE_DIR="$PROFILE_ROOT/Default"
+PROFILE_PREFS="$PROFILE_DIR/Preferences"
 mkdir -p "$PROFILE_DIR"
 
 BROWSER_PID=""
 SKIP_HEALTH_LOOP=false
 
 URL="${URL:-$DEFAULT_URL}"
-case "$BROWSER_FLAVOR" in
-  chromium)
-    FLAGS=(
-      --kiosk
-      --start-fullscreen
-      --no-first-run
-      --no-default-browser-check
-      --disable-restore-session-state
-      --disable-translate
-      --disable-infobars
-      --disable-session-crashed-bubble
-      '--disable-features=TranslateUI,ChromeWhatsNewUI'
-      --disable-component-update
-      --disable-sync
-      --noerrdialogs
-      --disable-logging
-      --disable-logging-redirect
-      --log-level=3
-      --enable-features=OverlayScrollbar
-      --password-store=basic
-      --allow-running-insecure-content
-      --user-data-dir="$PROFILE_ROOT"
-      --new-window
-      "$URL"
-    )
-    if [ "$DEVTOOLS_AUTO_OPEN" = "true" ]; then
-      FLAGS+=( --auto-open-devtools-for-tabs )
-    fi
-    if [ -n "$DEVTOOLS_REMOTE_PORT" ]; then
-      FLAGS+=( "--remote-debugging-port=$DEVTOOLS_REMOTE_PORT" )
-    fi
-    ;;
-  firefox)
-    FLAGS=(
-      --kiosk
-      --private-window
-      --no-remote
-      --profile="$PROFILE_ROOT"
-      "$URL"
-    )
-    ;;
-esac
+FLAGS=(
+  --kiosk
+  --start-fullscreen
+  --no-first-run
+  --no-default-browser-check
+  --disable-restore-session-state
+  --disable-translate
+  --disable-infobars
+  --disable-session-crashed-bubble
+  '--disable-features=TranslateUI,ChromeWhatsNewUI'
+  --disable-component-update
+  --disable-sync
+  --noerrdialogs
+  --disable-logging
+  --disable-logging-redirect
+  --log-level=3
+  --enable-features=OverlayScrollbar
+  --password-store=basic
+  --allow-running-insecure-content
+  --user-data-dir="$PROFILE_ROOT"
+  --new-window
+  "$URL"
+)
+if [ "$DEVTOOLS_AUTO_OPEN" = "true" ]; then
+  FLAGS+=( --auto-open-devtools-for-tabs )
+fi
+if [ -n "$DEVTOOLS_REMOTE_PORT" ]; then
+  FLAGS+=( "--remote-debugging-port=$DEVTOOLS_REMOTE_PORT" )
+fi
 
 # ——— Environment ———
 if [ -z "${DISPLAY:-}" ]; then
@@ -1876,16 +1748,12 @@ trap handle_shutdown_signal INT TERM
 printf '==== START %s at %s ====\n' "$0" "$(date -Is)"
 
 # ——— Initial browser detection and launch ———
-if [ "$BROWSER_FLAVOR" = "chromium" ]; then
-  if [ -n "${CHROMIUM_BROWSER_MATCH:-}" ]; then
-    existing_pid=$(pgrep -u "$GUI_USER" -o -f -- "${CHROMIUM_BROWSER_MATCH}" || true)
-  elif [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
-    existing_pid=$(pgrep -u "$GUI_USER" -o -f -- "${CHROMIUM_PGREP_PATTERN}" || true)
-  else
-    existing_pid=$(pgrep -u "$GUI_USER" -o -f -- "--type=browser" || true)
-  fi
+if [ -n "${CHROMIUM_BROWSER_MATCH:-}" ]; then
+  existing_pid=$(pgrep -u "$GUI_USER" -o -f -- "${CHROMIUM_BROWSER_MATCH}" || true)
+elif [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
+  existing_pid=$(pgrep -u "$GUI_USER" -o -f -- "${CHROMIUM_PGREP_PATTERN}" || true)
 else
-  existing_pid=$(pgrep -u "$GUI_USER" -o -f -- "--profile=${PROFILE_ROOT}" || pgrep -u "$GUI_USER" -o "$(basename "$CHROME")" || true)
+  existing_pid=$(pgrep -u "$GUI_USER" -o -f -- "--type=browser" || true)
 fi
 if [ -n "$existing_pid" ]; then
   BROWSER_PID=$existing_pid
@@ -1936,31 +1804,23 @@ while true; do
   fi
 
   active_pattern=""
-  if [ "$BROWSER_FLAVOR" = "chromium" ]; then
-    if [ -n "${CHROMIUM_BROWSER_MATCH:-}" ]; then
-      active_pattern="${CHROMIUM_BROWSER_MATCH}"
-    elif [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
-      active_pattern="${CHROMIUM_PGREP_PATTERN}"
-    else
-      active_pattern="--type=browser"
-    fi
+  if [ -n "${CHROMIUM_BROWSER_MATCH:-}" ]; then
+    active_pattern="${CHROMIUM_BROWSER_MATCH}"
+  elif [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
+    active_pattern="${CHROMIUM_PGREP_PATTERN}"
   else
-    active_pattern="--profile=${PROFILE_ROOT}"
+    active_pattern="--type=browser"
   fi
   mapfile -t active_browsers < <(pgrep -u "$GUI_USER" -f -- "$active_pattern" 2>/dev/null || true)
   if [ "${#active_browsers[@]}" -gt 1 ]; then
     echo "Detected multiple $BROWSER_LABEL processes — pruning extras"
     stop_other_browser_sessions "$BROWSER_PID"
-    if [ "$BROWSER_FLAVOR" = "chromium" ]; then
-      if [ -n "${CHROMIUM_BROWSER_MATCH:-}" ]; then
-        BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "${CHROMIUM_BROWSER_MATCH}" || true)
-      elif [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
-        BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "${CHROMIUM_PGREP_PATTERN}" || true)
-      else
-        BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "--type=browser" || true)
-      fi
+    if [ -n "${CHROMIUM_BROWSER_MATCH:-}" ]; then
+      BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "${CHROMIUM_BROWSER_MATCH}" || true)
+    elif [ -n "${CHROMIUM_PGREP_PATTERN:-}" ]; then
+      BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "${CHROMIUM_PGREP_PATTERN}" || true)
     else
-      BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "--profile=${PROFILE_ROOT}" || pgrep -u "$GUI_USER" -o "$(basename "$CHROME")" || true)
+      BROWSER_PID=$(pgrep -u "$GUI_USER" -o -f -- "--type=browser" || true)
     fi
     if [ -z "$BROWSER_PID" ] && kill -0 "$LAUNCHER_PID" 2>/dev/null; then
       BROWSER_PID=$(pgrep -P "$LAUNCHER_PID" -n || true)

@@ -3,8 +3,7 @@
 Browser watchdog for kiosk-style displays. The service keeps a single kiosk window pinned to your dashboard, restarts the browser when the page or GPU freezes, and scrubs the profile so crash prompts and duplicate tabs never appear after a reboot.
 
 ## Features
-- Launches Chromium or Firefox in kiosk mode against a configurable URL (default Birdseye view)
-- Optional Firefox profile tuning for hardware-accelerated H.264/MJPEG streams
+- Launches Chromium in kiosk mode against a configurable URL (default Birdseye view)
 - Monitors reachability of the target URL and captures screen hashes to detect frozen frames
 - Auto-recovers from network outages, browser crashes, or repeated stalls with storm-protection backoff
 - Self-install, update, and removal via `--install`, `--update`, `--remove`
@@ -16,17 +15,11 @@ Browser watchdog for kiosk-style displays. The service keeps a single kiosk wind
 - Debian/Raspberry Pi OS or other systemd-based distro with a graphical session on `seat0`
 - Packages: `chromium-browser`, `curl`, `sudo`, `x11-apps`, `grim` (Wayland), `wayland-utils`, `fbset`, `coreutils`, `procps` (provides `ps`/`pgrep`)
 - Chromium binary at `/usr/bin/chromium-browser` when `BROWSER=chromium` (override with `CHROMIUM_BIN`)
-- Optional: `firefox`/`firefox-esr` plus `libopenh264-2` (or equivalent) when `BROWSER=firefox`
 
 ## Quick Install
 ```bash
 curl -fsSL https://raw.githubusercontent.com/extremeshok/kiosk-monitor/main/kiosk-monitor.sh \
   | sudo bash -s -- --install --url "http://192.168.3.222:30059/?Birdseye" --gui-user spaceman
-```
-
-To deploy Firefox instead of Chromium, prefix the installer with `BROWSER=firefox` (ensure Firefox and the H.264 codec are installed):
-```bash
-BROWSER=firefox sudo kiosk-monitor.sh --install --url "https://example.local" --gui-user spaceman
 ```
 
 The installer will download `kiosk-monitor.sh` and `kiosk-monitor.service`, place them in `/usr/local/bin` and `/etc/systemd/system`, create `/etc/kiosk-monitor/kiosk-monitor.conf` (alongside a `.sample`), run `systemctl daemon-reload`, and enable/start the service. Use `--no-start` if you want to enable without starting immediately.
@@ -38,9 +31,6 @@ sudo kiosk-monitor.sh --update
 
 # Remove files; add --purge to delete /etc/kiosk-monitor
 sudo kiosk-monitor.sh --remove [--purge]
-
-# Switch browsers during an update
-sudo kiosk-monitor.sh --update --browser firefox
 
 # Refresh / regenerate the config (writes current values plus new defaults)
 sudo kiosk-monitor.sh --reconfig
@@ -58,9 +48,8 @@ The installer seeds an override file. Edit it to customise runtime behaviour.
 | ------------- | --------------------------------------------------------------------------- | ------- |
 | `URL`         | Page to load in browser kiosk mode                                           | Birdseye URL |
 | `GUI_USER`    | Desktop user that owns the display session; autodetected when empty          | *(auto)* |
-| `BROWSER`     | `chromium` (default) or `firefox`                                            | `chromium` |
+| `BROWSER`     | Chromium variant (`chromium`/`chrome` accepted; Chromium-only support)       | `chromium` |
 | `CHROMIUM_BIN`| Override path to Chromium binary                                             | `/usr/bin/chromium-browser` |
-| `FIREFOX_BIN` | Override path to Firefox binary                                              | `/usr/bin/firefox` |
 | `DEBUG`       | Set to `true` for verbose logging                                            | `false` |
 | `PROFILE_ROOT`| Directory for the dedicated kiosk browser profile                            | `/home/<GUI_USER>/.local/share/kiosk-monitor` |
 | `LOCK_FILE`   | Path for the single-instance flock lock (non-root users automatically fall back to `$XDG_RUNTIME_DIR/kiosk-monitor.lock` or `/tmp`) | `/var/lock/kiosk-monitor.lock` |
@@ -160,12 +149,10 @@ Adjust the `User` and `Environment` lines to match the user that owns your kiosk
 
 When `PROFILE_TMPFS=true`, the value of `PROFILE_ROOT` is treated as the persistent on-disk copy that seeds the tmpfs runtime directory.
 
-Set `BROWSER=firefox` in `/etc/kiosk-monitor/kiosk-monitor.conf` (or export it before running the installer) to switch the kiosk engine.
-
 ### Faster Launch Tips (Pi-class hardware)
 - **Run the profile from RAM:** set `PROFILE_TMPFS=true` and optionally `PROFILE_SYNC_BACK=true` to rsync changes back to disk on exit. The default tmpfs path is `/dev/shm/kiosk-monitor`; customise with `PROFILE_TMPFS_PATH` if needed.
 - **Keep the seed warm:** combine `PROFILE_SYNC_BACK=true` with `PROFILE_SYNC_INTERVAL=900` (for example) so the tmpfs profile is mirrored back to persistent storage every 15 minutes.
-- **Seed from a tarball:** build a tuned profile once (for Chromium: `tar -cf /var/lib/kiosk-monitor/profile.tar .config/chromium/Default`; for Firefox, archive your dedicated profile directory) and point `PROFILE_ARCHIVE` to it. Extraction into tmpfs is much quicker than replaying thousands of tiny file operations.
+- **Seed from a tarball:** build a tuned profile once (for example, `tar -cf /var/lib/kiosk-monitor/profile.tar .config/chromium/Default`) and point `PROFILE_ARCHIVE` to it. Extraction into tmpfs is much quicker than replaying thousands of tiny file operations.
 - **Pre-warm on boot:** leave `PREWARM_ENABLED=true` (and optionally extend `PREWARM_PATHS`) so the watchdog touches the browser binary/profile before launch, reducing SD-card cold start times.
 - **Defer the first launch:** set `SESSION_READY_DELAY=15` (and/or a `SESSION_READY_CMD`) to give the desktop stack a chance to finish initialising before the kiosk browser starts.
 - **Skip the initial URL wait:** if the dashboard is occasionally slow, set `WAIT_FOR_URL=false` so Chromium begins loading immediately while the watchdog continues health checks in the background.
