@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 5.3.2
+# kiosk-monitor.sh :: version 5.3.3
 #======================================================================
 # Monitors a Chromium kiosk session on Raspberry Pi:
 #  - Launches the browser in fullscreen (kiosk‑style) to a specified URL
@@ -80,7 +80,7 @@ else
   set --
 fi
 
-SCRIPT_VERSION="5.3.2"
+SCRIPT_VERSION="5.3.3"
 
 CONFIG_DIR_DEFAULT="/etc/kiosk-monitor"
 CONFIG_DIR_ENV="${CONFIG_DIR:-}"
@@ -147,7 +147,6 @@ HEALTH_INTERVAL=${HEALTH_INTERVAL:-30}
 HEALTH_CONNECT_TIMEOUT=${HEALTH_CONNECT_TIMEOUT:-3}
 HEALTH_TOTAL_TIMEOUT=${HEALTH_TOTAL_TIMEOUT:-8}
 WAIT_FOR_URL_TIMEOUT=${WAIT_FOR_URL_TIMEOUT:-0}
-SERVICE_START_DELAY=${SERVICE_START_DELAY:-60}
 MIN_UPTIME_BEFORE_START=${MIN_UPTIME_BEFORE_START:-60}
 STALL_RETRIES=${STALL_RETRIES:-3}
 HEALTH_RETRIES=${HEALTH_RETRIES:-6}
@@ -409,9 +408,10 @@ write_service_unit() {
   local runtime_dir=$3
   local wayland_display=${4:-}
   local target_path=${5:-$SERVICE_PATH}
-  local start_delay="$SERVICE_START_DELAY"
-  if ! [[ "$start_delay" =~ ^[0-9]+$ ]]; then
-    start_delay=0
+  local dependency=${6:-}
+  local after_targets="network-online.target graphical.target"
+  if [ -n "$dependency" ]; then
+    after_targets="$after_targets $dependency"
   fi
 
   local tmp
@@ -421,13 +421,20 @@ write_service_unit() {
 [Unit]
 Description=Kiosk Monitor Watchdog
 Documentation=https://github.com/extremeshok/kiosk-monitor
-After=network-online.target graphical.target
+After=$after_targets
 Wants=network-online.target
+EOF
+    if [ -n "$dependency" ]; then
+      printf 'Requires=%s\n' "$dependency"
+    fi
+    cat <<'EOF'
 StartLimitIntervalSec=0
 StartLimitBurst=0
 
 [Service]
 Type=simple
+EOF
+    cat <<EOF
 User=$gui_user
 Environment=GUI_USER=$gui_user
 Environment=DISPLAY=$display
@@ -438,11 +445,6 @@ EOF
     fi
     cat <<EOF
 EnvironmentFile=-$CONFIG_FILE
-EOF
-    if [ "$start_delay" -gt 0 ]; then
-      printf 'ExecStartPre=/bin/sleep %s\n' "$start_delay"
-    fi
-    cat <<EOF
 ExecStart=$INSTALL_DIR/kiosk-monitor.sh
 ExecStop=/bin/kill -s TERM \$MAINPID
 Restart=always
@@ -459,6 +461,17 @@ EOF
   } > "$tmp"
   install -m 0644 "$tmp" "$target_path"
   rm -f "$tmp"
+}
+
+tailscaled_dependency_unit() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 1
+  fi
+  if systemctl is-enabled --quiet tailscaled.service >/dev/null 2>&1; then
+    printf 'tailscaled.service\n'
+    return 0
+  fi
+  return 1
 }
 
 trim_chromium_cache() {
@@ -817,7 +830,13 @@ install_self() {
   fi
   ensure_config_file "$url_override" "$gui_override" "$browser_override"
 
-  write_service_unit "$effective_gui" "$effective_display" "$runtime_dir" "$wayland_display" "$SERVICE_PATH"
+  local service_dependency=""
+  local dependency=""
+  if dependency=$(tailscaled_dependency_unit); then
+    service_dependency="$dependency"
+  fi
+
+  write_service_unit "$effective_gui" "$effective_display" "$runtime_dir" "$wayland_display" "$SERVICE_PATH" "$service_dependency"
 
   systemctl daemon-reload
   if [ "$autostart" = "yes" ]; then
@@ -928,7 +947,13 @@ update_self() {
     ensure_config_file "" "" "$browser_override"
   fi
 
-  write_service_unit "$effective_gui" "$effective_display" "$runtime_dir" "$wayland_display" "$SERVICE_PATH"
+  local service_dependency=""
+  local dependency=""
+  if dependency=$(tailscaled_dependency_unit); then
+    service_dependency="$dependency"
+  fi
+
+  write_service_unit "$effective_gui" "$effective_display" "$runtime_dir" "$wayland_display" "$SERVICE_PATH" "$service_dependency"
 
   systemctl daemon-reload
   if [ "$was_active" = "yes" ] && [ "$suppress_restart" = "no" ]; then
@@ -1402,28 +1427,194 @@ wait_for_url_ready() {
 
 capture_hash() {
   local checksum=""
+  local capture_tmp=""
+  capture_tmp=$(mktemp 2>/dev/null) || return 1
+
   local -a cmd=()
   if [ "$BACKEND" = "wayland" ]; then
     cmd=(as_gui grim "${GRIM_OUT_OPT[@]}" -t ppm - -)
-    debug "Capturing Wayland frame via grim (mode=$SCREEN_SAMPLE_MODE, bytes=$SCREEN_SAMPLE_BYTES)"
+    debug "Capturing Wayland frame via grim for freeze detection (mode=$SCREEN_SAMPLE_MODE)"
   else
     cmd=(as_gui xwd -silent -root -display "$DISPLAY")
-    debug "Capturing X11 frame via xwd (mode=$SCREEN_SAMPLE_MODE, bytes=$SCREEN_SAMPLE_BYTES)"
+    debug "Capturing X11 frame via xwd for freeze detection (mode=$SCREEN_SAMPLE_MODE)"
   fi
 
-  if [ "$SCREEN_SAMPLE_MODE" = "full" ]; then
-    checksum=$(
-      {
-        "${cmd[@]}" 2>/dev/null || true
-      } | cksum | awk '{print $1}'
-    )
-  else
-    checksum=$(
-      {
-        "${cmd[@]}" 2>/dev/null || true
-      } | head -c "$SCREEN_SAMPLE_BYTES" | cksum | awk '{print $1}'
-    )
+  if ! "${cmd[@]}" >"$capture_tmp" 2>/dev/null; then
+    debug "capture_hash: screenshot command failed"
+    rm -f "$capture_tmp"
+    return 1
   fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    local python_hash_status=0
+    checksum=$(
+      HASH_MODE="$SCREEN_SAMPLE_MODE" python3 - "$capture_tmp" <<'PYTHON'
+import hashlib
+import os
+import struct
+import sys
+
+MODE = os.environ.get("HASH_MODE", "sample").strip().lower()
+if MODE not in ("sample", "full"):
+    MODE = "sample"
+
+def half_or_full(value):
+    if MODE == "full":
+        return value
+    return value // 2 if value > 1 else value
+
+def hash_ppm(path):
+    with open(path, "rb") as fh:
+        magic = fh.read(2)
+        if magic != b"P6":
+            return None
+
+        def read_token():
+            token = bytearray()
+            while True:
+                ch = fh.read(1)
+                if not ch:
+                    return None
+                if ch == b"#":
+                    fh.readline()
+                    continue
+                if ch in b" \t\r\n":
+                    if token:
+                        return token.decode("ascii")
+                    continue
+                token.append(ch[0])
+
+        def skip_to_data():
+            while True:
+                ch = fh.read(1)
+                if not ch:
+                    return
+                if ch not in b" \t\r\n":
+                    fh.seek(-1, 1)
+                    return
+
+        width_token = read_token()
+        height_token = read_token()
+        maxval_token = read_token()
+        if not width_token or not height_token or not maxval_token:
+            return None
+        width = int(width_token)
+        height = int(height_token)
+        maxval = int(maxval_token)
+        if width <= 0 or height <= 0:
+            return None
+        bytes_per_channel = 2 if maxval > 255 else 1
+        skip_to_data()
+        region_w = half_or_full(width)
+        region_h = half_or_full(height)
+        row_bytes = width * 3 * bytes_per_channel
+        region_bytes = region_w * 3 * bytes_per_channel
+        hasher = hashlib.sha256()
+        for row in range(height):
+            row_data = fh.read(row_bytes)
+            if len(row_data) != row_bytes:
+                return None
+            if row < region_h:
+                hasher.update(row_data[:region_bytes])
+        return hasher.hexdigest()
+
+def hash_xwd(path):
+    with open(path, "rb") as fh:
+        header = fh.read(100)
+        if len(header) != 100:
+            return None
+        values = None
+        endian = None
+        for fmt in ("<", ">"):
+            try:
+                candidate = struct.unpack(fmt + "25I", header)
+            except struct.error:
+                continue
+            header_size = candidate[0]
+            width = candidate[4]
+            height = candidate[5]
+            bytes_per_line = candidate[12]
+            ncolors = candidate[19]
+            bits_per_pixel = candidate[11]
+            if (
+                100 <= header_size <= 65536
+                and 0 < width <= 20000
+                and 0 < height <= 12000
+                and 0 < bytes_per_line <= 163840
+            ):
+                values = candidate
+                endian = fmt
+                break
+        if values is None:
+            return None
+
+        header_size = values[0]
+        width = values[4]
+        height = values[5]
+        bits_per_pixel = values[11]
+        bytes_per_line = values[12]
+        ncolors = values[19]
+
+        remaining = header_size - 100
+        if remaining < 0:
+            return None
+        if remaining:
+            skipped = fh.read(remaining)
+            if len(skipped) != remaining:
+                return None
+
+        color_entry_size = 12
+        cmap_bytes = ncolors * color_entry_size
+        if cmap_bytes:
+            skipped = fh.read(cmap_bytes)
+            if len(skipped) != cmap_bytes:
+                return None
+
+        bytes_per_pixel = max(1, (bits_per_pixel + 7) // 8)
+        region_w = half_or_full(width)
+        region_h = half_or_full(height)
+        region_bytes = min(bytes_per_line, region_w * bytes_per_pixel)
+        hasher = hashlib.sha256()
+        for row in range(height):
+            row_data = fh.read(bytes_per_line)
+            if len(row_data) != bytes_per_line:
+                return None
+            if row < region_h:
+                hasher.update(row_data[:region_bytes])
+        return hasher.hexdigest()
+
+def main():
+    path = sys.argv[1]
+    digest = hash_ppm(path)
+    if digest is None:
+        digest = hash_xwd(path)
+    if digest is None:
+        raise SystemExit(1)
+    print(digest)
+
+if __name__ == "__main__":
+    main()
+PYTHON
+    )
+    python_hash_status=$?
+    checksum=$(printf '%s' "$checksum" | tr -d '[:space:]')
+    if [ $python_hash_status -ne 0 ]; then
+      checksum=""
+    fi
+  fi
+
+  if [ -z "$checksum" ]; then
+    debug "capture_hash: falling back to simple byte hashing"
+    if [ "$SCREEN_SAMPLE_MODE" = "full" ]; then
+      checksum=$(sha256sum "$capture_tmp" 2>/dev/null | awk '{print $1}')
+    else
+      checksum=$(
+        head -c "$SCREEN_SAMPLE_BYTES" "$capture_tmp" 2>/dev/null | sha256sum | awk '{print $1}'
+      )
+    fi
+  fi
+
+  rm -f "$capture_tmp"
 
   if [ -z "$checksum" ]; then
     debug "capture_hash: no checksum computed (mode=$SCREEN_SAMPLE_MODE)"
@@ -1591,6 +1782,7 @@ fi
 exec > >(tee -a "$LOG") 2>&1
 need_cmd curl
 need_cmd flock
+need_cmd sha256sum
 requested_lock="$LOCK_FILE"
 if ! open_lock_file "$requested_lock"; then
   fallback_base="${XDG_RUNTIME_DIR:-}"

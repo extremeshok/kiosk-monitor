@@ -26,8 +26,8 @@ SESSION_READY_CMD=""
 SESSION_READY_TIMEOUT=0
 GUI_SESSION_WAIT_TIMEOUT=120   # wait up to N seconds for the GUI user’s loginctl session before launching (0 disables)
 WAIT_FOR_URL_TIMEOUT=0         # seconds to wait for initial health check before proceeding anyway (0=wait forever)
-SCREEN_SAMPLE_BYTES=524288     # bytes hashed per capture for freeze detection (increase for high-res dashboards)
-SCREEN_SAMPLE_MODE="sample"    # set to "full" to hash the entire capture each cycle (higher CPU/bandwidth)
+SCREEN_SAMPLE_BYTES=524288     # bytes hashed when region hashing fails (legacy fallback)
+SCREEN_SAMPLE_MODE="sample"    # "sample" hashes the top-left 50% via SHA-256; set to "full" for the entire frame
 SCREEN_DELAY=120               # seconds the browser must run before screen-freeze checks begin
 HEALTH_INTERVAL=30             # seconds between health-check cycles
 HEALTH_CONNECT_TIMEOUT=2       # curl connect timeout (seconds) for health checks

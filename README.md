@@ -72,8 +72,8 @@ The installer seeds an override file. Edit it to customise runtime behaviour.
 | `SESSION_READY_TIMEOUT` | Max seconds to wait for `SESSION_READY_CMD` (0 = wait forever)         | `0` |
 | `GUI_SESSION_WAIT_TIMEOUT` | Seconds to wait for the GUI user’s login session before launching (0 disables) | `120` |
 | `WAIT_FOR_URL_TIMEOUT` | Seconds to wait for the initial health probe before continuing anyway (0 = wait forever) | `0` |
-| `SCREEN_SAMPLE_BYTES` | Bytes hashed from each screenshot during freeze detection                | `524288` |
-| `SCREEN_SAMPLE_MODE` | `sample` hashes only the first `SCREEN_SAMPLE_BYTES`; `full` hashes the entire frame | `sample` |
+| `SCREEN_SAMPLE_BYTES` | Bytes hashed when falling back to legacy sampling (used only if region hashing fails) | `524288` |
+| `SCREEN_SAMPLE_MODE` | `sample` hashes the top-left 50% of the frame; `full` hashes the entire screenshot | `sample` |
 | `SCREEN_DELAY` | Seconds the browser must run before screen-freeze hashing starts             | `120` |
 | `LOG`         | Optional override for the runtime log (default `/dev/shm/kiosk.log`)         | *(unset)* |
 | `HEALTH_INTERVAL` | Seconds between health-check cycles                                      | `30` |
@@ -94,7 +94,7 @@ Apply changes with `sudo systemctl restart kiosk-monitor`.
 
 The installer also writes `/etc/kiosk-monitor/kiosk-monitor.conf.sample`; copy or diff against it when introducing new options.
 All management commands accept `--config /path/to/config.conf` if you need to operate on an alternate configuration file.
-By default the watchdog waits up to `GUI_SESSION_WAIT_TIMEOUT` seconds for the GUI user’s `loginctl` session to appear before launching, and it hashes `SCREEN_SAMPLE_BYTES` from each screenshot (`SCREEN_SAMPLE_MODE=sample`) when checking for stuck frames. Increase the bytes or switch to `SCREEN_SAMPLE_MODE=full` if you have high-resolution dashboards that continue to animate outside the sampled region.
+By default the watchdog waits up to `GUI_SESSION_WAIT_TIMEOUT` seconds for the GUI user’s `loginctl` session to appear before launching, and it hashes the top-left 50% of each screenshot (`SCREEN_SAMPLE_MODE=sample`) with SHA-256 when checking for stuck frames. Switch to `SCREEN_SAMPLE_MODE=full` to hash the entire frame, and adjust `SCREEN_SAMPLE_BYTES` only if you need to tune the legacy byte-sampling fallback.
 
 ## Runtime Behaviour
 - Logs are mirrored to stdout and `/dev/shm/kiosk.log` (override via `LOG`)
@@ -148,6 +148,8 @@ The unit is tied to both `multi-user.target` and `graphical.target`, so it comes
 Adjust the `User` and `Environment` lines to match the user that owns your kiosk session (for example, `pi`).
 
 When `PROFILE_TMPFS=true`, the value of `PROFILE_ROOT` is treated as the persistent on-disk copy that seeds the tmpfs runtime directory.
+
+If the host already has `tailscaled.service` enabled, `kiosk-monitor.sh --install/--update` automatically adds `Requires=tailscaled.service` and includes it in the `After=` chain so kiosk-monitor waits for the Tailscale tunnel before starting the browser.
 
 ### Faster Launch Tips (Pi-class hardware)
 - **Run the profile from RAM:** set `PROFILE_TMPFS=true` and optionally `PROFILE_SYNC_BACK=true` to rsync changes back to disk on exit. The default tmpfs path is `/dev/shm/kiosk-monitor`; customise with `PROFILE_TMPFS_PATH` if needed.
