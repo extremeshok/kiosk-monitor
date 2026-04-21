@@ -4,20 +4,26 @@ Watchdog for kiosk-style displays. Launches Chromium in fullscreen kiosk mode **
 
 ## Features
 - **Two launch modes** per instance: `chrome` (fullscreen Chromium) or `vlc` (fullscreen video player).
+- **Works on Wayland or X11** — detects labwc/wayfire/sway/… or an X11 DISPLAY and picks the right capture + output tooling automatically.
 - **Dual-display** support (**experimental**) — Chromium can be routed to specific outputs via a generated labwc window rule; VLC routing is unreliable because its Wayland window identity isn't easily matched. Single-instance (one display) is the supported configuration today.
-- **Per-output freeze detection** using `grim`: each instance is checked against its own monitor so a hang on one display never restarts the other.
+- **"Waiting for target" page** — when the configured kiosk URL isn't reachable at startup, Chromium launches a local HTML page that shows the target, a spinner, and the retry count; its JS polls the URL and auto-navigates once it responds. No more silent blank screens.
+- **Per-output freeze detection** using `grim` (Wayland) or `xwd` (X11): each instance is checked against its own monitor so a hang on one display never restarts the other.
 - **URL health checks** for http/https targets, independent per instance.
 - **Automatic restart** on frozen screens, dead processes, or repeated health failures, with per-instance storm-protection backoff.
 - **Auto-detects the default desktop user** (active seat0 session → systemd autologin → lightdm autologin → SUDO_USER → first non-system UID).
-- **Waits for the desktop to be open** before launching (labwc process + `wayland-*` socket).
-- **Self-install / update / remove** via `--install`, `--update`, `--remove`, `--reconfig`, `--status`.
+- **Waits for the desktop to be open** before launching (Wayland compositor or X11 DISPLAY probed in sequence).
+- **Self-install / update / remove** via `--install`, `--update`, `--remove`, `--reconfig`, `--configure` (interactive TUI), `--logs`, `--status`.
+- **Interactive configuration TUI** (`whiptail`): run `sudo kiosk-monitor` from a terminal for a menu-driven editor of every supported option; all config is persisted in `/etc/kiosk-monitor/kiosk-monitor.conf`, so hand-editing the file is always an option too.
+- **SIGHUP config reload** — `sudo systemctl reload kiosk-monitor` stops all instances, re-reads the config, and relaunches without a full restart.
+- **Short-name launcher** — `/usr/local/bin/kiosk-monitor` (no `.sh`). No-arg invocation from a terminal opens the TUI; systemd uses `kiosk-monitor --run` to start the watchdog explicitly.
 - Dedicated, isolated Chromium profiles per instance (no "restore previous session" prompts, no duplicate tabs).
 - Optional tmpfs profile staging, prewarm, and periodic sync back to disk.
+- Log rotation (copy-truncate) on `/dev/shm/kiosk.log`; configurable via `LOG_MAX_BYTES` / `LOG_ROTATE_KEEP`.
 
 ## Requirements
 - **Raspberry Pi OS trixie 64-bit Desktop** (Debian 13) or newer — this is the minimum supported platform.
-- Wayland (labwc compositor — default on trixie desktop).
-- Needed packages: `chromium`, `vlc`, `grim`, `wlr-randr`, `whiptail`, `curl`, `python3`, `sudo`. Most are preinstalled on the stock Desktop image; any that are missing are installed automatically by `--install` / `--update` via `apt-get`. Pass `--skip-apt` to opt out.
+- Either a Wayland compositor (labwc on the stock trixie Desktop) **or** an X11 session (e.g. LightDM's `rpd-x`). Both are auto-detected.
+- Needed packages: `chromium`, `vlc`, `curl`, `python3`, `sudo`, plus `grim` + `wlr-randr` on Wayland or `x11-apps` (xwd) + `x11-xserver-utils` (xset, xrandr) on X11; `whiptail` for the TUI. Anything missing is installed automatically by `--install` / `--update` via `apt-get`. Pass `--skip-apt` to opt out.
 
 ## Quick install
 ```bash
@@ -149,15 +155,26 @@ VLC (`MODE=vlc`):
 | `PREWARM_SLICE_SIZE`     | Bytes read from each file during prewarm                                       | `262144` |
 
 ## Runtime behaviour
-- Logs go to stdout and `/dev/shm/kiosk.log` (override via `LOG=...`). Follow them live with `journalctl -u kiosk-monitor -f`.
-- Each Chromium instance runs with its own `--user-data-dir`, isolating cookies/session state.
+- Logs go to stdout and `/dev/shm/kiosk.log` (override via `LOG=...`). Follow them live with `sudo kiosk-monitor --logs` or `journalctl -u kiosk-monitor -f`. The log file is copy-truncated once it exceeds `LOG_MAX_BYTES` (default 2 MiB); the previous copy is kept at `${LOG}.1` when `LOG_ROTATE_KEEP > 0`.
+- Each Chromium instance runs with its own `--user-data-dir`, isolating cookies/session state. Chromium is launched with `--ozone-platform=wayland` on Wayland and `--ozone-platform=x11` on X11.
 - VLC runs with `--intf=dummy` (no UI), `--fullscreen`, and a unique `--logfile` as a process fingerprint.
-- Window placement is computed from `wlr-randr --json`: each instance launches at its output's top-left with that output's native resolution, and labwc fullscreens it to the containing monitor.
-- Freeze detection uses `grim -o <OUTPUT>` so each instance is compared only against its own monitor.
+- Window placement is computed from `wlr-randr --json` on Wayland or `xrandr --query` on X11: each instance launches at its output's top-left with that output's native resolution, and the compositor fullscreens it to the containing monitor.
+- Freeze detection uses `grim -o <OUTPUT>` on Wayland or `xwd -root` on X11; on Wayland each instance is compared against its own monitor, on X11 against the whole root (single-display setups).
+- Sending `SIGHUP` (via `sudo systemctl reload kiosk-monitor`) re-reads the config file, stops all instances, and relaunches. Editing the config file directly and reloading is always an option.
+
+## Waiting page
+When a Chromium instance's configured URL isn't reachable at launch time, `kiosk-monitor` generates `/tmp/kiosk-monitor-waiting-<id>.html` and points Chromium at that `file://` page instead of leaving the display blank or showing Chromium's error page. The page:
+- shows the target URL prominently with a "Waiting for kiosk target" headline and a spinner;
+- polls the target via `fetch(URL, { mode: 'no-cors' })` every 3 seconds in the browser (no bash involved);
+- navigates to the real URL the moment the target responds (any response — 200, 302, 401, 500 — all count).
+
+No configuration toggle: the waiting page is only used when the target fails the initial health probe. If the URL is reachable, Chromium launches directly at it with no indirection. The same flow applies when the watchdog restarts a chrome instance mid-run.
+
+VLC instances still block on the old `wait_for_url_ready_instance` loop (no in-player equivalent); only Chromium gets the visual fallback.
 
 ## Manual run / debugging
 ```bash
-sudo LOG=/tmp/kiosk.log DEBUG=true /usr/local/bin/kiosk-monitor.sh --debug
+sudo LOG=/tmp/kiosk.log DEBUG=true /usr/local/bin/kiosk-monitor --run --debug
 ```
 Press `Ctrl+C` to stop; systemd will relaunch if the service is enabled.
 
