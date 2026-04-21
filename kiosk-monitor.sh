@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 6.4.0
+# kiosk-monitor.sh :: version 6.5.0
 # ======================================================================
 # Kiosk watchdog for Raspberry Pi OS trixie 64-bit (or newer Debian/RPi).
 # Supports Chromium fullscreen kiosk and VLC fullscreen video playback,
@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.4.0"
+SCRIPT_VERSION="6.5.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 
 # ------------------------------------------------------------------
@@ -1156,6 +1156,80 @@ process_alive() {
   kill -0 "$pid" 2>/dev/null
 }
 
+write_waiting_page() {
+  # Render a local HTML file that shows "Waiting for URL" and has inline JS
+  # that polls the target URL and auto-navigates to it once it responds.
+  # Echoes the file:// URL of the generated page.
+  local id=$1
+  local url="${INSTANCE_URL[$id]}"
+  local path="/tmp/kiosk-monitor-waiting-${id}.html"
+  local esc_js esc_html
+  esc_js=$(printf '%s' "$url" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+  esc_html=$(printf '%s' "$url" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+  cat > "$path" <<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>kiosk-monitor — waiting for target</title>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body { background: #0b0f19; color: #e4e8f1;
+           font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+           display: flex; justify-content: center; align-items: center;
+           text-align: center; }
+    .card { max-width: 80%; padding: 2rem 2.5rem; }
+    h1 { font-size: clamp(1.5rem, 3vw, 3rem); margin: 0 0 0.75rem; font-weight: 600; }
+    .muted { opacity: 0.7; font-size: 1.1rem; }
+    .url { color: #7dd3fc; word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+           display: inline-block; padding: 0.5rem 1rem; background: #111827;
+           border-radius: 6px; margin-top: 0.5rem; }
+    .spinner { width: 52px; height: 52px; margin: 2rem auto 1rem;
+               border: 5px solid #1f2937; border-top-color: #7dd3fc;
+               border-radius: 50%; animation: spin 1s linear infinite; }
+    .status { color: #fbbf24; margin-top: 1rem; font-size: 0.95rem; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>Waiting for kiosk target</h1>
+    <div class="muted">kiosk-monitor will load it here as soon as it responds.</div>
+    <div class="url">${esc_html}</div>
+    <div class="spinner"></div>
+    <div class="status">Attempt <span id="attempts">0</span> — retrying every <span id="delay">3</span>s</div>
+  </main>
+  <script>
+    (function () {
+      const TARGET = "${esc_js}";
+      const RETRY_MS = 3000;
+      let attempts = 0;
+      const attemptsEl = document.getElementById('attempts');
+      async function tick() {
+        attempts += 1;
+        if (attemptsEl) attemptsEl.textContent = attempts;
+        try {
+          // no-cors: resolves for any server response, rejects only on
+          // actual network failure. Perfect signal for "is the target up?".
+          await fetch(TARGET, { mode: 'no-cors', cache: 'no-store' });
+          window.location.replace(TARGET);
+        } catch (e) {
+          setTimeout(tick, RETRY_MS);
+        }
+      }
+      tick();
+    })();
+  </script>
+</body>
+</html>
+HTML
+  chmod 0644 "$path"
+  if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+    chown "$GUI_USER":"$GUI_USER" "$path" 2>/dev/null || true
+  fi
+  printf 'file://%s\n' "$path"
+}
+
 # ======================================================================
 # Per-instance launch / stop
 # ======================================================================
@@ -1219,9 +1293,24 @@ launch_chrome_instance() {
   fi
   [ "$DEVTOOLS_AUTO_OPEN" = "true" ] && flags+=( --auto-open-devtools-for-tabs )
   [ -n "$DEVTOOLS_REMOTE_PORT" ] && flags+=( "--remote-debugging-port=$DEVTOOLS_REMOTE_PORT" )
-  flags+=( "$url" )
 
-  log_instance "$id" "Launching Chromium on $name (${w}x${h}+${x}+${y}) → $url"
+  # Pick the URL we hand to Chromium. When the real target isn't reachable
+  # yet, point Chromium at a local "Waiting for target" page; its JS polls
+  # the target and navigates to it as soon as it responds — so the kiosk
+  # never shows a bare error page and operators see something useful on
+  # the display while the upstream is coming up.
+  local launch_url="$url"
+  case "$url" in
+    http://*|https://*)
+      if ! health_check_instance "$id" >/dev/null 2>&1; then
+        launch_url=$(write_waiting_page "$id")
+        log_instance "$id" "Target not reachable yet — launching with waiting page, JS will redirect when $url responds."
+      fi
+      ;;
+  esac
+  flags+=( "$launch_url" )
+
+  log_instance "$id" "Launching Chromium on $name (${w}x${h}+${x}+${y}) → $launch_url"
   as_gui "$chrome" "${flags[@]}" >/dev/null 2>&1 &
   local launcher_pid=$!
   sleep "$CHROME_LAUNCH_DELAY"
@@ -3224,10 +3313,13 @@ log "Desktop user: $GUI_USER (uid=$GUI_UID), WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-
 log "Outputs: ${OUTPUTS_NAMES[*]:-none}"
 log "Instances: ${INSTANCES[*]}"
 
-# --- health-gate for chrome instances with http URLs ---
+# --- health-gate for VLC instances (chrome shows a waiting page instead) ---
+# Chromium launches immediately with a local "Waiting for target" page
+# (launch_chrome_instance → write_waiting_page) that redirects itself when
+# the real URL responds. VLC has no such fallback so we still block here.
 if [ "$WAIT_FOR_URL" = "true" ]; then
   for id in "${INSTANCES[@]}"; do
-    if [ "${INSTANCE_MODE[$id]}" = "chrome" ]; then
+    if [ "${INSTANCE_MODE[$id]}" = "vlc" ]; then
       log_instance "$id" "waiting for ${INSTANCE_URL[$id]} …"
       wait_for_url_ready_instance "$id" || true
     fi
