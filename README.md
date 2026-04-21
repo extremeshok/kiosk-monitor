@@ -168,9 +168,18 @@ When a Chromium instance's configured URL isn't reachable at launch time, `kiosk
 - polls the target via `fetch(URL, { mode: 'no-cors' })` every 3 seconds in the browser (no bash involved);
 - navigates to the real URL the moment the target responds (any response — 200, 302, 401, 500 — all count).
 
+While the instance is on the waiting page the watchdog **does not** count health-probe failures against `HEALTH_RETRIES` and **does not** run freeze detection against the (intentionally static) page. Otherwise a target that stayed unreachable for more than a couple of minutes would trigger an endless "restart Chromium → relaunch waiting page → restart" loop, and the freeze detector would see the static page as a hung screen. Once the URL probe succeeds the log records `target <URL> now reachable — waiting page will redirect` and normal health + freeze supervision resumes.
+
 No configuration toggle: the waiting page is only used when the target fails the initial health probe. If the URL is reachable, Chromium launches directly at it with no indirection. The same flow applies when the watchdog restarts a chrome instance mid-run.
 
 VLC instances still block on the old `wait_for_url_ready_instance` loop (no in-player equivalent); only Chromium gets the visual fallback.
+
+## Cold-boot behaviour
+The systemd unit is installed with the expectation that a freshly-booted Pi may take a minute or more before the desktop session is ready:
+- `MIN_UPTIME_BEFORE_START=60` (config) — the script waits until system uptime reaches this before doing anything user-visible.
+- `wait_for_display_ready` sits in a loop probing for a Wayland compositor (labwc / wayfire / sway / …) or a reachable X11 DISPLAY, logging `Waiting for a graphical session…` once and `Still waiting… (waited Ns)` every 60 s.
+- `TimeoutStartSec=infinity` on the unit — systemd never kills the service mid-wait, no matter how long the desktop takes.
+- `Restart=always`, `RestartSec=5`, `StartLimitIntervalSec=0`, `StartLimitBurst=0` — if the desktop never arrives the service exits 1 after `WAYLAND_READY_TIMEOUT` seconds (default 300) and systemd restarts it 5 s later, forever.
 
 ## Manual run / debugging
 ```bash
@@ -196,8 +205,11 @@ Environment=GUI_USER=<detected desktop user>
 Environment=XDG_RUNTIME_DIR=/run/user/<uid>
 Environment=WAYLAND_DISPLAY=wayland-0
 EnvironmentFile=-/etc/kiosk-monitor/kiosk-monitor.conf
-ExecStart=/usr/local/bin/kiosk-monitor.sh
+ExecStart=/usr/local/bin/kiosk-monitor --run
 ExecStop=/bin/kill -s TERM $MAINPID
+ExecReload=/bin/kill -s HUP $MAINPID
+TimeoutStartSec=infinity
+TimeoutStopSec=30
 Restart=always
 RestartSec=5
 SyslogIdentifier=kiosk-monitor
