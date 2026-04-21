@@ -8,7 +8,7 @@ _kiosk_monitor() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local actions="--install --update --remove --configure --reconfig --status --logs --help --version --debug --config"
+    local actions="--install --update --remove --configure --reconfig --reconfigure --status --logs --run --help --version --debug --config"
     local install_opts="--url --url2 --mode --mode2 --output --output2 --gui-user --user --no-start --skip-apt --base-url --browser"
     local update_opts="--check --local --force --skip-apt --base-url --gui-user --user --mode --browser --no-restart"
     local remove_opts="--purge"
@@ -59,6 +59,4 @@ _kiosk_monitor() {
 }
 
 complete -F _kiosk_monitor kiosk-monitor
-complete -F _kiosk_monitor kiosk-monitor.sh
 complete -F _kiosk_monitor /usr/local/bin/kiosk-monitor
-complete -F _kiosk_monitor /usr/local/bin/kiosk-monitor.sh

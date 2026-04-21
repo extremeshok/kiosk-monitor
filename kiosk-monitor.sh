@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 6.1.0
+# kiosk-monitor.sh :: version 6.2.0
 # ======================================================================
 # Kiosk watchdog for Raspberry Pi OS trixie 64-bit (or newer Debian/RPi).
 # Supports Chromium fullscreen kiosk and VLC fullscreen video playback,
@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.1.0"
+SCRIPT_VERSION="6.2.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 
 # ------------------------------------------------------------------
@@ -1767,7 +1767,7 @@ EOF
     [ -n "$wayland_display" ] && printf 'Environment=WAYLAND_DISPLAY=%s\n' "$wayland_display"
     cat <<EOF
 EnvironmentFile=-$CONFIG_FILE
-ExecStart=$INSTALL_DIR/kiosk-monitor.sh
+ExecStart=$INSTALL_DIR/kiosk-monitor --run
 ExecStop=/bin/kill -s TERM \$MAINPID
 ExecReload=/bin/kill -s HUP \$MAINPID
 Restart=always
@@ -1809,21 +1809,21 @@ install_bash_completion() {
 }
 
 ensure_script_installed() {
+  # Installed name is `kiosk-monitor` (no `.sh`). Any leftover
+  # `kiosk-monitor.sh` from older installs is removed — no compat alias is
+  # maintained going forward.
   local source=$1 target=$2 dir
   dir=$(dirname "$target"); mkdir -p "$dir"
+  [ -L "$target" ] && rm -f "$target"
   local source_real target_real=""
   source_real=$(readlink -f "$source" 2>/dev/null || printf '%s' "$source")
   target_real=$(readlink -f "$target" 2>/dev/null || printf '')
   if [ -n "$target_real" ] && [ "$source_real" = "$target_real" ]; then
-    chmod 0755 "$target"; return 0
+    chmod 0755 "$target"
+  else
+    install -m 0755 "$source" "$target"
   fi
-  install -m 0755 "$source" "$target"
-  # Convenience short-name: `kiosk-monitor` (no .sh) opens the TUI when
-  # launched without args; every subcommand still works via either name.
-  local short="${target%/*}/kiosk-monitor"
-  if [ "$short" != "$target" ]; then
-    ln -sf "$(basename "$target")" "$short"
-  fi
+  rm -f "${target}.sh"
 }
 
 escape_config_value() {
@@ -2098,7 +2098,7 @@ install_self() {
   script_dir=$(dirname "$resolved_script")
 
   mkdir -p "$INSTALL_DIR"
-  ensure_script_installed "$resolved_script" "$INSTALL_DIR/kiosk-monitor.sh"
+  ensure_script_installed "$resolved_script" "$INSTALL_DIR/kiosk-monitor"
   install_bash_completion "$script_dir"
 
   mkdir -p "$CONFIG_DIR"
@@ -2243,7 +2243,8 @@ update_self() {
 
   if [ "$source_mode" = "remote" ]; then
     echo "Downloading kiosk-monitor.sh from $BASE_URL…"
-    download_component kiosk-monitor.sh         "$INSTALL_DIR/kiosk-monitor.sh"         0755 || exit 1
+    download_component kiosk-monitor.sh         "$INSTALL_DIR/kiosk-monitor"            0755 || exit 1
+    rm -f "$INSTALL_DIR/kiosk-monitor.sh"
     echo "Downloading kiosk-monitor.conf.sample…"
     download_component kiosk-monitor.conf.sample "$CONFIG_DIR/kiosk-monitor.conf.sample" 0644 || true
     # Use an empty script_dir so install_bash_completion falls through to
@@ -2253,7 +2254,7 @@ update_self() {
     local resolved_script script_dir
     resolved_script=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
     script_dir=$(dirname "$resolved_script")
-    ensure_script_installed "$resolved_script" "$INSTALL_DIR/kiosk-monitor.sh"
+    ensure_script_installed "$resolved_script" "$INSTALL_DIR/kiosk-monitor"
     install_bash_completion "$script_dir"
     if [ -f "$script_dir/kiosk-monitor.conf.sample" ]; then
       install -m 0644 "$script_dir/kiosk-monitor.conf.sample" "$CONFIG_DIR/kiosk-monitor.conf.sample"
@@ -2269,7 +2270,7 @@ update_self() {
   systemctl daemon-reload
 
   local new_ver
-  new_ver=$("$INSTALL_DIR/kiosk-monitor.sh" --version 2>/dev/null || echo "$SCRIPT_VERSION")
+  new_ver=$("$INSTALL_DIR/kiosk-monitor" --version 2>/dev/null || echo "$SCRIPT_VERSION")
   if [ "$was_active" = "yes" ] && [ "$suppress_restart" = "no" ]; then
     systemctl restart kiosk-monitor.service
     echo "kiosk-monitor updated to $new_ver and restarted."
@@ -2612,21 +2613,22 @@ status_self() {
 
 usage() {
   cat <<'EOF'
-kiosk-monitor.sh — Browser/VLC kiosk watchdog (v6, Wayland + labwc)
+kiosk-monitor — Browser/VLC kiosk watchdog (v6, Wayland + labwc)
 
 Usage:
-  kiosk-monitor.sh [--debug]
-  kiosk-monitor.sh --install [--url URL] [--mode chrome|vlc] [--output NAME]
-                             [--url2 URL] [--mode2 chrome|vlc] [--output2 NAME]
-                             [--gui-user USER] [--no-start] [--skip-apt]
-  kiosk-monitor.sh --update  [--check] [--local] [--force] [--base-url URL]
-                             [--gui-user USER] [--mode chrome|vlc] [--no-restart] [--skip-apt]
-  kiosk-monitor.sh --remove  [--purge]
-  kiosk-monitor.sh --configure            Interactive whiptail TUI (requires root)
-  kiosk-monitor.sh --reconfig [--config PATH]
-  kiosk-monitor.sh --status
-  kiosk-monitor.sh --logs [--no-follow] [--lines N|all]
-  kiosk-monitor.sh --help | --version
+  kiosk-monitor                           Open the interactive TUI (terminal-only default)
+  kiosk-monitor --run                     Run the watchdog (used by systemd ExecStart)
+  kiosk-monitor --configure               Same TUI, explicit
+  kiosk-monitor --install [--url URL] [--mode chrome|vlc] [--output NAME]
+                          [--url2 URL] [--mode2 chrome|vlc] [--output2 NAME]
+                          [--gui-user USER] [--no-start] [--skip-apt]
+  kiosk-monitor --update  [--check] [--local] [--force] [--base-url URL]
+                          [--gui-user USER] [--mode chrome|vlc] [--no-restart] [--skip-apt]
+  kiosk-monitor --remove  [--purge]
+  kiosk-monitor --reconfig | --reconfigure [--config PATH]
+  kiosk-monitor --status
+  kiosk-monitor --logs [--no-follow] [--lines N|all]
+  kiosk-monitor --help | --version
 
 Config (/etc/kiosk-monitor/kiosk-monitor.conf):
   MODE       chrome or vlc                     (instance 1, required)
@@ -2645,19 +2647,35 @@ EOF
 # ======================================================================
 # Action dispatch
 # ======================================================================
-ACTION="run"
-# Invoked via the short-name symlink with no args? Open the TUI. The systemd
-# unit uses the full .sh path so the service still runs the watchdog.
-if [ "$#" -eq 0 ] && [ "$SCRIPT_NAME" = "kiosk-monitor" ]; then
-  ACTION="configure"
-fi
+ACTION=""
 case "${1:-}" in
-  --install|--remove|--update|--reconfig|--configure) ACTION="${1#--}"; shift ;;
-  --status)  ACTION="status"; shift ;;
-  --logs)    ACTION="logs"; shift ;;
-  --help|-h) ACTION="help"; shift ;;
+  --install|--remove|--update|--configure) ACTION="${1#--}"; shift ;;
+  --reconfig|--reconfigure)                ACTION="reconfig"; shift ;;
+  --run)     ACTION="run";     shift ;;
+  --status)  ACTION="status";  shift ;;
+  --logs)    ACTION="logs";    shift ;;
+  --help|-h) ACTION="help";    shift ;;
   --version) ACTION="version"; shift ;;
 esac
+
+# No action given: if stdin + stdout are a terminal, open the configuration
+# TUI (most useful default for an operator). Non-interactive callers (cron,
+# systemd, subprocess) must pass --run explicitly — refusing silent starts
+# prevents the watchdog from firing off unintentionally.
+if [ -z "$ACTION" ]; then
+  if [ "$#" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
+    ACTION="configure"
+  else
+    cat >&2 <<EOF
+$SCRIPT_NAME: no action specified.
+
+Run the TUI from a terminal:       $SCRIPT_NAME         (interactive)
+Or pass a subcommand, for example: $SCRIPT_NAME --run   (watchdog)
+See: $SCRIPT_NAME --help
+EOF
+    exit 1
+  fi
+fi
 ACTION_ARGS=("$@")
 
 case "$ACTION" in
@@ -2741,6 +2759,22 @@ if [ ! -d "$XDG_RUNTIME_DIR" ] && [ "${EUID:-$(id -u)}" -eq 0 ]; then
   chmod 0700 "$XDG_RUNTIME_DIR"
 fi
 
+# --- install signal traps BEFORE any blocking wait. SIGHUP arriving while
+#     we're waiting for the compositor used to kill bash outright. ---
+handle_reload_signal() {
+  RELOAD_REQUESTED=true
+}
+handle_shutdown_signal() {
+  [ "$SHUTDOWN_REQUESTED" = "true" ] && return
+  SHUTDOWN_REQUESTED=true
+  log "Termination signal received — shutting down kiosk-monitor."
+  local id
+  for id in "${INSTANCES[@]:-}"; do stop_instance "$id" 2>/dev/null || true; done
+  exit 0
+}
+trap handle_shutdown_signal INT TERM
+trap handle_reload_signal HUP
+
 # --- wait for labwc + wayland socket (desktop open) ---
 wait_for_gui_session
 wait_for_wayland_ready "$GUI_UID"
@@ -2778,20 +2812,13 @@ done
 # Install labwc window rules so each instance lands on the right output.
 ensure_labwc_window_rules
 
-# --- signal/exit handling ---
-handle_shutdown_signal() {
-  [ "$SHUTDOWN_REQUESTED" = "true" ] && return
-  SHUTDOWN_REQUESTED=true
-  log "Termination signal received — shutting down kiosk-monitor."
-  local id
-  for id in "${INSTANCES[@]}"; do stop_instance "$id"; done
-  exit 0
-}
+# --- exit cleanup (INT/TERM/HUP traps were installed earlier so they're
+#     active during the Wayland / GUI wait) ---
 cleanup() {
   local status=$?
   trap - EXIT
   local id
-  for id in "${INSTANCES[@]}"; do stop_instance "$id" 2>/dev/null || true; done
+  for id in "${INSTANCES[@]:-}"; do stop_instance "$id" 2>/dev/null || true; done
   if [ -n "$PROFILE_SYNC_PID" ] && kill -0 "$PROFILE_SYNC_PID" 2>/dev/null; then
     kill "$PROFILE_SYNC_PID" 2>/dev/null || true
     wait "$PROFILE_SYNC_PID" 2>/dev/null || true
@@ -2802,14 +2829,7 @@ cleanup() {
   log "==== STOP kiosk-monitor ===="
   exit "$status"
 }
-handle_reload_signal() {
-  # Just set the flag — the main loop does the actual reload at a safe
-  # point so we don't interrupt a launch or screenshot mid-flight.
-  RELOAD_REQUESTED=true
-}
 trap cleanup EXIT
-trap handle_shutdown_signal INT TERM
-trap handle_reload_signal HUP
 
 log "==== START kiosk-monitor v$SCRIPT_VERSION at $(date -Is) ===="
 log "Desktop user: $GUI_USER (uid=$GUI_UID), WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-?}"

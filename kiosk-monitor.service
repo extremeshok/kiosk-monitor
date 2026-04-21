@@ -21,7 +21,7 @@ Environment=GUI_USER=%i
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=WAYLAND_DISPLAY=wayland-0
 EnvironmentFile=-/etc/kiosk-monitor/kiosk-monitor.conf
-ExecStart=/usr/local/bin/kiosk-monitor.sh
+ExecStart=/usr/local/bin/kiosk-monitor --run
 ExecStop=/bin/kill -s TERM $MAINPID
 ExecReload=/bin/kill -s HUP $MAINPID
 Restart=always

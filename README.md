@@ -27,33 +27,34 @@ curl -fsSL https://raw.githubusercontent.com/extremeshok/kiosk-monitor/main/kios
 
 Dual-display example (Chromium dashboard on primary, camera stream on secondary):
 ```bash
-sudo kiosk-monitor.sh --install \
+sudo kiosk-monitor --install \
   --mode chrome --url "http://192.168.3.222:30059/?Birdseye" --output HDMI-A-1 \
   --mode2 vlc   --url2 "rtsp://192.168.3.210:8554/cam1"       --output2 HDMI-A-2
 ```
 
 The installer:
 1. Auto-detects the desktop user (or use `--gui-user USER`).
-2. Copies the script to `/usr/local/bin/kiosk-monitor.sh`.
+2. Copies the script to `/usr/local/bin/kiosk-monitor` (and removes any pre-v6.2 `kiosk-monitor.sh` leftover there).
 3. Creates `/etc/kiosk-monitor/kiosk-monitor.conf` (and a `.sample`).
-4. Writes `/etc/systemd/system/kiosk-monitor.service` with the correct `User=`, `XDG_RUNTIME_DIR=`, `WAYLAND_DISPLAY=`.
+4. Writes `/etc/systemd/system/kiosk-monitor.service` with `ExecStart=/usr/local/bin/kiosk-monitor --run` and the correct `User=`, `XDG_RUNTIME_DIR=`, `WAYLAND_DISPLAY=`.
 5. Enables and starts the service (use `--no-start` to skip startup).
 
 ### Day-to-day commands
-After `--install`, a short-name launcher is created at `/usr/local/bin/kiosk-monitor`. Running it with no arguments opens the interactive configuration TUI (pre-loaded with the current `kiosk-monitor.conf` values). Any subcommand also works via either name.
+Running `kiosk-monitor` from an interactive terminal with no arguments opens the configuration TUI (pre-loaded with the current `kiosk-monitor.conf` values). Non-interactive callers (systemd, cron, scripts) must pass an explicit subcommand like `--run` — so piping the command at a daemon never silently starts the watchdog.
 
 ```bash
-sudo kiosk-monitor                             # TUI (shortcut for --configure; preloads current config)
-sudo kiosk-monitor.sh --logs                   # tail `journalctl -u kiosk-monitor -f` (supports --lines N / --no-follow / --all)
-sudo kiosk-monitor.sh --configure              # same TUI, explicit invocation
-sudo kiosk-monitor.sh --update --check         # show installed vs. latest GitHub version (no changes)
-sudo kiosk-monitor.sh --update                 # fetch latest from GitHub, install, restart if running
-sudo kiosk-monitor.sh --update --local         # install from the current working-tree file (dev mode)
-sudo kiosk-monitor.sh --update --force         # reinstall even when the remote matches
-sudo kiosk-monitor.sh --remove [--purge]       # remove binaries; --purge also drops /etc/kiosk-monitor
-sudo kiosk-monitor.sh --reconfig               # re-write kiosk-monitor.conf with every supported option
-kiosk-monitor.sh --status                      # show instance config + service status
-kiosk-monitor.sh --version
+sudo kiosk-monitor                             # TUI (interactive terminal only; preloads current config)
+sudo kiosk-monitor --run                       # watchdog (what systemd ExecStart uses)
+sudo kiosk-monitor --logs                      # tail `journalctl -u kiosk-monitor -f` (supports --lines N / --no-follow / --all)
+sudo kiosk-monitor --configure                 # same TUI, explicit
+sudo kiosk-monitor --update --check            # show installed vs. latest GitHub version (no changes)
+sudo kiosk-monitor --update                    # fetch latest from GitHub, install, restart if running
+sudo kiosk-monitor --update --local            # install from the current working-tree file (dev mode)
+sudo kiosk-monitor --update --force            # reinstall even when the remote matches
+sudo kiosk-monitor --remove [--purge]          # remove binaries; --purge also drops /etc/kiosk-monitor
+sudo kiosk-monitor --reconfig                  # re-write kiosk-monitor.conf with every supported option (alias: --reconfigure)
+kiosk-monitor --status                         # show instance config + service status
+kiosk-monitor --version
 ```
 `--update` fetches `kiosk-monitor.sh` + `kiosk-monitor.conf.sample` from `$BASE_URL` (default `https://raw.githubusercontent.com/extremeshok/kiosk-monitor/main`). Override with `--base-url URL` for forks or staging branches.
 
