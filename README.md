@@ -4,7 +4,7 @@ Watchdog for kiosk-style displays. Launches Chromium in fullscreen kiosk mode **
 
 ## Features
 - **Two launch modes** per instance: `chrome` (fullscreen Chromium) or `vlc` (fullscreen video player).
-- **Dual-display** support — run Chromium on HDMI-A-1 and VLC on HDMI-A-2 (or any combination) from a single watchdog.
+- **Dual-display** support (**experimental**) — Chromium can be routed to specific outputs via a generated labwc window rule; VLC routing is unreliable because its Wayland window identity isn't easily matched. Single-instance (one display) is the supported configuration today.
 - **Per-output freeze detection** using `grim`: each instance is checked against its own monitor so a hang on one display never restarts the other.
 - **URL health checks** for http/https targets, independent per instance.
 - **Automatic restart** on frozen screens, dead processes, or repeated health failures, with per-instance storm-protection backoff.
@@ -17,7 +17,7 @@ Watchdog for kiosk-style displays. Launches Chromium in fullscreen kiosk mode **
 ## Requirements
 - **Raspberry Pi OS trixie 64-bit Desktop** (Debian 13) or newer — this is the minimum supported platform.
 - Wayland (labwc compositor — default on trixie desktop).
-- Preinstalled on the stock image: `chromium`, `vlc`, `grim`, `wlr-randr`, `curl`, `python3`, `sudo`.
+- Needed packages: `chromium`, `vlc`, `grim`, `wlr-randr`, `whiptail`, `curl`, `python3`, `sudo`. Most are preinstalled on the stock Desktop image; any that are missing are installed automatically by `--install` / `--update` via `apt-get`. Pass `--skip-apt` to opt out.
 
 ## Quick install
 ```bash
@@ -39,14 +39,23 @@ The installer:
 4. Writes `/etc/systemd/system/kiosk-monitor.service` with the correct `User=`, `XDG_RUNTIME_DIR=`, `WAYLAND_DISPLAY=`.
 5. Enables and starts the service (use `--no-start` to skip startup).
 
-### Update / remove / reconfigure
+### Day-to-day commands
+After `--install`, a short-name launcher is created at `/usr/local/bin/kiosk-monitor`. Running it with no arguments opens the interactive configuration TUI (pre-loaded with the current `kiosk-monitor.conf` values). Any subcommand also works via either name.
+
 ```bash
-sudo kiosk-monitor.sh --update                 # refresh files; restart if running
+sudo kiosk-monitor                             # TUI (shortcut for --configure; preloads current config)
+sudo kiosk-monitor.sh --logs                   # tail `journalctl -u kiosk-monitor -f` (supports --lines N / --no-follow / --all)
+sudo kiosk-monitor.sh --configure              # same TUI, explicit invocation
+sudo kiosk-monitor.sh --update --check         # show installed vs. latest GitHub version (no changes)
+sudo kiosk-monitor.sh --update                 # fetch latest from GitHub, install, restart if running
+sudo kiosk-monitor.sh --update --local         # install from the current working-tree file (dev mode)
+sudo kiosk-monitor.sh --update --force         # reinstall even when the remote matches
 sudo kiosk-monitor.sh --remove [--purge]       # remove binaries; --purge also drops /etc/kiosk-monitor
 sudo kiosk-monitor.sh --reconfig               # re-write kiosk-monitor.conf with every supported option
 kiosk-monitor.sh --status                      # show instance config + service status
 kiosk-monitor.sh --version
 ```
+`--update` fetches `kiosk-monitor.sh` + `kiosk-monitor.conf.sample` from `$BASE_URL` (default `https://raw.githubusercontent.com/extremeshok/kiosk-monitor/main`). Override with `--base-url URL` for forks or staging branches.
 
 ## Configuration — `/etc/kiosk-monitor/kiosk-monitor.conf`
 Edit and then `sudo systemctl restart kiosk-monitor`.
@@ -61,16 +70,30 @@ Edit and then `sudo systemctl restart kiosk-monitor`.
 | `URL2`     | Target for instance 2                                        | *(empty)* |
 | `OUTPUT2`  | Output name for instance 2; blank → auto                     | *(auto)* |
 | `GUI_USER` | Desktop user; blank → auto-detect                            | *(auto)* |
+| `FORCE_RESOLUTION` / `FORCE_RESOLUTION_2` | Force the instance's output to a specific mode (e.g. `1920x1080` or `1920x1080@60`). Applied via `wlr-randr` at startup and after hotplug. The call is skipped when the output already matches, to avoid fighting with `kanshi` and other output managers. Blank = leave alone. | *(blank)* |
+| `FORCE_ROTATION` / `FORCE_ROTATION_2`     | Force the instance's output orientation. One of `normal`, `90`, `180`, `270`, `flipped`, `flipped-90`, `flipped-180`, `flipped-270`. | *(blank)* |
+
+> **Note on output managers:** Raspberry Pi OS trixie Desktop autostarts `kanshi`, which observes output changes and can persist them to `~/.config/kanshi/config.init`. If a `FORCE_RESOLUTION` / `FORCE_ROTATION` change sticks across reboots even after you clear the variables, delete that file and respawn `wf-panel-pi` / `pcmanfm-pi` (or log out and back in).
 
 Run `wlr-randr` as the desktop user to list available output names.
 
 ### Mode-specific
 Chromium (`MODE=chrome`):
 - `CHROMIUM_BIN` — path override (`/usr/bin/chromium` by default on trixie).
-- `BIRDSEYE_AUTO_FILL` — `true` injects CSS to force the Frigate Birdseye grid to fill the viewport.
-- `BIRDSEYE_MATCH_PATTERN` — override the extension match pattern (defaults to `scheme://host/*` from `URL`).
-- `BIRDSEYE_EXTENSION_DIR` — custom extension dir (default: under the profile).
 - `DEVTOOLS_AUTO_OPEN`, `DEVTOOLS_REMOTE_PORT` — debugging helpers.
+
+Frigate helper (only matters when `MODE=chrome` points at a Frigate dashboard):
+- **Smart defaults** — when the URL contains `?birdseye`, any Frigate helper variable left blank is filled in automatically: `FRIGATE_BIRDSEYE_AUTO_FILL=true`, `FRIGATE_DARK_MODE=Dark`, `FRIGATE_THEME="High Contrast"`. Set a variable to `None` (or `false` for the autofill toggle) to explicitly opt out.
+- `FRIGATE_BIRDSEYE_AUTO_FILL` — `true` injects CSS that pins the Birdseye grid and canvas to explicit pixel dimensions so the react-grid-layout children scale with the container.
+- `FRIGATE_BIRDSEYE_WIDTH` / `FRIGATE_BIRDSEYE_HEIGHT` — target size of the enlarged grid/canvas. Leave blank to auto-size from the instance's display resolution (via `wlr-randr`), so the same config works on 720p, 1080p, 1440p, 4K, or anything else. Set pixels to pin.
+- `FRIGATE_BIRDSEYE_MARGIN` — pixels subtracted from each axis when auto-sizing (default `80`, leaves room for Frigate's sidebar and status bar).
+- `FRIGATE_BIRDSEYE_MATCH_PATTERN` — override the extension match pattern (defaults to `scheme://host/*` from `URL`).
+- `FRIGATE_BIRDSEYE_EXTENSION_DIR` — custom extension dir (default: under the profile).
+- `FRIGATE_DARK_MODE` — `Light`, `Dark`, `None`, or empty (smart-default).
+- `FRIGATE_THEME` — `Default`, `Blue`, `Green`, `Nord`, `Red`, `High Contrast`, `None`, or empty (smart-default).
+- `FRIGATE_THEME_STORAGE_KEY` / `FRIGATE_COLOR_STORAGE_KEY` — override if your Frigate version uses different localStorage keys (defaults: `frigate-ui-theme` and `frigate-ui-color-scheme`; a handful of common aliases are also written).
+
+Legacy `BIRDSEYE_*` config names still work (silently aliased).
 
 VLC (`MODE=vlc`):
 - `VLC_BIN` — path override (`/usr/bin/vlc` by default).

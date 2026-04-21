@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: bash -n (syntax check)
+        run: bash -n kiosk-monitor.sh
+
+      - name: shellcheck (warning level)
+        run: shellcheck -x -S warning kiosk-monitor.sh

@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 6.0.0
+# kiosk-monitor.sh :: version 6.1.0
 # ======================================================================
 # Kiosk watchdog for Raspberry Pi OS trixie 64-bit (or newer Debian/RPi).
 # Supports Chromium fullscreen kiosk and VLC fullscreen video playback,
@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.0.0"
+SCRIPT_VERSION="6.1.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 
 # ------------------------------------------------------------------
@@ -87,7 +87,8 @@ fi
 # Defaults
 # ------------------------------------------------------------------
 DEFAULT_URL="http://192.168.3.222:30059/?Birdseye"
-DEFAULT_BASE_URL="https://raw.githubusercontent.com/extremeshok/kiosk-monitor/main"
+# HEAD resolves to the repo's default branch (works for both main and master).
+DEFAULT_BASE_URL="https://raw.githubusercontent.com/extremeshok/kiosk-monitor/HEAD"
 BASE_URL="${BASE_URL:-$DEFAULT_BASE_URL}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 SERVICE_PATH="${SERVICE_PATH:-/etc/systemd/system/kiosk-monitor.service}"
@@ -104,11 +105,36 @@ URL2="${URL2:-}"
 OUTPUT="${OUTPUT:-}"
 OUTPUT2="${OUTPUT2:-}"
 
+# Per-instance display forcing (applied via wlr-randr before launch).
+# FORCE_RESOLUTION: "" | "WxH" | "WxH@RATE" (e.g. "1920x1080@60")
+# FORCE_ROTATION:   "" | "normal" | "90" | "180" | "270"
+#                   | "flipped" | "flipped-90" | "flipped-180" | "flipped-270"
+FORCE_RESOLUTION="${FORCE_RESOLUTION:-}"
+FORCE_RESOLUTION_2="${FORCE_RESOLUTION_2:-}"
+FORCE_ROTATION="${FORCE_ROTATION:-}"
+FORCE_ROTATION_2="${FORCE_ROTATION_2:-}"
+
 # Chromium-specific
 CHROMIUM_BIN="${CHROMIUM_BIN:-}"
-BIRDSEYE_AUTO_FILL="${BIRDSEYE_AUTO_FILL:-false}"
-BIRDSEYE_MATCH_PATTERN="${BIRDSEYE_MATCH_PATTERN:-}"
-BIRDSEYE_EXTENSION_DIR="${BIRDSEYE_EXTENSION_DIR:-}"
+# Frigate Birdseye helper — left empty triggers smart defaults when the URL
+# looks like a Frigate Birdseye view (see apply_frigate_smart_defaults).
+# Legacy BIRDSEYE_* names are still honoured.
+FRIGATE_BIRDSEYE_AUTO_FILL="${FRIGATE_BIRDSEYE_AUTO_FILL:-${BIRDSEYE_AUTO_FILL:-}}"
+FRIGATE_BIRDSEYE_MATCH_PATTERN="${FRIGATE_BIRDSEYE_MATCH_PATTERN:-${BIRDSEYE_MATCH_PATTERN:-}}"
+FRIGATE_BIRDSEYE_EXTENSION_DIR="${FRIGATE_BIRDSEYE_EXTENSION_DIR:-${BIRDSEYE_EXTENSION_DIR:-}}"
+# Fixed pixel dimensions for the birdseye grid/canvas. Left empty = auto,
+# derived from the instance's output resolution minus FRIGATE_BIRDSEYE_MARGIN
+# on each axis. Explicit integers override that and pin the size.
+FRIGATE_BIRDSEYE_WIDTH="${FRIGATE_BIRDSEYE_WIDTH:-}"
+FRIGATE_BIRDSEYE_HEIGHT="${FRIGATE_BIRDSEYE_HEIGHT:-}"
+FRIGATE_BIRDSEYE_MARGIN="${FRIGATE_BIRDSEYE_MARGIN:-80}"
+# Frigate UI theming — applied via content script on matching pages.
+# Values: "" (auto-default for Frigate URLs), "None" (explicit skip),
+# "Light"/"Dark" or one of the known theme names.
+FRIGATE_DARK_MODE="${FRIGATE_DARK_MODE:-}"
+FRIGATE_THEME="${FRIGATE_THEME:-}"
+FRIGATE_THEME_STORAGE_KEY="${FRIGATE_THEME_STORAGE_KEY:-frigate-ui-theme}"
+FRIGATE_COLOR_STORAGE_KEY="${FRIGATE_COLOR_STORAGE_KEY:-frigate-ui-color-scheme}"
 DEVTOOLS_AUTO_OPEN="${DEVTOOLS_AUTO_OPEN:-false}"
 DEVTOOLS_REMOTE_PORT="${DEVTOOLS_REMOTE_PORT:-}"
 
@@ -161,9 +187,47 @@ MAX_RESTARTS="${MAX_RESTARTS:-10}"
 CLEAN_RESET="${CLEAN_RESET:-600}"
 VLC_STALL_RETRIES="${VLC_STALL_RETRIES:-6}"
 
+# Log rotation (in-process, copy-truncate so the tee fd stays valid)
+LOG_MAX_BYTES="${LOG_MAX_BYTES:-2097152}"     # 2 MiB
+LOG_ROTATE_KEEP="${LOG_ROTATE_KEEP:-1}"       # 0 disables the .1 copy
+
+# --- Frigate URL detection + smart defaults ---------------------------
+is_frigate_birdseye_url() {
+  local url=$1 lc
+  [ -n "$url" ] || return 1
+  lc=$(printf '%s' "$url" | tr '[:upper:]' '[:lower:]')
+  # Matches query strings like "?birdseye", "?birdseye=...", "&birdseye", etc.
+  case "$lc" in
+    *\?birdseye|*\?birdseye=*|*\?birdseye\&*|*\&birdseye|*\&birdseye=*|*\&birdseye\&*)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+apply_frigate_smart_defaults() {
+  local is_frigate="no"
+  if [ "${MODE:-}" = "chrome" ] || [ "${MODE:-}" = "chromium" ]; then
+    is_frigate_birdseye_url "${URL:-}" && is_frigate="yes"
+  fi
+  if [ "$is_frigate" = "no" ] && { [ "${MODE2:-}" = "chrome" ] || [ "${MODE2:-}" = "chromium" ]; }; then
+    is_frigate_birdseye_url "${URL2:-}" && is_frigate="yes"
+  fi
+  [ "$is_frigate" = "yes" ] || return 0
+  # Fill in opinionated defaults only when the user left the value empty.
+  [ -z "${FRIGATE_BIRDSEYE_AUTO_FILL:-}" ] && FRIGATE_BIRDSEYE_AUTO_FILL="true"
+  [ -z "${FRIGATE_DARK_MODE:-}" ]          && FRIGATE_DARK_MODE="Dark"
+  [ -z "${FRIGATE_THEME:-}" ]              && FRIGATE_THEME="High Contrast"
+  return 0
+}
+
+apply_frigate_smart_defaults
+
+# Ensure autofill has a concrete value once smart defaults have run.
+FRIGATE_BIRDSEYE_AUTO_FILL="${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
+
 # Normalize booleans/strings (lower-case)
 for _var in MODE MODE2 VLC_LOOP VLC_NO_AUDIO PROFILE_TMPFS PROFILE_SYNC_BACK PROFILE_TMPFS_PURGE \
-            PREWARM_ENABLED BIRDSEYE_AUTO_FILL DEVTOOLS_AUTO_OPEN WAIT_FOR_URL; do
+            PREWARM_ENABLED FRIGATE_BIRDSEYE_AUTO_FILL DEVTOOLS_AUTO_OPEN WAIT_FOR_URL; do
   val="${!_var}"
   val="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
   printf -v "$_var" '%s' "$val"
@@ -172,6 +236,24 @@ unset _var val
 
 case "$MODE" in chromium|chrome) MODE="chrome" ;; esac
 case "$MODE2" in chromium|chrome) MODE2="chrome" ;; esac
+
+# Normalize FRIGATE_DARK_MODE: "Light"/"Dark" → lower; "None"/anything else → empty
+case "$(printf '%s' "$FRIGATE_DARK_MODE" | tr '[:upper:]' '[:lower:]')" in
+  light) FRIGATE_DARK_MODE="light" ;;
+  dark)  FRIGATE_DARK_MODE="dark" ;;
+  *)     FRIGATE_DARK_MODE="" ;;
+esac
+
+# Normalize FRIGATE_THEME to lowercase/dash (shadcn-style slug).
+# "Default"/"None"/"" all mean "no override".
+_theme_lc=$(printf '%s' "$FRIGATE_THEME" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+case "$_theme_lc" in
+  blue|green|nord|red|high-contrast) FRIGATE_THEME="$_theme_lc" ;;
+  ""|default|none)                   FRIGATE_THEME="" ;;
+  *)  echo "Warning: unrecognized FRIGATE_THEME='$FRIGATE_THEME' (passing through as-is)" >&2
+      FRIGATE_THEME="$_theme_lc" ;;
+esac
+unset _theme_lc
 
 if [ "$MODE" != "chrome" ] && [ "$MODE" != "vlc" ]; then
   echo "Error: unsupported MODE='$MODE' (expected chrome or vlc)" >&2
@@ -188,6 +270,7 @@ if ! [[ "$SCREEN_SAMPLE_BYTES" =~ ^[0-9]+$ ]] || [ "$SCREEN_SAMPLE_BYTES" -le 0 
 fi
 
 SHUTDOWN_REQUESTED=false
+RELOAD_REQUESTED=false
 DEFERRED_LAUNCH_DONE=false
 PROFILE_SYNC_PID=""
 declare -A OUTPUT_GEOMETRY=()
@@ -206,6 +289,10 @@ declare -A INSTANCE_RESTART_LOG=()
 declare -A INSTANCE_PROFILE_DIR=()
 declare -A INSTANCE_MATCH=()
 declare -A INSTANCE_STALL_THRESHOLD=()
+declare -A INSTANCE_PAUSED=()
+declare -A INSTANCE_FORCE_RESOLUTION=()
+declare -A INSTANCE_FORCE_ROTATION=()
+declare -A INSTANCE_CLASS=()
 INSTANCES=()
 
 # ======================================================================
@@ -241,6 +328,23 @@ init_log_file() {
   dir=$(dirname "$target")
   mkdir -p "$dir" 2>/dev/null || return 1
   : > "$target" 2>/dev/null || { rm -f "$target" 2>/dev/null; : > "$target" 2>/dev/null || return 1; }
+  return 0
+}
+
+rotate_log_if_needed() {
+  local max="${LOG_MAX_BYTES:-2097152}"
+  [[ "$max" =~ ^[0-9]+$ ]] || return 0
+  [ "$max" -gt 0 ] || return 0
+  [ -n "${LOG:-}" ] && [ -f "$LOG" ] || return 0
+  local size
+  size=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+  [ "$size" -gt "$max" ] || return 0
+  local keep="${LOG_ROTATE_KEEP:-1}"
+  # copy-truncate keeps the fd open on the tee process we spawned at startup
+  if [ "$keep" -gt 0 ]; then
+    cp -f "$LOG" "${LOG}.1" 2>/dev/null || true
+  fi
+  : > "$LOG" 2>/dev/null || true
   return 0
 }
 
@@ -563,6 +667,12 @@ for o in data:
     OUTPUTS_NAMES+=( "$name" )
     OUTPUT_GEOMETRY["$name"]="$x $y $w $h"
   done <<< "$parsed"
+  # Sort alphabetically so HDMI-A-1 precedes HDMI-A-2 regardless of the
+  # order wlr-randr happened to enumerate them in. This keeps the auto-pick
+  # deterministic and the primary display first.
+  if [ "${#OUTPUTS_NAMES[@]}" -gt 1 ]; then
+    mapfile -t OUTPUTS_NAMES < <(printf '%s\n' "${OUTPUTS_NAMES[@]}" | LC_ALL=C sort)
+  fi
   [ "${#OUTPUTS_NAMES[@]}" -gt 0 ]
 }
 
@@ -574,9 +684,14 @@ pick_output_for_instance() {
     return 0
   fi
   if [ -n "$requested" ]; then
-    log_instance "$id" "Requested output '$requested' not available yet; current outputs: ${OUTPUTS_NAMES[*]:-none}"
+    # stdout is captured by callers — route the notice to stderr.
+    log_instance "$id" "requested output '$requested' not connected; leaving slot unfilled" >&2
+    # Preserve the user's explicit choice so the main loop can pause until
+    # the cable is plugged in again, instead of silently falling back.
+    printf '%s\n' "$requested"
+    return 1
   fi
-  # pick the Nth available output by id order
+  # No explicit request: pick the Nth available output by id order.
   local idx=0 name
   for name in "${OUTPUTS_NAMES[@]}"; do
     idx=$((idx + 1))
@@ -585,7 +700,8 @@ pick_output_for_instance() {
       return 0
     fi
   done
-  # fallback to first output
+  # Only one output — give both instances the same one (with a warning via
+  # validate_runtime_config at startup; hotplug loop handles unavailability).
   if [ "${#OUTPUTS_NAMES[@]}" -gt 0 ]; then
     printf '%s\n' "${OUTPUTS_NAMES[0]}"
     return 0
@@ -712,50 +828,196 @@ PYTHON
   fi
 }
 
-ensure_birdseye_extension() {
+ensure_frigate_extension() {
   local id=$1
-  [ "$BIRDSEYE_AUTO_FILL" = "true" ] || return 1
+  local autofill="$FRIGATE_BIRDSEYE_AUTO_FILL"
+  local dark="$FRIGATE_DARK_MODE" theme="$FRIGATE_THEME"
+  # Skip entirely when nothing is customised
+  [ "$autofill" = "true" ] || [ -n "$dark" ] || [ -n "$theme" ] || return 1
   local profile_root=${INSTANCE_PROFILE_DIR[$id]}
   local url="${INSTANCE_URL[$id]}"
   local -a candidates=()
-  [ -n "$BIRDSEYE_EXTENSION_DIR" ] && candidates+=( "${BIRDSEYE_EXTENSION_DIR%/}/$id" )
-  candidates+=( "${profile_root%/}/birdseye-autofill" "/usr/local/share/kiosk-monitor/birdseye-autofill-$id" )
+  [ -n "$FRIGATE_BIRDSEYE_EXTENSION_DIR" ] && candidates+=( "${FRIGATE_BIRDSEYE_EXTENSION_DIR%/}/$id" )
+  candidates+=( "${profile_root%/}/frigate-helper" "/usr/local/share/kiosk-monitor/frigate-helper-$id" )
   local dir="" candidate
   for candidate in "${candidates[@]}"; do
     [ -n "$candidate" ] || continue
     if mkdir -p "$candidate" 2>/dev/null; then dir="$candidate"; break; fi
   done
   [ -n "$dir" ] || return 1
-  local match_pattern="$BIRDSEYE_MATCH_PATTERN"
+  local match_pattern="$FRIGATE_BIRDSEYE_MATCH_PATTERN"
   [ -z "$match_pattern" ] && match_pattern=$(derive_match_pattern "$url")
-  cat > "$dir/fullscreen.css" <<'CSS'
-/* Ensure Frigate Birdseye grid/canvas fill the viewport */
+
+  # --- Compute initial CSS fallback dimensions from wlr-randr -----------
+  local bw="${FRIGATE_BIRDSEYE_WIDTH:-}" bh="${FRIGATE_BIRDSEYE_HEIGHT:-}"
+  local margin="${FRIGATE_BIRDSEYE_MARGIN:-80}"
+  [[ "$margin" =~ ^[0-9]+$ ]] || margin=80
+  if [ -z "$bw" ] || [ -z "$bh" ]; then
+    local out_name="${INSTANCE_OUTPUT[$id]:-}"
+    local geo="${OUTPUT_GEOMETRY[$out_name]:-}"
+    local ow=1920 oh=1080
+    if [ -n "$geo" ]; then
+      # shellcheck disable=SC2086
+      set -- $geo   # geo = "X Y W H"
+      ow="${3:-1920}"
+      oh="${4:-1080}"
+    fi
+    [ -z "$bw" ] && bw=$(( ow > margin ? ow - margin : ow ))
+    [ -z "$bh" ] && bh=$(( oh > margin ? oh - margin : oh ))
+  fi
+  [[ "$bw" =~ ^[0-9]+$ ]] || bw=1800
+  [[ "$bh" =~ ^[0-9]+$ ]] || bh=1000
+  [ "$bw" -lt 320 ] && bw=320
+  [ "$bh" -lt 240 ] && bh=240
+  # Ship to stderr — stdout of this function is captured by the caller.
+  log_instance "$id" "Birdseye fallback grid ${bw}x${bh} (output=${INSTANCE_OUTPUT[$id]:-?}, JS refines at runtime)" >&2
+
+  # --- CSS: first-paint fallback so there's no flash before JS runs ----
+  if [ "$autofill" = "true" ]; then
+    cat > "$dir/fullscreen.css" <<CSS
+/* Initial dimensions — frigate-helper.js recomputes these from the actual
+   window size once the document loads, so this only matters for first paint. */
 #pageRoot > div > div > div > div.react-grid-layout.grid-layout {
-  height: 100vh !important;
-  width: 100vw !important;
+  height: ${bh}px !important;
+  width: ${bw}px !important;
+  max-width: ${bw}px !important;
+  margin: 0 auto;
+}
+#pageRoot > div > div > div > div.react-grid-layout.grid-layout > div {
+  display: flex;
+  flex-direction: column;
+  width: 100% !important;
+  max-width: ${bw}px !important;
 }
 #pageRoot > div > div > div > div.react-grid-layout.grid-layout > div > div > div.size-full > div > div > div > canvas {
-  height: 100% !important;
-  width: 100% !important;
+  height: ${bh}px !important;
+  width: ${bw}px !important;
 }
 CSS
+  else
+    rm -f "$dir/fullscreen.css"
+  fi
+
+  # --- JS: theme + dark mode + runtime birdseye sizing -----------------
+  local has_helper_js=0
+  if [ -n "$dark" ] || [ -n "$theme" ] || [ "$autofill" = "true" ]; then
+    has_helper_js=1
+    local esc_dark esc_theme esc_tkey esc_ckey
+    esc_dark=$(printf '%s' "$dark"  | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+    esc_theme=$(printf '%s' "$theme" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+    esc_tkey=$(printf '%s' "$FRIGATE_THEME_STORAGE_KEY" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+    esc_ckey=$(printf '%s' "$FRIGATE_COLOR_STORAGE_KEY" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+    local js_autofill="false"
+    [ "$autofill" = "true" ] && js_autofill="true"
+    cat > "$dir/frigate-helper.js" <<JS
+(function() {
+  var DARK      = "$esc_dark";
+  var THEME     = "$esc_theme";
+  var TKEY      = "$esc_tkey";
+  var CKEY      = "$esc_ckey";
+  var AUTOFILL  = $js_autofill;
+  var MARGIN    = $margin;
+  var GRID_SEL  = "#pageRoot > div > div > div > div.react-grid-layout.grid-layout";
+
+  // Theme storage keys — write the canonical one plus well-known aliases
+  // so the Frigate UI picks it up across versions.
+  var THEME_ALIASES = [TKEY, "vite-ui-theme", "ui-theme", "theme"];
+  var COLOR_ALIASES = [CKEY, "vite-ui-color", "color-scheme", "frigate-color-scheme"];
+  function setAll(keys, value) {
+    if (!value) return;
+    for (var i = 0; i < keys.length; i++) {
+      try { localStorage.setItem(keys[i], value); } catch (e) {}
+    }
+  }
+  function applyHtmlClass() {
+    var h = document.documentElement;
+    if (!h) return;
+    if (DARK === "dark")  { h.classList.add("dark");  h.classList.remove("light"); }
+    if (DARK === "light") { h.classList.add("light"); h.classList.remove("dark"); }
+    if (THEME) {
+      var classes = (h.className || "").split(/\s+/).filter(function (c) {
+        return c && c.indexOf("theme-") !== 0;
+      });
+      classes.push("theme-" + THEME);
+      h.className = classes.join(" ");
+      h.setAttribute("data-theme", THEME);
+    }
+  }
+  function pxImportant(el, prop, px) {
+    if (!el || !el.style) return;
+    el.style.setProperty(prop, px + "px", "important");
+  }
+  function resizeBirdseye() {
+    if (!AUTOFILL) return;
+    var grid = document.querySelector(GRID_SEL);
+    if (!grid) return;
+    var w = Math.max(320, (window.innerWidth  || document.documentElement.clientWidth  || 1920) - MARGIN);
+    var h = Math.max(240, (window.innerHeight || document.documentElement.clientHeight || 1080) - MARGIN);
+    pxImportant(grid, "width", w);
+    pxImportant(grid, "height", h);
+    pxImportant(grid, "max-width", w);
+    grid.style.margin = "0 auto";
+    var child = grid.firstElementChild;
+    if (child) {
+      child.style.display = "flex";
+      child.style.flexDirection = "column";
+      pxImportant(child, "max-width", w);
+      child.style.setProperty("width", "100%", "important");
+    }
+    var canvas = grid.querySelector("canvas");
+    if (canvas) {
+      pxImportant(canvas, "width",  w);
+      pxImportant(canvas, "height", h);
+    }
+  }
+  function applyAll() {
+    applyHtmlClass();
+    resizeBirdseye();
+  }
+  setAll(THEME_ALIASES, DARK);
+  setAll(COLOR_ALIASES, THEME);
+  applyAll();
+  document.addEventListener("DOMContentLoaded", applyAll);
+  window.addEventListener("resize", resizeBirdseye);
+  // Poll while React mounts / remounts the grid; run for ~20s total
+  var tries = 0;
+  var iv = setInterval(function () {
+    applyAll();
+    if (++tries > 80) clearInterval(iv);
+  }, 250);
+})();
+JS
+  else
+    rm -f "$dir/frigate-helper.js" "$dir/frigate-theme.js"
+  fi
+  # clean up the old file name from previous versions
+  [ "$has_helper_js" = "1" ] && rm -f "$dir/frigate-theme.js"
+
+  # --- manifest ---
+  local css_field="" js_field=""
+  [ "$autofill" = "true" ] && css_field='      "css": ["fullscreen.css"],'
+  [ "$has_helper_js" = "1" ] && js_field='      "js": ["frigate-helper.js"],'
   cat > "$dir/manifest.json" <<MANIFEST
 {
-  "name": "Frigate Birdseye Auto-Fill",
+  "name": "Kiosk-Monitor Frigate Helper",
   "version": "1.0",
   "manifest_version": 3,
-  "description": "Force the Frigate Birdseye grid to fill the window.",
+  "description": "Inject Frigate kiosk tweaks: birdseye auto-fill, dark-mode and theme.",
   "content_scripts": [
     {
       "matches": ["$match_pattern"],
-      "css": ["fullscreen.css"],
+$css_field
+$js_field
       "run_at": "document_start"
     }
   ]
 }
 MANIFEST
-  chmod 0644 "$dir/fullscreen.css" "$dir/manifest.json"
+  # Clean up blank lines in the manifest (from skipped css/js fields)
+  sed -i '/^[[:space:]]*$/d' "$dir/manifest.json"
+
   chmod 0755 "$dir"
+  find "$dir" -maxdepth 1 -type f -exec chmod 0644 {} +
   if [ "${EUID:-$(id -u)}" -eq 0 ]; then
     chown -R "$GUI_USER":"$GUI_USER" "$dir" 2>/dev/null || true
   fi
@@ -851,10 +1113,11 @@ launch_chrome_instance() {
     "--user-data-dir=$profile_root"
     "--window-position=${x},${y}"
     "--window-size=${w},${h}"
+    "--class=${INSTANCE_CLASS[$id]}"
     --new-window
   )
   local ext_path
-  if ext_path=$(ensure_birdseye_extension "$id"); then
+  if ext_path=$(ensure_frigate_extension "$id"); then
     flags+=( "--load-extension=$ext_path" "--disable-extensions-except=$ext_path" )
   fi
   [ "$DEVTOOLS_AUTO_OPEN" = "true" ] && flags+=( --auto-open-devtools-for-tabs )
@@ -907,6 +1170,7 @@ launch_vlc_instance() {
     --intf=dummy
     --no-qt-privacy-ask
     --no-video-title-show
+    "--video-title=${INSTANCE_CLASS[$id]}"
     --quiet
     --file-logging
     "--logfile=$logfile"
@@ -930,7 +1194,16 @@ launch_vlc_instance() {
   flags+=( "$url" )
 
   log_instance "$id" "Launching VLC on $name (${w}x${h}+${x}+${y}) → $url"
-  as_gui "$vlc" "${flags[@]}" >/dev/null 2>&1 &
+  # exec -a sets argv[0] so the process (and its X11 WM_CLASS res_name in
+  # most toolkits) matches ${INSTANCE_CLASS[$id]}, which lines up with the
+  # labwc window rule below.
+  local esc_cmd
+  printf -v esc_cmd 'exec -a %q %q' "${INSTANCE_CLASS[$id]}" "$vlc"
+  local f
+  for f in "${flags[@]}"; do
+    printf -v esc_cmd '%s %q' "$esc_cmd" "$f"
+  done
+  as_gui bash -c "$esc_cmd" >/dev/null 2>&1 &
   local launcher_pid=$!
   sleep "$VLC_LAUNCH_DELAY"
 
@@ -1137,11 +1410,15 @@ setup_instances() {
   INSTANCE_MODE[1]="$MODE"
   INSTANCE_URL[1]="$URL"
   INSTANCE_OUTPUT[1]="$OUTPUT"
+  INSTANCE_FORCE_RESOLUTION[1]="$FORCE_RESOLUTION"
+  INSTANCE_FORCE_ROTATION[1]="$FORCE_ROTATION"
   if [ -n "$MODE2" ]; then
     INSTANCES+=( 2 )
     INSTANCE_MODE[2]="$MODE2"
     INSTANCE_URL[2]="${URL2:-$URL}"
     INSTANCE_OUTPUT[2]="$OUTPUT2"
+    INSTANCE_FORCE_RESOLUTION[2]="$FORCE_RESOLUTION_2"
+    INSTANCE_FORCE_ROTATION[2]="$FORCE_ROTATION_2"
   fi
   local id
   for id in "${INSTANCES[@]}"; do
@@ -1151,6 +1428,9 @@ setup_instances() {
     INSTANCE_FAIL_COUNT[$id]=0
     INSTANCE_LAST_GOOD[$id]=$(date +%s)
     INSTANCE_RESTART_LOG[$id]=""
+    INSTANCE_PAUSED[$id]="no"
+    # Window identifier used by launch flags and labwc window rules
+    INSTANCE_CLASS[$id]="kiosk-monitor-${INSTANCE_MODE[$id]}-$id"
     case "${INSTANCE_MODE[$id]}" in
       chrome)
         INSTANCE_PROFILE_DIR[$id]="${PROFILE_RUNTIME_ROOT%/}/chromium-$id"
@@ -1164,6 +1444,247 @@ setup_instances() {
         ;;
     esac
   done
+}
+
+validate_runtime_config() {
+  local errors=0
+  # instance 1
+  case "$MODE" in
+    chrome|vlc) ;;
+    *) echo "Config error: MODE must be 'chrome' or 'vlc' (got '$MODE')" >&2; errors=$((errors+1)) ;;
+  esac
+  if [ -z "${URL:-}" ]; then
+    echo "Config error: URL is required for instance 1." >&2
+    errors=$((errors+1))
+  else
+    case "$URL" in
+      http://*|https://*|rtsp://*|rtsps://*|rtmp://*|rtmps://*|udp://*|file://*|/*) ;;
+      *) echo "Config warning: URL='$URL' has no recognised scheme." >&2 ;;
+    esac
+  fi
+  # instance 2
+  if [ -n "${MODE2:-}" ]; then
+    case "$MODE2" in
+      chrome|vlc) ;;
+      *) echo "Config error: MODE2 must be 'chrome', 'vlc', or empty (got '$MODE2')" >&2; errors=$((errors+1)) ;;
+    esac
+    if [ -z "${URL2:-}" ]; then
+      echo "Config error: URL2 is required when MODE2 is set." >&2
+      errors=$((errors+1))
+    else
+      case "$URL2" in
+        http://*|https://*|rtsp://*|rtsps://*|rtmp://*|rtmps://*|udp://*|file://*|/*) ;;
+        *) echo "Config warning: URL2='$URL2' has no recognised scheme." >&2 ;;
+      esac
+    fi
+    if [ -n "${OUTPUT:-}" ] && [ -n "${OUTPUT2:-}" ] && [ "$OUTPUT" = "$OUTPUT2" ]; then
+      echo "Config warning: OUTPUT and OUTPUT2 are both '$OUTPUT'; the two instances will overlap on the same display." >&2
+    fi
+  fi
+  if [ "$errors" -gt 0 ]; then
+    echo "Refusing to start — please fix $errors config error(s) in $CONFIG_FILE." >&2
+    return 1
+  fi
+  return 0
+}
+
+instance_output_present() {
+  # returns 0 if the instance's requested output name is currently in OUTPUTS_NAMES
+  local id=$1
+  local req="${INSTANCE_OUTPUT[$id]:-}"
+  [ -n "$req" ] || return 0          # auto-pick: caller handles fallback
+  local name
+  for name in "${OUTPUTS_NAMES[@]}"; do
+    [ "$name" = "$req" ] && return 0
+  done
+  return 1
+}
+
+valid_rotation() {
+  case "$1" in
+    normal|90|180|270|flipped|flipped-90|flipped-180|flipped-270) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+current_output_mode() {
+  # Prints "WxH@FREQ" for a connected output, or empty if unknown.
+  local out=$1 json
+  command -v wlr-randr >/dev/null 2>&1 || return 1
+  json=$(as_gui wlr-randr --json 2>/dev/null) || return 1
+  printf '%s' "$json" | NAME="$out" python3 -c '
+import json, os, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+target = os.environ.get("NAME", "")
+for o in data:
+    if o.get("name") != target:
+        continue
+    for m in o.get("modes", []):
+        if m.get("current"):
+            w = int(m.get("width", 0))
+            h = int(m.get("height", 0))
+            r = float(m.get("refresh", 0))
+            print("%dx%d@%.3f" % (w, h, r))
+            sys.exit(0)
+' 2>/dev/null
+}
+
+current_output_transform() {
+  local out=$1 json
+  command -v wlr-randr >/dev/null 2>&1 || return 1
+  json=$(as_gui wlr-randr --json 2>/dev/null) || return 1
+  printf '%s' "$json" | NAME="$out" python3 -c '
+import json, os, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+target = os.environ.get("NAME", "")
+for o in data:
+    if o.get("name") == target:
+        print(o.get("transform", "normal") or "normal")
+        sys.exit(0)
+' 2>/dev/null
+}
+
+ensure_labwc_window_rules() {
+  # Generate ~/.config/labwc/rc.xml with window rules that route each kiosk
+  # window to its configured output. Under Wayland the client can't choose
+  # its output — the compositor decides — so we have to tell labwc.
+  #
+  # Only writes the file when it doesn't exist yet or when a previous
+  # kiosk-monitor run placed the managed marker. Anything else is left
+  # alone so we don't clobber a user's hand-rolled compositor config.
+  #
+  # Single-instance setups never need this — labwc's default placement
+  # already puts the sole window on the primary output, so skip the
+  # file entirely and leave the compositor config untouched.
+  if [ "${#INSTANCES[@]}" -le 1 ]; then
+    return 0
+  fi
+  local rc="/home/${GUI_USER}/.config/labwc/rc.xml"
+  local rc_dir
+  rc_dir=$(dirname "$rc")
+  local marker="kiosk-monitor: managed rc.xml"
+
+  if ! as_gui mkdir -p "$rc_dir" 2>/dev/null; then
+    log "Warning: could not create $rc_dir — skipping labwc window rules."
+    return 0
+  fi
+
+  if [ -f "$rc" ] && ! grep -qF "$marker" "$rc" 2>/dev/null; then
+    log "Warning: $rc exists and isn't kiosk-monitor-managed; leaving it."
+    log "Dual-display window routing needs labwc window rules in that file."
+    return 0
+  fi
+
+  local tmp
+  tmp=$(mktemp)
+  {
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<!-- %s — remove this comment to opt out of auto-management -->\n' "$marker"
+    printf '<labwc_config>\n'
+    printf '  <windowRules>\n'
+    local id
+    for id in "${INSTANCES[@]}"; do
+      local out="${INSTANCE_OUTPUT[$id]:-}"
+      local cls="${INSTANCE_CLASS[$id]:-}"
+      local mode="${INSTANCE_MODE[$id]}"
+      [ -n "$out" ] && [ -n "$cls" ] || continue
+      # Chromium is a Wayland-native client and respects --class=NAME, which
+      # labwc matches via 'identifier'. VLC runs under Xwayland and its
+      # WM_CLASS is fixed to 'vlc' by Qt regardless of argv[0], so we match
+      # the window title instead (set via --video-title).
+      if [ "$mode" = "vlc" ]; then
+        printf '    <windowRule title="%s" serverDecoration="no" skipTaskbar="yes" skipWindowSwitcher="yes">\n' "$cls"
+      else
+        printf '    <windowRule identifier="%s" serverDecoration="no" skipTaskbar="yes" skipWindowSwitcher="yes">\n' "$cls"
+      fi
+      printf '      <action name="MoveToOutput" output="%s"/>\n' "$out"
+      printf '    </windowRule>\n'
+    done
+    printf '  </windowRules>\n'
+    printf '</labwc_config>\n'
+  } > "$tmp"
+  as_gui install -m 0644 "$tmp" "$rc"
+  rm -f "$tmp"
+  if pkill -SIGHUP -u "$GUI_USER" -x labwc 2>/dev/null; then
+    log "labwc window rules written to $rc and compositor reloaded."
+  else
+    log "labwc window rules written to $rc (could not SIGHUP labwc)."
+  fi
+}
+
+apply_display_overrides() {
+  # Force the requested output's mode and/or transform via wlr-randr.
+  # Skips the call entirely when the output is already in the requested
+  # state — important because wlr-randr mode changes can trigger kanshi
+  # to auto-save a persistent config.init that hijacks the desktop layout.
+  local id=$1
+  local out="${INSTANCE_OUTPUT[$id]:-}"
+  local mode="${INSTANCE_FORCE_RESOLUTION[$id]:-}"
+  local rot="${INSTANCE_FORCE_ROTATION[$id]:-}"
+  [ -n "$out" ] || return 0
+  [ -n "$mode" ] || [ -n "$rot" ] || return 0
+  command -v wlr-randr >/dev/null 2>&1 || return 0
+
+  local mode_valid="no" rot_valid="no"
+  if [ -n "$mode" ]; then
+    if [[ "$mode" =~ ^[0-9]+x[0-9]+(@[0-9]+(\.[0-9]+)?)?$ ]]; then
+      mode_valid="yes"
+    else
+      log_instance "$id" "ignoring invalid FORCE_RESOLUTION='$mode' (expected WxH or WxH@RATE)"
+    fi
+  fi
+  if [ -n "$rot" ]; then
+    if valid_rotation "$rot"; then
+      rot_valid="yes"
+    else
+      log_instance "$id" "ignoring invalid FORCE_ROTATION='$rot' (expected normal|90|180|270|flipped*)"
+    fi
+  fi
+  [ "$mode_valid" = "yes" ] || [ "$rot_valid" = "yes" ] || return 0
+
+  # Idempotency check: compare current vs desired before invoking wlr-randr.
+  local need_mode="no" need_rot="no"
+  if [ "$mode_valid" = "yes" ]; then
+    local cur_mode
+    cur_mode=$(current_output_mode "$out" || true)
+    local want_dim="${mode%@*}"
+    local cur_dim="${cur_mode%@*}"
+    if [ "$cur_dim" != "$want_dim" ]; then
+      need_mode="yes"
+    elif [[ "$mode" == *@* ]]; then
+      # compare requested rate (optional) with current rate
+      local want_rate="${mode#*@}" cur_rate="${cur_mode#*@}"
+      # normalize to integers of Hz*1000 for loose equality
+      local w_ms c_ms
+      w_ms=$(awk -v v="$want_rate" 'BEGIN{printf "%d", v*1000}')
+      c_ms=$(awk -v v="$cur_rate"  'BEGIN{printf "%d", v*1000}')
+      [ "$w_ms" != "$c_ms" ] && need_mode="yes"
+    fi
+  fi
+  if [ "$rot_valid" = "yes" ]; then
+    local cur_rot
+    cur_rot=$(current_output_transform "$out" || true)
+    [ "$cur_rot" != "$rot" ] && need_rot="yes"
+  fi
+  if [ "$need_mode" != "yes" ] && [ "$need_rot" != "yes" ]; then
+    debug_instance "$id" "display override already in effect (mode=$mode rot=$rot) — skipping wlr-randr"
+    return 0
+  fi
+
+  local -a args=( --output "$out" )
+  [ "$need_mode" = "yes" ] && args+=( --mode "$mode" )
+  [ "$need_rot"  = "yes" ] && args+=( --transform "$rot" )
+  log_instance "$id" "applying display override: wlr-randr ${args[*]}"
+  if ! as_gui wlr-randr "${args[@]}" >/dev/null 2>&1; then
+    log_instance "$id" "wlr-randr override failed (output may not support requested mode/transform)"
+  fi
+  refresh_outputs || true
 }
 
 # ======================================================================
@@ -1248,6 +1769,7 @@ EOF
 EnvironmentFile=-$CONFIG_FILE
 ExecStart=$INSTALL_DIR/kiosk-monitor.sh
 ExecStop=/bin/kill -s TERM \$MAINPID
+ExecReload=/bin/kill -s HUP \$MAINPID
 Restart=always
 RestartSec=5
 SyslogIdentifier=kiosk-monitor
@@ -1270,6 +1792,22 @@ tailscaled_dependency_unit() {
   return 1
 }
 
+install_bash_completion() {
+  # Install bash completion file. Prefers a local copy alongside the script
+  # (checkout / --update --local), falls back to downloading from BASE_URL
+  # (one-liner curl-pipe install).
+  local script_dir=$1
+  local target="/etc/bash_completion.d/kiosk-monitor"
+  [ -d /etc/bash_completion.d ] || return 0
+  local src="$script_dir/kiosk-monitor.bash-completion"
+  if [ -f "$src" ]; then
+    install -m 0644 "$src" "$target"
+    return 0
+  fi
+  download_component kiosk-monitor.bash-completion "$target" 0644 2>/dev/null || true
+  return 0
+}
+
 ensure_script_installed() {
   local source=$1 target=$2 dir
   dir=$(dirname "$target"); mkdir -p "$dir"
@@ -1280,6 +1818,12 @@ ensure_script_installed() {
     chmod 0755 "$target"; return 0
   fi
   install -m 0755 "$source" "$target"
+  # Convenience short-name: `kiosk-monitor` (no .sh) opens the TUI when
+  # launched without args; every subcommand still works via either name.
+  local short="${target%/*}/kiosk-monitor"
+  if [ "$short" != "$target" ]; then
+    ln -sf "$(basename "$target")" "$short"
+  fi
 }
 
 escape_config_value() {
@@ -1305,9 +1849,13 @@ EOF
     emit_config_line MODE         "${MODE:-chrome}"
     emit_config_line URL          "${URL:-$DEFAULT_URL}"
     emit_config_line OUTPUT       "${OUTPUT:-}"
+    emit_config_line FORCE_RESOLUTION "${FORCE_RESOLUTION:-}"
+    emit_config_line FORCE_ROTATION   "${FORCE_ROTATION:-}"
     emit_config_line MODE2        "${MODE2:-}"
     emit_config_line URL2         "${URL2:-}"
     emit_config_line OUTPUT2      "${OUTPUT2:-}"
+    emit_config_line FORCE_RESOLUTION_2 "${FORCE_RESOLUTION_2:-}"
+    emit_config_line FORCE_ROTATION_2   "${FORCE_ROTATION_2:-}"
     emit_config_line DEBUG        "${DEBUG:-false}"
     emit_config_line CHROMIUM_BIN "${CHROMIUM_BIN:-}"
     emit_config_line VLC_BIN      "${VLC_BIN:-}"
@@ -1349,15 +1897,24 @@ EOF
     emit_config_line RESTART_WINDOW "${RESTART_WINDOW:-600}"
     emit_config_line MAX_RESTARTS "${MAX_RESTARTS:-10}"
     emit_config_line CLEAN_RESET "${CLEAN_RESET:-600}"
-    emit_config_line BIRDSEYE_AUTO_FILL "${BIRDSEYE_AUTO_FILL:-false}"
-    emit_config_line BIRDSEYE_MATCH_PATTERN "${BIRDSEYE_MATCH_PATTERN:-}"
-    emit_config_line BIRDSEYE_EXTENSION_DIR "${BIRDSEYE_EXTENSION_DIR:-}"
+    emit_config_line FRIGATE_BIRDSEYE_AUTO_FILL "${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
+    emit_config_line FRIGATE_BIRDSEYE_WIDTH  "${FRIGATE_BIRDSEYE_WIDTH:-}"
+    emit_config_line FRIGATE_BIRDSEYE_HEIGHT "${FRIGATE_BIRDSEYE_HEIGHT:-}"
+    emit_config_line FRIGATE_BIRDSEYE_MARGIN "${FRIGATE_BIRDSEYE_MARGIN:-80}"
+    emit_config_line FRIGATE_BIRDSEYE_MATCH_PATTERN "${FRIGATE_BIRDSEYE_MATCH_PATTERN:-}"
+    emit_config_line FRIGATE_BIRDSEYE_EXTENSION_DIR "${FRIGATE_BIRDSEYE_EXTENSION_DIR:-}"
+    emit_config_line FRIGATE_DARK_MODE "${FRIGATE_DARK_MODE:-}"
+    emit_config_line FRIGATE_THEME "${FRIGATE_THEME:-}"
+    emit_config_line FRIGATE_THEME_STORAGE_KEY "${FRIGATE_THEME_STORAGE_KEY:-frigate-ui-theme}"
+    emit_config_line FRIGATE_COLOR_STORAGE_KEY "${FRIGATE_COLOR_STORAGE_KEY:-frigate-ui-color-scheme}"
     emit_config_line DEVTOOLS_AUTO_OPEN "${DEVTOOLS_AUTO_OPEN:-false}"
     emit_config_line DEVTOOLS_REMOTE_PORT "${DEVTOOLS_REMOTE_PORT:-}"
     emit_config_line LOCK_FILE "${LOCK_FILE:-/var/lock/kiosk-monitor.lock}"
     emit_config_line INSTALL_DIR "${INSTALL_DIR:-/usr/local/bin}"
     emit_config_line SERVICE_PATH "${SERVICE_PATH:-/etc/systemd/system/kiosk-monitor.service}"
     emit_config_line BASE_URL "${BASE_URL:-$DEFAULT_BASE_URL}"
+    emit_config_line LOG_MAX_BYTES "${LOG_MAX_BYTES:-2097152}"
+    emit_config_line LOG_ROTATE_KEEP "${LOG_ROTATE_KEEP:-1}"
   } > "$tmp"
   install -m 0644 "$tmp" "$target"
   rm -f "$tmp"
@@ -1416,13 +1973,79 @@ ensure_config_file() {
   return 0
 }
 
+ensure_apt_dependencies() {
+  # Installs any missing runtime prerequisites via apt-get. Safe to call more
+  # than once; skips work when everything is present. Invoked from install/
+  # update paths and can be disabled with --skip-apt.
+  require_root
+  command -v apt-get >/dev/null 2>&1 || {
+    echo "apt-get not found; skipping dependency install." >&2
+    return 0
+  }
+
+  # cmd → package (apt package that provides the command)
+  declare -A pkg_for=(
+    [curl]=curl
+    [grim]=grim
+    [wlr-randr]=wlr-randr
+    [python3]=python3
+    [whiptail]=whiptail
+    [flock]=util-linux
+    [sha256sum]=coreutils
+  )
+
+  # chromium / vlc: any of several commands satisfies the dep; install
+  # package only if none of them are present.
+  local bin has_chromium="no" has_vlc="no"
+  for bin in chromium chromium-browser google-chrome; do
+    command -v "$bin" >/dev/null 2>&1 && { has_chromium="yes"; break; }
+  done
+  [ "$has_chromium" = "no" ] && pkg_for[chromium]=chromium
+
+  for bin in vlc cvlc; do
+    command -v "$bin" >/dev/null 2>&1 && { has_vlc="yes"; break; }
+  done
+  [ "$has_vlc" = "no" ] && pkg_for[vlc]=vlc
+
+  local -a to_install=()
+  local cmd pkg
+  for cmd in "${!pkg_for[@]}"; do
+    command -v "$cmd" >/dev/null 2>&1 && continue
+    pkg="${pkg_for[$cmd]}"
+    case " ${to_install[*]:-} " in *" $pkg "*) ;; *) to_install+=( "$pkg" ) ;; esac
+  done
+
+  if [ "${#to_install[@]}" -eq 0 ]; then
+    echo "All required packages are already installed."
+    return 0
+  fi
+
+  echo "Installing missing dependencies via apt: ${to_install[*]}"
+  # refresh apt index if it's older than 24 hours
+  local cache_age=99999
+  if [ -f /var/cache/apt/pkgcache.bin ]; then
+    cache_age=$(( $(date +%s) - $(stat -c %Y /var/cache/apt/pkgcache.bin 2>/dev/null || echo 0) ))
+  fi
+  if [ "$cache_age" -gt 86400 ]; then
+    echo "Refreshing apt index…"
+    apt-get update -qq || echo "Warning: apt-get update failed; continuing with cached index." >&2
+  fi
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${to_install[@]}"; then
+    echo "Error: apt-get install failed for: ${to_install[*]}" >&2
+    echo "Install them manually and re-run." >&2
+    return 1
+  fi
+  echo "Dependency install complete."
+  return 0
+}
+
 install_self() {
   require_root
   need_cmd systemctl; need_cmd install
 
   local url_override="" gui_override="" mode_override=""
   local output_override="" mode2_override="" url2_override="" output2_override=""
-  local autostart="yes"
+  local autostart="yes" skip_apt="no"
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --url)        shift; url_override="${1:-}";      [ -n "$url_override" ]     || { echo 'Error: --url requires a value' >&2; exit 1; } ;;
@@ -1439,11 +2062,16 @@ install_self() {
                     case "$mode_override" in chromium|chrome) mode_override="chrome" ;; vlc|VLC) mode_override="vlc" ;; esac ;;
       --gui-user|--user) shift; gui_override="${1:-}"; [ -n "$gui_override" ]     || { echo 'Error: --gui-user requires a value' >&2; exit 1; } ;;
       --no-start)   autostart="no" ;;
+      --skip-apt)   skip_apt="yes" ;;
       --base-url)   shift; BASE_URL="${1:-}";          [ -n "$BASE_URL" ]         || { echo 'Error: --base-url requires a value' >&2; exit 1; } ;;
       *) printf 'Error: unknown install option %s\n' "$1" >&2; usage; exit 1 ;;
     esac
     shift
   done
+
+  if [ "$skip_apt" = "no" ]; then
+    ensure_apt_dependencies || exit 1
+  fi
 
   local effective_gui
   if [ -n "$gui_override" ]; then
@@ -1471,6 +2099,7 @@ install_self() {
 
   mkdir -p "$INSTALL_DIR"
   ensure_script_installed "$resolved_script" "$INSTALL_DIR/kiosk-monitor.sh"
+  install_bash_completion "$script_dir"
 
   mkdir -p "$CONFIG_DIR"
   if [ ! -f "$CONFIG_DIR/kiosk-monitor.conf.sample" ] && [ -f "$script_dir/kiosk-monitor.conf.sample" ]; then
@@ -1493,10 +2122,47 @@ install_self() {
   fi
 }
 
+download_component() {
+  local source=$1 destination=$2 mode=${3:-0644} tmp
+  need_cmd curl; need_cmd install
+  tmp=$(mktemp)
+  if ! curl -fsSL --connect-timeout 10 --max-time 60 "${BASE_URL%/}/$source" -o "$tmp"; then
+    printf 'Error: failed to download %s from %s\n' "$source" "$BASE_URL" >&2
+    rm -f "$tmp"; return 1
+  fi
+  case "$source" in
+    *.sh)
+      if ! head -1 "$tmp" | grep -q '^#!'; then
+        echo "Error: downloaded $source is not a shell script (bad shebang)" >&2
+        rm -f "$tmp"; return 1
+      fi
+      ;;
+  esac
+  if [ ! -s "$tmp" ]; then
+    echo "Error: downloaded $source is empty" >&2
+    rm -f "$tmp"; return 1
+  fi
+  install -m "$mode" "$tmp" "$destination"
+  rm -f "$tmp"
+  return 0
+}
+
+fetch_remote_version() {
+  need_cmd curl
+  local tmp ver=""
+  tmp=$(mktemp)
+  if curl -fsSL --connect-timeout 10 --max-time 30 "${BASE_URL%/}/kiosk-monitor.sh" -o "$tmp" 2>/dev/null; then
+    ver=$(grep -m1 '^SCRIPT_VERSION=' "$tmp" | sed -E 's/^SCRIPT_VERSION="?([^"]+)"?.*$/\1/')
+  fi
+  rm -f "$tmp"
+  printf '%s\n' "$ver"
+}
+
 update_self() {
   require_root
   need_cmd systemctl; need_cmd install
   local gui_override="" mode_override="" suppress_restart="no"
+  local source_mode="remote" check_only="no" force_install="no" skip_apt="no"
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --gui-user|--user) shift; gui_override="${1:-}"; [ -n "$gui_override" ] || { echo 'Error: --gui-user requires a value' >&2; exit 1; } ;;
@@ -1504,11 +2170,51 @@ update_self() {
                     case "$mode_override" in chromium|chrome) mode_override="chrome" ;; esac ;;
       --browser)    shift; mode_override="${1:-}"; case "$mode_override" in chromium|chrome) mode_override="chrome" ;; vlc|VLC) mode_override="vlc" ;; esac ;;
       --no-restart) suppress_restart="yes" ;;
-      --base-url)   shift; echo 'Warning: --base-url is deprecated and ignored.' >&2 ;;
+      --local)      source_mode="local" ;;
+      --check)      check_only="yes" ;;
+      --force)      force_install="yes" ;;
+      --skip-apt)   skip_apt="yes" ;;
+      --base-url)   shift; BASE_URL="${1:-}"; [ -n "$BASE_URL" ] || { echo 'Error: --base-url requires a value' >&2; exit 1; } ;;
       *) printf 'Error: unknown update option %s\n' "$1" >&2; usage; exit 1 ;;
     esac
     shift
   done
+
+  # --- remote version check ---
+  local remote_ver=""
+  if [ "$source_mode" = "remote" ] || [ "$check_only" = "yes" ]; then
+    echo "Checking $BASE_URL for newer kiosk-monitor…"
+    remote_ver=$(fetch_remote_version 2>/dev/null) || true
+    if [ -n "$remote_ver" ]; then
+      printf 'Installed : %s\n' "$SCRIPT_VERSION"
+      printf 'Remote    : %s\n' "$remote_ver"
+    else
+      printf 'Installed : %s\n' "$SCRIPT_VERSION"
+      printf 'Remote    : (unknown — fetch failed)\n'
+      if [ "$check_only" = "yes" ]; then exit 1; fi
+      if [ "$source_mode" = "remote" ] && [ "$force_install" != "yes" ]; then
+        echo 'Use --force to attempt install anyway, or --local to install from this file.' >&2
+        exit 1
+      fi
+    fi
+    if [ "$check_only" = "yes" ]; then
+      if [ -z "$remote_ver" ] || [ "$remote_ver" = "$SCRIPT_VERSION" ]; then
+        echo 'Up to date.'
+      else
+        echo 'Update available.'
+      fi
+      exit 0
+    fi
+    if [ "$source_mode" = "remote" ] && [ -n "$remote_ver" ] \
+       && [ "$remote_ver" = "$SCRIPT_VERSION" ] && [ "$force_install" != "yes" ]; then
+      echo 'Already at the latest version. Use --force to reinstall.'
+      exit 0
+    fi
+  fi
+
+  if [ "$skip_apt" = "no" ]; then
+    ensure_apt_dependencies || exit 1
+  fi
 
   local was_active="no"
   systemctl is-active --quiet kiosk-monitor.service && was_active="yes"
@@ -1533,16 +2239,27 @@ update_self() {
   fi
   [ -z "$wayland_display" ] && wayland_display="wayland-0"
 
-  local resolved_script script_dir
-  resolved_script=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
-  script_dir=$(dirname "$resolved_script")
-  mkdir -p "$INSTALL_DIR"
-  ensure_script_installed "$resolved_script" "$INSTALL_DIR/kiosk-monitor.sh"
+  mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"
 
-  mkdir -p "$CONFIG_DIR"
-  if [ ! -f "$CONFIG_DIR/kiosk-monitor.conf.sample" ] && [ -f "$script_dir/kiosk-monitor.conf.sample" ]; then
-    install -m 0644 "$script_dir/kiosk-monitor.conf.sample" "$CONFIG_DIR/kiosk-monitor.conf.sample"
+  if [ "$source_mode" = "remote" ]; then
+    echo "Downloading kiosk-monitor.sh from $BASE_URL…"
+    download_component kiosk-monitor.sh         "$INSTALL_DIR/kiosk-monitor.sh"         0755 || exit 1
+    echo "Downloading kiosk-monitor.conf.sample…"
+    download_component kiosk-monitor.conf.sample "$CONFIG_DIR/kiosk-monitor.conf.sample" 0644 || true
+    # Use an empty script_dir so install_bash_completion falls through to
+    # the remote download path.
+    install_bash_completion /nonexistent
+  else
+    local resolved_script script_dir
+    resolved_script=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+    script_dir=$(dirname "$resolved_script")
+    ensure_script_installed "$resolved_script" "$INSTALL_DIR/kiosk-monitor.sh"
+    install_bash_completion "$script_dir"
+    if [ -f "$script_dir/kiosk-monitor.conf.sample" ]; then
+      install -m 0644 "$script_dir/kiosk-monitor.conf.sample" "$CONFIG_DIR/kiosk-monitor.conf.sample"
+    fi
   fi
+
   [ -n "$mode_override" ] && ensure_config_file "" "" "$mode_override" "" "" "" ""
 
   local service_dependency=""
@@ -1550,11 +2267,14 @@ update_self() {
   if dep=$(tailscaled_dependency_unit); then service_dependency="$dep"; fi
   write_service_unit "$effective_gui" "$runtime_dir" "$wayland_display" "$SERVICE_PATH" "$service_dependency"
   systemctl daemon-reload
+
+  local new_ver
+  new_ver=$("$INSTALL_DIR/kiosk-monitor.sh" --version 2>/dev/null || echo "$SCRIPT_VERSION")
   if [ "$was_active" = "yes" ] && [ "$suppress_restart" = "no" ]; then
     systemctl restart kiosk-monitor.service
-    echo 'kiosk-monitor updated and restarted.'
+    echo "kiosk-monitor updated to $new_ver and restarted."
   else
-    echo 'kiosk-monitor updated.'
+    echo "kiosk-monitor updated to $new_ver."
   fi
 }
 
@@ -1573,7 +2293,8 @@ remove_self() {
     systemctl disable kiosk-monitor.service 2>/dev/null || true
   fi
   rm -f "$SERVICE_PATH"
-  rm -f "$INSTALL_DIR/kiosk-monitor.sh"
+  rm -f "$INSTALL_DIR/kiosk-monitor.sh" "$INSTALL_DIR/kiosk-monitor"
+  rm -f /etc/bash_completion.d/kiosk-monitor
   if [ "$purge" = "yes" ]; then
     rm -f "$CONFIG_FILE"
     [ -d "$CONFIG_DIR" ] && rmdir "$CONFIG_DIR" 2>/dev/null || true
@@ -1592,15 +2313,298 @@ reconfigure_self() {
   echo "kiosk-monitor configuration written to $CONFIG_FILE."
 }
 
+# ----------------------------------------------------------------------
+# Interactive TUI (whiptail)
+# ----------------------------------------------------------------------
+_wt_run() {
+  # Runs whiptail, isolating its stdout (menu results) from stderr (UI).
+  # Returns whiptail's exit code; caller inspects $? to detect Cancel/ESC.
+  local rc
+  set +e
+  "$@" 3>&1 1>&2 2>&3
+  rc=$?
+  set -e
+  return $rc
+}
+
+_wt_menu() {
+  # title, prompt, height, width, list-height, then tag/description pairs
+  local title=$1 prompt=$2 h=$3 w=$4 lh=$5
+  shift 5
+  _wt_run whiptail --title "$title" --menu "$prompt" "$h" "$w" "$lh" "$@"
+}
+
+_wt_input() {
+  local title=$1 prompt=$2 default=$3
+  _wt_run whiptail --title "$title" --inputbox "$prompt" 10 78 "$default"
+}
+
+_wt_yesno() {
+  local title=$1 prompt=$2 default=${3:-yes}
+  local flag=""
+  [ "$default" = "no" ] && flag="--defaultno"
+  set +e
+  whiptail --title "$title" --yesno $flag "$prompt" 10 70
+  local rc=$?
+  set -e
+  return $rc
+}
+
+configure_self() {
+  require_root
+  if ! command -v whiptail >/dev/null 2>&1; then
+    echo "Error: whiptail not installed. Run: sudo apt install whiptail" >&2
+    exit 1
+  fi
+
+  # Load existing config so current values pre-populate the prompts
+  if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+  fi
+
+  # We need a GUI user to probe outputs via wlr-randr. Best-effort only.
+  if [ -z "${GUI_USER:-}" ] || [ "$GUI_USER" = "root" ]; then
+    auto_detect_gui_user 2>/dev/null || true
+  fi
+  if [ -n "${GUI_USER:-}" ] && [ "$GUI_USER" != "root" ]; then
+    GUI_UID=$(id -u "$GUI_USER" 2>/dev/null || echo 0)
+    : "${XDG_RUNTIME_DIR:=/run/user/$GUI_UID}"
+    export XDG_RUNTIME_DIR
+    # pick wayland socket
+    if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
+      local sock
+      for sock in "$XDG_RUNTIME_DIR"/wayland-*; do
+        case "$sock" in *.lock) continue ;; esac
+        [ -S "$sock" ] && { WAYLAND_DISPLAY=$(basename "$sock"); export WAYLAND_DISPLAY; break; }
+      done
+    fi
+    refresh_outputs 2>/dev/null || true
+  fi
+
+  local -a output_tags=( "" "(auto — kiosk-monitor picks)" )
+  local name
+  for name in "${OUTPUTS_NAMES[@]}"; do
+    output_tags+=( "$name" "${OUTPUT_GEOMETRY[$name]:-?}" )
+  done
+
+  local rc
+  local new_mode new_url new_output=""
+  local new_mode2="" new_url2="" new_output2=""
+  local new_dark="" new_theme="" new_autofill="${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
+
+  # --- Instance 1 mode ---
+  new_mode=$(_wt_menu "Kiosk Monitor — Instance 1" "Choose launch mode for the primary display." 13 66 4 \
+    "chrome" "Fullscreen Chromium kiosk" \
+    "vlc"    "Fullscreen VLC video player") || { echo "Cancelled."; exit 0; }
+
+  # --- Instance 1 URL ---
+  new_url=$(_wt_input "Instance 1 URL" "URL for chrome, or stream path for VLC:" "${URL:-}") || { echo "Cancelled."; exit 0; }
+  if [ -z "$new_url" ]; then
+    whiptail --title "Kiosk Monitor" --msgbox "URL cannot be empty. Aborting." 10 50
+    exit 1
+  fi
+
+  # --- Instance 1 output ---
+  if [ "${#output_tags[@]}" -ge 2 ]; then
+    new_output=$(_wt_menu "Instance 1 Output" "Which display should instance 1 render on?" 16 70 8 \
+      "${output_tags[@]}") || { echo "Cancelled."; exit 0; }
+  fi
+
+  # --- Instance 1 resolution + rotation (optional) ---
+  local new_res="" new_rot=""
+  if _wt_yesno "Force Resolution" "Force a specific resolution/rotation for instance 1?" \
+       "$( [ -n "${FORCE_RESOLUTION:-}${FORCE_ROTATION:-}" ] && echo yes || echo no )"; then
+    new_res=$(_wt_input "Instance 1 Resolution" \
+      "WxH or WxH@Hz (blank = leave alone):" "${FORCE_RESOLUTION:-}") || { echo "Cancelled."; exit 0; }
+    new_rot=$(_wt_menu "Instance 1 Rotation" "Force the output orientation for instance 1." 16 60 9 \
+      ""             "Do not override" \
+      "normal"       "0° (no rotation)" \
+      "90"           "90° clockwise" \
+      "180"          "180°" \
+      "270"          "270° clockwise" \
+      "flipped"      "mirrored" \
+      "flipped-90"   "mirrored + 90°" \
+      "flipped-180"  "mirrored + 180°" \
+      "flipped-270"  "mirrored + 270°") || { echo "Cancelled."; exit 0; }
+  fi
+
+  # --- Enable instance 2? ---
+  local new_res2="" new_rot2=""
+  if _wt_yesno "Second Display" "Enable a second instance on another display?" \
+       "$( [ -n "${MODE2:-}" ] && echo yes || echo no )"; then
+    new_mode2=$(_wt_menu "Kiosk Monitor — Instance 2" "Choose launch mode for the second display." 13 66 4 \
+      "chrome" "Fullscreen Chromium kiosk" \
+      "vlc"    "Fullscreen VLC video player") || { echo "Cancelled."; exit 0; }
+    new_url2=$(_wt_input "Instance 2 URL" "URL for chrome, or stream path for VLC:" "${URL2:-}") || { echo "Cancelled."; exit 0; }
+    if [ -z "$new_url2" ]; then
+      whiptail --title "Kiosk Monitor" --msgbox "URL2 cannot be empty. Aborting." 10 50
+      exit 1
+    fi
+    if [ "${#output_tags[@]}" -ge 2 ]; then
+      new_output2=$(_wt_menu "Instance 2 Output" "Which display should instance 2 render on?" 16 70 8 \
+        "${output_tags[@]}") || { echo "Cancelled."; exit 0; }
+    fi
+    if _wt_yesno "Force Resolution (2)" "Force a specific resolution/rotation for instance 2?" \
+         "$( [ -n "${FORCE_RESOLUTION_2:-}${FORCE_ROTATION_2:-}" ] && echo yes || echo no )"; then
+      new_res2=$(_wt_input "Instance 2 Resolution" \
+        "WxH or WxH@Hz (blank = leave alone):" "${FORCE_RESOLUTION_2:-}") || { echo "Cancelled."; exit 0; }
+      new_rot2=$(_wt_menu "Instance 2 Rotation" "Force the output orientation for instance 2." 16 60 9 \
+        ""             "Do not override" \
+        "normal"       "0° (no rotation)" \
+        "90"           "90° clockwise" \
+        "180"          "180°" \
+        "270"          "270° clockwise" \
+        "flipped"      "mirrored" \
+        "flipped-90"   "mirrored + 90°" \
+        "flipped-180"  "mirrored + 180°" \
+        "flipped-270"  "mirrored + 270°") || { echo "Cancelled."; exit 0; }
+    fi
+  fi
+
+  # --- Frigate tweaks (if any chrome instance present) ---
+  if [ "$new_mode" = "chrome" ] || [ "$new_mode2" = "chrome" ]; then
+    new_dark=$(_wt_menu "Frigate Dark Mode" "Force Frigate's theme, or leave unchanged." 13 60 4 \
+      ""      "Do not override" \
+      "Light" "Force light theme" \
+      "Dark"  "Force dark theme") || { echo "Cancelled."; exit 0; }
+
+    new_theme=$(_wt_menu "Frigate Theme" "Force Frigate's color theme, or leave unchanged." 17 60 8 \
+      ""              "Do not override" \
+      "Default"       "Frigate default" \
+      "Blue"          "Blue accent" \
+      "Green"         "Green accent" \
+      "Nord"          "Nord palette" \
+      "Red"           "Red accent" \
+      "High Contrast" "High-contrast theme") || { echo "Cancelled."; exit 0; }
+
+    new_autofill="false"
+    if _wt_yesno "Frigate Birdseye Auto-Fill" \
+         "Inject CSS to force the Frigate Birdseye grid to fill the window?" \
+         "$( [ "${FRIGATE_BIRDSEYE_AUTO_FILL:-false}" = "true" ] && echo yes || echo no )"; then
+      new_autofill="true"
+    fi
+  fi
+
+  # --- Summary + confirm ---
+  local summary
+  summary=$(printf "Instance 1:\n  mode       : %s\n  url        : %s\n  output     : %s\n  resolution : %s\n  rotation   : %s\n\n" \
+              "$new_mode" "$new_url" "${new_output:-auto}" "${new_res:-(unchanged)}" "${new_rot:-(unchanged)}")
+  if [ -n "$new_mode2" ]; then
+    summary+=$(printf "Instance 2:\n  mode       : %s\n  url        : %s\n  output     : %s\n  resolution : %s\n  rotation   : %s\n\n" \
+                 "$new_mode2" "$new_url2" "${new_output2:-auto}" "${new_res2:-(unchanged)}" "${new_rot2:-(unchanged)}")
+  else
+    summary+=$(printf "Instance 2: disabled\n\n")
+  fi
+  if [ "$new_mode" = "chrome" ] || [ "$new_mode2" = "chrome" ]; then
+    summary+=$(printf "Frigate:\n  dark-mode          : %s\n  theme              : %s\n  birdseye-autofill  : %s\n" \
+                 "${new_dark:-(unchanged)}" "${new_theme:-(unchanged)}" "$new_autofill")
+  fi
+  whiptail --title "Review" --scrolltext --yesno "$summary
+Save to $CONFIG_FILE?" 24 78 || { echo "Cancelled — no changes saved."; exit 0; }
+
+  # --- Persist ---
+  mkdir -p "$CONFIG_DIR"
+  [ -f "$CONFIG_FILE" ] || render_config_file
+  set_or_append_conf_value MODE              "$new_mode"     "$CONFIG_FILE"
+  set_or_append_conf_value URL               "$new_url"      "$CONFIG_FILE"
+  set_or_append_conf_value OUTPUT            "$new_output"   "$CONFIG_FILE"
+  set_or_append_conf_value FORCE_RESOLUTION  "$new_res"      "$CONFIG_FILE"
+  set_or_append_conf_value FORCE_ROTATION    "$new_rot"      "$CONFIG_FILE"
+  set_or_append_conf_value MODE2             "$new_mode2"    "$CONFIG_FILE"
+  set_or_append_conf_value URL2              "$new_url2"     "$CONFIG_FILE"
+  set_or_append_conf_value OUTPUT2           "$new_output2"  "$CONFIG_FILE"
+  set_or_append_conf_value FORCE_RESOLUTION_2 "$new_res2"    "$CONFIG_FILE"
+  set_or_append_conf_value FORCE_ROTATION_2   "$new_rot2"    "$CONFIG_FILE"
+  if [ "$new_mode" = "chrome" ] || [ "$new_mode2" = "chrome" ]; then
+    set_or_append_conf_value FRIGATE_DARK_MODE           "$new_dark"     "$CONFIG_FILE"
+    set_or_append_conf_value FRIGATE_THEME               "$new_theme"    "$CONFIG_FILE"
+    set_or_append_conf_value FRIGATE_BIRDSEYE_AUTO_FILL  "$new_autofill" "$CONFIG_FILE"
+  fi
+  echo "Saved configuration to $CONFIG_FILE."
+
+  # --- Offer restart ---
+  if command -v systemctl >/dev/null 2>&1 && \
+     systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' | grep -qx 'kiosk-monitor.service'; then
+    local was_active="no"
+    systemctl is-active --quiet kiosk-monitor.service && was_active="yes"
+    local prompt
+    if [ "$was_active" = "yes" ]; then
+      prompt="Service is running. Restart kiosk-monitor.service to apply?"
+    else
+      prompt="Service is not running. Start kiosk-monitor.service now?"
+    fi
+    if _wt_yesno "Apply" "$prompt"; then
+      if [ "$was_active" = "yes" ]; then
+        systemctl restart kiosk-monitor.service && echo "Service restarted."
+      else
+        systemctl start kiosk-monitor.service && echo "Service started."
+      fi
+    fi
+  else
+    echo "Tip: run '$SCRIPT_NAME --install' first to create the systemd service."
+  fi
+  rc=0
+  return $rc
+}
+
+logs_self() {
+  need_cmd journalctl
+  local follow="yes" lines=200
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --no-follow|-n)  follow="no" ;;
+      --follow|-f)     follow="yes" ;;
+      --lines)         shift; lines="${1:-200}" ;;
+      --lines=*)       lines="${1#--lines=}" ;;
+      --all)           lines="all" ;;
+      *) printf 'Error: unknown logs option %s\n' "$1" >&2; usage; exit 1 ;;
+    esac
+    shift
+  done
+  local -a cmd=( journalctl -u kiosk-monitor.service --no-pager )
+  case "$lines" in all|0) ;; *) cmd+=( -n "$lines" ) ;; esac
+  [ "$follow" = "yes" ] && cmd+=( -f )
+  exec "${cmd[@]}"
+}
+
 status_self() {
   printf 'kiosk-monitor version: %s\n' "$SCRIPT_VERSION"
-  printf 'Config file: %s\n' "$CONFIG_FILE"
-  printf 'Instance 1: mode=%s url=%s output=%s\n' "${MODE:-unset}" "${URL:-unset}" "${OUTPUT:-auto}"
+  printf 'Config file:           %s\n' "$CONFIG_FILE"
+  printf 'Desktop user (config): %s\n' "${GUI_USER:-auto-detect}"
+  printf '\nInstance 1:\n'
+  printf '  mode        : %s\n' "${MODE:-unset}"
+  printf '  url         : %s\n' "${URL:-unset}"
+  printf '  output      : %s\n' "${OUTPUT:-(auto)}"
+  printf '  resolution  : %s\n' "${FORCE_RESOLUTION:-(compositor)}"
+  printf '  rotation    : %s\n' "${FORCE_ROTATION:-(compositor)}"
   if [ -n "${MODE2:-}" ]; then
-    printf 'Instance 2: mode=%s url=%s output=%s\n' "$MODE2" "${URL2:-unset}" "${OUTPUT2:-auto}"
+    printf '\nInstance 2:\n'
+    printf '  mode        : %s\n' "$MODE2"
+    printf '  url         : %s\n' "${URL2:-unset}"
+    printf '  output      : %s\n' "${OUTPUT2:-(auto)}"
+    printf '  resolution  : %s\n' "${FORCE_RESOLUTION_2:-(compositor)}"
+    printf '  rotation    : %s\n' "${FORCE_ROTATION_2:-(compositor)}"
   else
-    printf 'Instance 2: disabled\n'
+    printf '\nInstance 2: disabled\n'
   fi
+  if [ "$MODE" = "chrome" ] || [ -n "${MODE2:-}" ] && [ "${MODE2:-}" = "chrome" ]; then
+    printf '\nFrigate helper:\n'
+    printf '  dark-mode         : %s\n' "${FRIGATE_DARK_MODE:-(none)}"
+    printf '  theme             : %s\n' "${FRIGATE_THEME:-(none)}"
+    printf '  birdseye autofill : %s\n' "${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
+    if [ -n "${FRIGATE_BIRDSEYE_WIDTH:-}" ] || [ -n "${FRIGATE_BIRDSEYE_HEIGHT:-}" ]; then
+      printf '  birdseye size     : %sx%s (fixed)\n' "${FRIGATE_BIRDSEYE_WIDTH:-auto}" "${FRIGATE_BIRDSEYE_HEIGHT:-auto}"
+    else
+      printf '  birdseye size     : auto (viewport minus %spx margin)\n' "${FRIGATE_BIRDSEYE_MARGIN:-80}"
+    fi
+  fi
+  if [ -n "${LOG:-}" ] && [ -f "$LOG" ]; then
+    local lsize
+    lsize=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+    printf '\nLog file:   %s (%s bytes; cap %s)\n' "$LOG" "$lsize" "${LOG_MAX_BYTES:-2097152}"
+  fi
+  echo
   if command -v systemctl >/dev/null 2>&1; then
     systemctl status kiosk-monitor.service --no-pager 2>/dev/null || true
   fi
@@ -1614,11 +2618,14 @@ Usage:
   kiosk-monitor.sh [--debug]
   kiosk-monitor.sh --install [--url URL] [--mode chrome|vlc] [--output NAME]
                              [--url2 URL] [--mode2 chrome|vlc] [--output2 NAME]
-                             [--gui-user USER] [--no-start]
-  kiosk-monitor.sh --update  [--gui-user USER] [--mode chrome|vlc] [--no-restart]
+                             [--gui-user USER] [--no-start] [--skip-apt]
+  kiosk-monitor.sh --update  [--check] [--local] [--force] [--base-url URL]
+                             [--gui-user USER] [--mode chrome|vlc] [--no-restart] [--skip-apt]
   kiosk-monitor.sh --remove  [--purge]
+  kiosk-monitor.sh --configure            Interactive whiptail TUI (requires root)
   kiosk-monitor.sh --reconfig [--config PATH]
   kiosk-monitor.sh --status
+  kiosk-monitor.sh --logs [--no-follow] [--lines N|all]
   kiosk-monitor.sh --help | --version
 
 Config (/etc/kiosk-monitor/kiosk-monitor.conf):
@@ -1639,22 +2646,30 @@ EOF
 # Action dispatch
 # ======================================================================
 ACTION="run"
+# Invoked via the short-name symlink with no args? Open the TUI. The systemd
+# unit uses the full .sh path so the service still runs the watchdog.
+if [ "$#" -eq 0 ] && [ "$SCRIPT_NAME" = "kiosk-monitor" ]; then
+  ACTION="configure"
+fi
 case "${1:-}" in
-  --install|--remove|--update|--reconfig) ACTION="${1#--}"; shift ;;
+  --install|--remove|--update|--reconfig|--configure) ACTION="${1#--}"; shift ;;
   --status)  ACTION="status"; shift ;;
+  --logs)    ACTION="logs"; shift ;;
   --help|-h) ACTION="help"; shift ;;
   --version) ACTION="version"; shift ;;
 esac
 ACTION_ARGS=("$@")
 
 case "$ACTION" in
-  install)  install_self "${ACTION_ARGS[@]}"; exit 0 ;;
-  update)   update_self  "${ACTION_ARGS[@]}"; exit 0 ;;
-  remove)   remove_self  "${ACTION_ARGS[@]}"; exit 0 ;;
-  reconfig) reconfigure_self;                 exit 0 ;;
-  status)   status_self;                      exit 0 ;;
-  help)     usage;                            exit 0 ;;
-  version)  printf '%s\n' "$SCRIPT_VERSION";  exit 0 ;;
+  install)   install_self "${ACTION_ARGS[@]}"; exit 0 ;;
+  update)    update_self  "${ACTION_ARGS[@]}"; exit 0 ;;
+  remove)    remove_self  "${ACTION_ARGS[@]}"; exit 0 ;;
+  configure) configure_self;                    exit 0 ;;
+  reconfig)  reconfigure_self;                  exit 0 ;;
+  status)    status_self;                       exit 0 ;;
+  logs)      logs_self    "${ACTION_ARGS[@]}"; exit 0 ;;
+  help)      usage;                             exit 0 ;;
+  version)   printf '%s\n' "$SCRIPT_VERSION";   exit 0 ;;
 esac
 
 # ======================================================================
@@ -1736,6 +2751,14 @@ PROFILE_RUNTIME_ROOT="$PROFILE_PERSIST_ROOT"
 prepare_profile_runtime
 start_profile_sync_timer
 
+# --- deprecation notice (legacy BIRDSEYE_* names) ---
+if [ -n "${BIRDSEYE_AUTO_FILL:-}${BIRDSEYE_MATCH_PATTERN:-}${BIRDSEYE_EXTENSION_DIR:-}" ]; then
+  log "Notice: BIRDSEYE_* config names are deprecated — rename to FRIGATE_BIRDSEYE_*."
+fi
+
+# --- config validation ---
+validate_runtime_config || exit 1
+
 # --- instance configuration ---
 setup_instances
 
@@ -1746,9 +2769,14 @@ if ! refresh_outputs; then
   OUTPUT_GEOMETRY["HDMI-A-1"]="0 0 1920 1080"
 fi
 for id in "${INSTANCES[@]}"; do
-  resolve_output_geometry "$id" >/dev/null
+  # rc=1 means the requested output isn't connected yet — we still store the
+  # name so the main loop can pause until it returns.
+  resolve_output_geometry "$id" >/dev/null || true
   log_instance "$id" "resolved output=${INSTANCE_OUTPUT[$id]}"
+  apply_display_overrides "$id"
 done
+# Install labwc window rules so each instance lands on the right output.
+ensure_labwc_window_rules
 
 # --- signal/exit handling ---
 handle_shutdown_signal() {
@@ -1774,8 +2802,14 @@ cleanup() {
   log "==== STOP kiosk-monitor ===="
   exit "$status"
 }
+handle_reload_signal() {
+  # Just set the flag — the main loop does the actual reload at a safe
+  # point so we don't interrupt a launch or screenshot mid-flight.
+  RELOAD_REQUESTED=true
+}
 trap cleanup EXIT
 trap handle_shutdown_signal INT TERM
+trap handle_reload_signal HUP
 
 log "==== START kiosk-monitor v$SCRIPT_VERSION at $(date -Is) ===="
 log "Desktop user: $GUI_USER (uid=$GUI_UID), WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-?}"
@@ -1800,11 +2834,70 @@ for id in "${INSTANCES[@]}"; do
 done
 
 # --- main watchdog loop ---
+reload_instances() {
+  log "SIGHUP received — reloading configuration from $CONFIG_FILE."
+  local id
+  for id in "${INSTANCES[@]}"; do stop_instance "$id"; done
+  if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+  fi
+  # Re-apply smart defaults + basic mode normalization. Full normalization
+  # happens only at script startup; these are the bits that matter for
+  # deciding what to launch on reload.
+  apply_frigate_smart_defaults
+  MODE=$(printf '%s' "${MODE:-chrome}" | tr '[:upper:]' '[:lower:]')
+  MODE2=$(printf '%s' "${MODE2:-}"    | tr '[:upper:]' '[:lower:]')
+  case "$MODE"  in chromium|chrome) MODE="chrome" ;; esac
+  case "$MODE2" in chromium|chrome) MODE2="chrome" ;; esac
+  FRIGATE_BIRDSEYE_AUTO_FILL="${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
+  validate_runtime_config || { log "Reload aborted: config invalid."; return 1; }
+  setup_instances
+  refresh_outputs || true
+  ensure_labwc_window_rules
+  for id in "${INSTANCES[@]}"; do
+    resolve_output_geometry "$id" >/dev/null || true
+    log_instance "$id" "resolved output=${INSTANCE_OUTPUT[$id]}"
+    apply_display_overrides "$id"
+    launch_instance "$id" || log_instance "$id" "reload launch failed"
+    INSTANCE_LAST_GOOD[$id]=$(date +%s)
+    INSTANCE_LAST_HASH[$id]=$(capture_output_hash "$id" || true)
+  done
+  log "Configuration reloaded."
+}
+
 while true; do
+  if [ "$RELOAD_REQUESTED" = "true" ]; then
+    RELOAD_REQUESTED=false
+    reload_instances || true
+    continue
+  fi
+  rotate_log_if_needed
   refresh_outputs || true
   now=$(date +%s)
   for id in "${INSTANCES[@]}"; do
     pid="${INSTANCE_PID[$id]:-}"
+
+    # 0. HDMI hotplug: pause when the instance's requested output is gone;
+    #    resume when it returns. Instances with no explicit OUTPUT skip this.
+    if [ -n "${INSTANCE_OUTPUT[$id]:-}" ] && ! instance_output_present "$id"; then
+      if [ "${INSTANCE_PAUSED[$id]:-no}" != "yes" ]; then
+        log_instance "$id" "output '${INSTANCE_OUTPUT[$id]}' not connected — pausing"
+        stop_instance "$id"
+        INSTANCE_PAUSED[$id]="yes"
+      fi
+      continue
+    fi
+    if [ "${INSTANCE_PAUSED[$id]:-no}" = "yes" ]; then
+      log_instance "$id" "output '${INSTANCE_OUTPUT[$id]}' reconnected — resuming"
+      INSTANCE_PAUSED[$id]="no"
+      INSTANCE_RESTART_LOG[$id]=""
+      apply_display_overrides "$id"
+      launch_instance "$id" || log_instance "$id" "relaunch after hotplug failed; will retry"
+      INSTANCE_LAST_GOOD[$id]=$now
+      INSTANCE_LAST_HASH[$id]=$(capture_output_hash "$id" || true)
+      continue
+    fi
 
     # 1. process liveness
     if ! process_alive "$pid"; then
@@ -1876,5 +2969,7 @@ while true; do
       continue
     fi
   done
-  sleep "$HEALTH_INTERVAL"
+  # SIGHUP delivered during sleep makes sleep exit non-zero; swallow it so
+  # `set -e` doesn't treat the interrupted wait as a hard error.
+  sleep "$HEALTH_INTERVAL" || true
 done

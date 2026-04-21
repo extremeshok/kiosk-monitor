@@ -5,13 +5,23 @@
 
 # ---- Instance 1 (primary display) ----------------------------------------
 MODE="chrome"                  # chrome or vlc
-URL="http://192.168.3.222:30059/?Birdseye"
+URL="http://192.168.3.222:30059/?birdseye"
 OUTPUT=""                      # e.g. HDMI-A-1; leave blank to auto-pick primary
+FORCE_RESOLUTION=""            # e.g. "1920x1080" or "1920x1080@60"; blank = keep current
+FORCE_ROTATION=""              # normal | 90 | 180 | 270 | flipped | flipped-90 | flipped-180 | flipped-270
 
 # ---- Instance 2 (optional, for second display) ---------------------------
-MODE2=""                       # "chrome", "vlc", or blank to disable
-URL2=""                        # URL / stream for second display
-OUTPUT2=""                     # e.g. HDMI-A-2; leave blank to auto-pick secondary
+# EXPERIMENTAL: dual-display routing under Wayland/labwc is partially wired
+# up. Chromium (--class) is reliably placed on the requested output via a
+# labwc window rule, but VLC's Wayland window identity isn't easily matched,
+# so the VLC instance may land on the primary screen. Use at your own risk
+# and report back — single-instance (leave MODE2 blank) is the supported
+# configuration.
+MODE2=""                          # "chrome", "vlc", or blank to disable
+URL2=""                           # URL / stream for second display
+OUTPUT2=""                        # e.g. HDMI-A-2; leave blank to auto-pick secondary
+FORCE_RESOLUTION_2=""             # same format as FORCE_RESOLUTION
+FORCE_ROTATION_2=""               # same values as FORCE_ROTATION
 
 # ---- Desktop user --------------------------------------------------------
 # Leave blank to auto-detect (checks active seat0 session, autologin,
@@ -20,18 +30,31 @@ GUI_USER=""
 
 # ---- Chromium-specific (MODE=chrome) -------------------------------------
 #CHROMIUM_BIN="/usr/bin/chromium"
-BIRDSEYE_AUTO_FILL=false       # true => inject Frigate Birdseye fullscreen CSS
-#BIRDSEYE_MATCH_PATTERN=""     # override match pattern (auto-derived from URL)
-#BIRDSEYE_EXTENSION_DIR=""     # custom extension dir (default: inside profile)
 DEVTOOLS_AUTO_OPEN=false
 #DEVTOOLS_REMOTE_PORT=9222
+
+# ---- Frigate helper (applies to chrome instances pointed at Frigate) -----
+# Smart defaults: when the URL contains "?birdseye", these values are
+# auto-applied: FRIGATE_BIRDSEYE_AUTO_FILL=true, FRIGATE_DARK_MODE=Dark,
+# FRIGATE_THEME="High Contrast". Leave blank to accept the smart default,
+# set to "None" to explicitly opt out, or set to a specific value to pin.
+FRIGATE_BIRDSEYE_AUTO_FILL=""     # "", "true", "false"
+FRIGATE_BIRDSEYE_WIDTH=""         # pixels; blank = auto (output width minus FRIGATE_BIRDSEYE_MARGIN)
+FRIGATE_BIRDSEYE_HEIGHT=""        # pixels; blank = auto (output height minus FRIGATE_BIRDSEYE_MARGIN)
+FRIGATE_BIRDSEYE_MARGIN=80        # pixel margin subtracted on each axis when auto-sizing
+FRIGATE_DARK_MODE=""              # "", "None", "Light", "Dark"
+FRIGATE_THEME=""                  # "", "None", "Default", "Blue", "Green", "Nord", "Red", "High Contrast"
+#FRIGATE_BIRDSEYE_MATCH_PATTERN="" # override match pattern (auto-derived from URL)
+#FRIGATE_BIRDSEYE_EXTENSION_DIR="" # custom extension dir (default: inside profile)
+#FRIGATE_THEME_STORAGE_KEY="frigate-ui-theme"           # override if your Frigate version uses a different key
+#FRIGATE_COLOR_STORAGE_KEY="frigate-ui-color-scheme"    # ditto
 
 # ---- VLC-specific (MODE=vlc) --------------------------------------------
 #VLC_BIN="/usr/bin/vlc"
 VLC_LOOP=true
 VLC_NO_AUDIO=false
-#VLC_NETWORK_CACHING=1500      # ms; raise for flaky RTSP streams
-#VLC_EXTRA_ARGS="--avcodec-hw=any"
+VLC_NETWORK_CACHING=1500      # ms; raised for flaky RTSP streams
+VLC_EXTRA_ARGS="--avcodec-hw=any"
 
 # ---- Profile / cache -----------------------------------------------------
 #PROFILE_ROOT=""                # default: /home/<GUI_USER>/.local/share/kiosk-monitor

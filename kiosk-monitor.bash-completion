@@ -1,0 +1,64 @@
+# bash completion for kiosk-monitor.sh
+# Installed by `kiosk-monitor.sh --install` to /etc/bash_completion.d/kiosk-monitor
+# shellcheck shell=bash
+# shellcheck disable=SC2207  # completion scripts idiomatically use $(compgen ...)
+
+_kiosk_monitor() {
+    local cur prev
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    local actions="--install --update --remove --configure --reconfig --status --logs --help --version --debug --config"
+    local install_opts="--url --url2 --mode --mode2 --output --output2 --gui-user --user --no-start --skip-apt --base-url --browser"
+    local update_opts="--check --local --force --skip-apt --base-url --gui-user --user --mode --browser --no-restart"
+    local remove_opts="--purge"
+    local logs_opts="--follow --no-follow --lines --all"
+    local modes="chrome vlc"
+
+    # Value completion for options that take arguments.
+    case "$prev" in
+        --mode|--mode2|--browser)
+            COMPREPLY=( $(compgen -W "$modes" -- "$cur") )
+            return 0 ;;
+        --gui-user|--user)
+            COMPREPLY=( $(compgen -u -- "$cur") )
+            return 0 ;;
+        --output|--output2)
+            COMPREPLY=( $(compgen -W "HDMI-A-1 HDMI-A-2 DP-1 DP-2" -- "$cur") )
+            return 0 ;;
+        --config)
+            COMPREPLY=( $(compgen -f -- "$cur") )
+            return 0 ;;
+        --lines)
+            COMPREPLY=( $(compgen -W "50 100 200 500 1000 all" -- "$cur") )
+            return 0 ;;
+        --url|--url2|--base-url)
+            return 0 ;;
+    esac
+
+    # Determine the primary action from the first action-like arg so we can
+    # offer action-specific options.
+    local action="" i
+    for (( i=1; i < COMP_CWORD; i++ )); do
+        case "${COMP_WORDS[i]}" in
+            --install|--update|--remove|--configure|--reconfig|--status|--logs|--help|--version)
+                action="${COMP_WORDS[i]}"
+                break
+                ;;
+        esac
+    done
+
+    case "$action" in
+        --install)  COMPREPLY=( $(compgen -W "$install_opts" -- "$cur") ); return 0 ;;
+        --update)   COMPREPLY=( $(compgen -W "$update_opts"  -- "$cur") ); return 0 ;;
+        --remove)   COMPREPLY=( $(compgen -W "$remove_opts"  -- "$cur") ); return 0 ;;
+        --logs)     COMPREPLY=( $(compgen -W "$logs_opts"    -- "$cur") ); return 0 ;;
+    esac
+
+    COMPREPLY=( $(compgen -W "$actions" -- "$cur") )
+}
+
+complete -F _kiosk_monitor kiosk-monitor
+complete -F _kiosk_monitor kiosk-monitor.sh
+complete -F _kiosk_monitor /usr/local/bin/kiosk-monitor
+complete -F _kiosk_monitor /usr/local/bin/kiosk-monitor.sh
