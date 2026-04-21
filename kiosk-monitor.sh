@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 6.2.0
+# kiosk-monitor.sh :: version 6.3.0
 # ======================================================================
 # Kiosk watchdog for Raspberry Pi OS trixie 64-bit (or newer Debian/RPi).
 # Supports Chromium fullscreen kiosk and VLC fullscreen video playback,
@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.2.0"
+SCRIPT_VERSION="6.3.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 
 # ------------------------------------------------------------------
@@ -558,34 +558,53 @@ wait_for_wayland_ready() {
   local timeout="${WAYLAND_READY_TIMEOUT:-0}"
   [[ "$timeout" =~ ^[0-9]+$ ]] && [ "$timeout" -gt 0 ] || timeout=0
   local rt="/run/user/${uid}"
-  local waited=0
-  local found=""
+  local waited=0 found="" comp=""
+  # Known wlroots-based compositors we're willing to attach to. labwc is
+  # the Raspberry Pi OS trixie default; the others work the same at our
+  # API surface (wl_output + xdg-shell + screenshot via grim).
+  local -a KNOWN=( labwc labwc-pi wayfire sway hyprland river weston )
+  local announced=no
   while true; do
+    found=""
     if [ -d "$rt" ]; then
       for sock in "$rt"/wayland-*; do
-        [ -S "$sock" ] || continue
         case "$sock" in *.lock) continue ;; esac
-        found=$(basename "$sock")
-        break
+        [ -S "$sock" ] && { found=$(basename "$sock"); break; }
       done
     fi
-    # also require the compositor to be up
-    if [ -n "$found" ] && pgrep -u "$uid" -x labwc >/dev/null 2>&1; then
+    comp=""
+    if [ -n "$found" ]; then
+      local p
+      for p in "${KNOWN[@]}"; do
+        if pgrep -u "$uid" -x "$p" >/dev/null 2>&1; then comp="$p"; break; fi
+      done
+    fi
+    if [ -n "$found" ] && [ -n "$comp" ]; then
       WAYLAND_DISPLAY="$found"
       export WAYLAND_DISPLAY
-      log "Desktop session ready: wayland socket=$WAYLAND_DISPLAY, compositor=labwc."
+      log "Desktop session ready: wayland socket=$WAYLAND_DISPLAY, compositor=$comp."
       return 0
     fi
     if [ "$timeout" -gt 0 ] && [ "$waited" -ge "$timeout" ]; then
-      log "Wayland/labwc not ready after ${timeout}s; proceeding (compositor may still come up)."
-      [ -n "$found" ] && { WAYLAND_DISPLAY="$found"; export WAYLAND_DISPLAY; }
-      return 0
+      log "No Wayland compositor detected after ${timeout}s."
+      log "kiosk-monitor requires a Wayland session (labwc on Raspberry Pi OS trixie)."
+      # Xorg often runs as root via LightDM, so check the whole process
+      # table and also the X11 socket — either is a giveaway.
+      if pgrep -x Xorg >/dev/null 2>&1 \
+         || pgrep -x Xwayland >/dev/null 2>&1 \
+         || [ -S /tmp/.X11-unix/X0 ]; then
+        log "An X11 server is running — switch the session to Wayland via 'sudo raspi-config' (Advanced → Wayland) or by setting 'autologin-session=labwc' in /etc/lightdm/lightdm.conf."
+      fi
+      return 1
     fi
-    if [ $((waited % 15)) -eq 0 ]; then
-      log "Waiting for labwc + wayland socket in $rt (waited ${waited}s)…"
+    if [ "$announced" = "no" ]; then
+      log "Waiting for a Wayland session (compositor not yet running; timeout ${timeout}s)…"
+      announced=yes
+    elif [ "$waited" -gt 0 ] && [ $((waited % 60)) -eq 0 ]; then
+      log "Still waiting for Wayland (waited ${waited}s)…"
     fi
-    sleep 2
-    waited=$((waited + 2))
+    sleep 5
+    waited=$((waited + 5))
   done
 }
 
@@ -2351,20 +2370,59 @@ _wt_yesno() {
   return $rc
 }
 
-configure_self() {
-  require_root
-  if ! command -v whiptail >/dev/null 2>&1; then
-    echo "Error: whiptail not installed. Run: sudo apt install whiptail" >&2
-    exit 1
-  fi
+# ======================================================================
+# TUI state (script-scope so submenus can mutate without juggling globals).
+# ======================================================================
+TUI_MODE=""; TUI_URL=""; TUI_OUTPUT=""; TUI_RES=""; TUI_ROT=""
+TUI_MODE2=""; TUI_URL2=""; TUI_OUTPUT2=""; TUI_RES2=""; TUI_ROT2=""
+TUI_FRIGATE_DARK=""; TUI_FRIGATE_THEME=""; TUI_FRIGATE_AUTOFILL=""
+TUI_FRIGATE_WIDTH=""; TUI_FRIGATE_HEIGHT=""; TUI_FRIGATE_MARGIN=""
+TUI_GUI_USER=""
+TUI_HEALTH_INTERVAL=""; TUI_SCREEN_DELAY=""; TUI_STALL_RETRIES=""
+TUI_VLC_STALL_RETRIES=""; TUI_HEALTH_RETRIES=""
+TUI_MIN_UPTIME=""; TUI_SESSION_WAIT=""; TUI_WAYLAND_WAIT=""
+TUI_LOG_MAX_BYTES=""; TUI_LOG_ROTATE_KEEP=""
+TUI_PROFILE_TMPFS=""; TUI_PROFILE_SYNC_BACK=""; TUI_PREWARM=""
+TUI_VLC_LOOP=""; TUI_VLC_NO_AUDIO=""; TUI_VLC_NETWORK_CACHING=""
+TUI_DIRTY="no"
+declare -a TUI_OUTPUT_TAGS=()
 
-  # Load existing config so current values pre-populate the prompts
+_tui_load_config() {
   if [ -f "$CONFIG_FILE" ]; then
     # shellcheck disable=SC1090
     . "$CONFIG_FILE"
   fi
+  TUI_MODE="${MODE:-chrome}";        TUI_URL="${URL:-}";        TUI_OUTPUT="${OUTPUT:-}"
+  TUI_RES="${FORCE_RESOLUTION:-}";   TUI_ROT="${FORCE_ROTATION:-}"
+  TUI_MODE2="${MODE2:-}";            TUI_URL2="${URL2:-}";      TUI_OUTPUT2="${OUTPUT2:-}"
+  TUI_RES2="${FORCE_RESOLUTION_2:-}"; TUI_ROT2="${FORCE_ROTATION_2:-}"
+  TUI_FRIGATE_DARK="${FRIGATE_DARK_MODE:-}"
+  TUI_FRIGATE_THEME="${FRIGATE_THEME:-}"
+  TUI_FRIGATE_AUTOFILL="${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
+  TUI_FRIGATE_WIDTH="${FRIGATE_BIRDSEYE_WIDTH:-}"
+  TUI_FRIGATE_HEIGHT="${FRIGATE_BIRDSEYE_HEIGHT:-}"
+  TUI_FRIGATE_MARGIN="${FRIGATE_BIRDSEYE_MARGIN:-80}"
+  TUI_GUI_USER="${GUI_USER:-}"
+  TUI_HEALTH_INTERVAL="${HEALTH_INTERVAL:-30}"
+  TUI_SCREEN_DELAY="${SCREEN_DELAY:-120}"
+  TUI_STALL_RETRIES="${STALL_RETRIES:-3}"
+  TUI_VLC_STALL_RETRIES="${VLC_STALL_RETRIES:-6}"
+  TUI_HEALTH_RETRIES="${HEALTH_RETRIES:-6}"
+  TUI_MIN_UPTIME="${MIN_UPTIME_BEFORE_START:-60}"
+  TUI_SESSION_WAIT="${GUI_SESSION_WAIT_TIMEOUT:-300}"
+  TUI_WAYLAND_WAIT="${WAYLAND_READY_TIMEOUT:-300}"
+  TUI_LOG_MAX_BYTES="${LOG_MAX_BYTES:-2097152}"
+  TUI_LOG_ROTATE_KEEP="${LOG_ROTATE_KEEP:-1}"
+  TUI_PROFILE_TMPFS="${PROFILE_TMPFS:-false}"
+  TUI_PROFILE_SYNC_BACK="${PROFILE_SYNC_BACK:-false}"
+  TUI_PREWARM="${PREWARM_ENABLED:-true}"
+  TUI_VLC_LOOP="${VLC_LOOP:-true}"
+  TUI_VLC_NO_AUDIO="${VLC_NO_AUDIO:-false}"
+  TUI_VLC_NETWORK_CACHING="${VLC_NETWORK_CACHING:-}"
+  TUI_DIRTY="no"
+}
 
-  # We need a GUI user to probe outputs via wlr-randr. Best-effort only.
+_tui_probe_outputs() {
   if [ -z "${GUI_USER:-}" ] || [ "$GUI_USER" = "root" ]; then
     auto_detect_gui_user 2>/dev/null || true
   fi
@@ -2372,7 +2430,6 @@ configure_self() {
     GUI_UID=$(id -u "$GUI_USER" 2>/dev/null || echo 0)
     : "${XDG_RUNTIME_DIR:=/run/user/$GUI_UID}"
     export XDG_RUNTIME_DIR
-    # pick wayland socket
     if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
       local sock
       for sock in "$XDG_RUNTIME_DIR"/wayland-*; do
@@ -2382,171 +2439,387 @@ configure_self() {
     fi
     refresh_outputs 2>/dev/null || true
   fi
-
-  local -a output_tags=( "" "(auto — kiosk-monitor picks)" )
+  TUI_OUTPUT_TAGS=( "" "(auto — kiosk-monitor picks)" )
   local name
   for name in "${OUTPUTS_NAMES[@]}"; do
-    output_tags+=( "$name" "${OUTPUT_GEOMETRY[$name]:-?}" )
+    TUI_OUTPUT_TAGS+=( "$name" "${OUTPUT_GEOMETRY[$name]:-?}" )
   done
+}
 
-  local rc
-  local new_mode new_url new_output=""
-  local new_mode2="" new_url2="" new_output2=""
-  local new_dark="" new_theme="" new_autofill="${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
+_tui_bool_toggle() {
+  # $1 current value, echoes the flipped value
+  case "$1" in true) echo false ;; *) echo true ;; esac
+}
 
-  # --- Instance 1 mode ---
-  new_mode=$(_wt_menu "Kiosk Monitor — Instance 1" "Choose launch mode for the primary display." 13 66 4 \
+_tui_preview_value() {
+  # Render a value with "(none)" / "(auto)" substitutes for empty.
+  local v="$1" empty="${2:-(none)}"
+  if [ -z "$v" ]; then echo "$empty"; else echo "$v"; fi
+}
+
+_tui_mode_picker() {
+  # args: title, current-value. echoes chosen value, or exit on cancel.
+  _wt_menu "$1" "Choose launch mode" 11 60 2 \
     "chrome" "Fullscreen Chromium kiosk" \
-    "vlc"    "Fullscreen VLC video player") || { echo "Cancelled."; exit 0; }
+    "vlc"    "Fullscreen VLC video player"
+}
 
-  # --- Instance 1 URL ---
-  new_url=$(_wt_input "Instance 1 URL" "URL for chrome, or stream path for VLC:" "${URL:-}") || { echo "Cancelled."; exit 0; }
-  if [ -z "$new_url" ]; then
-    whiptail --title "Kiosk Monitor" --msgbox "URL cannot be empty. Aborting." 10 50
-    exit 1
-  fi
+_tui_rotation_picker() {
+  # args: title, current. echoes chosen.
+  _wt_menu "$1" "Force the output orientation." 17 60 9 \
+    ""            "Do not override" \
+    "normal"      "0° (no rotation)" \
+    "90"          "90° clockwise" \
+    "180"         "180°" \
+    "270"         "270° clockwise" \
+    "flipped"     "mirrored" \
+    "flipped-90"  "mirrored + 90°" \
+    "flipped-180" "mirrored + 180°" \
+    "flipped-270" "mirrored + 270°"
+}
 
-  # --- Instance 1 output ---
-  if [ "${#output_tags[@]}" -ge 2 ]; then
-    new_output=$(_wt_menu "Instance 1 Output" "Which display should instance 1 render on?" 16 70 8 \
-      "${output_tags[@]}") || { echo "Cancelled."; exit 0; }
-  fi
-
-  # --- Instance 1 resolution + rotation (optional) ---
-  local new_res="" new_rot=""
-  if _wt_yesno "Force Resolution" "Force a specific resolution/rotation for instance 1?" \
-       "$( [ -n "${FORCE_RESOLUTION:-}${FORCE_ROTATION:-}" ] && echo yes || echo no )"; then
-    new_res=$(_wt_input "Instance 1 Resolution" \
-      "WxH or WxH@Hz (blank = leave alone):" "${FORCE_RESOLUTION:-}") || { echo "Cancelled."; exit 0; }
-    new_rot=$(_wt_menu "Instance 1 Rotation" "Force the output orientation for instance 1." 16 60 9 \
-      ""             "Do not override" \
-      "normal"       "0° (no rotation)" \
-      "90"           "90° clockwise" \
-      "180"          "180°" \
-      "270"          "270° clockwise" \
-      "flipped"      "mirrored" \
-      "flipped-90"   "mirrored + 90°" \
-      "flipped-180"  "mirrored + 180°" \
-      "flipped-270"  "mirrored + 270°") || { echo "Cancelled."; exit 0; }
-  fi
-
-  # --- Enable instance 2? ---
-  local new_res2="" new_rot2=""
-  if _wt_yesno "Second Display" "Enable a second instance on another display?" \
-       "$( [ -n "${MODE2:-}" ] && echo yes || echo no )"; then
-    new_mode2=$(_wt_menu "Kiosk Monitor — Instance 2" "Choose launch mode for the second display." 13 66 4 \
-      "chrome" "Fullscreen Chromium kiosk" \
-      "vlc"    "Fullscreen VLC video player") || { echo "Cancelled."; exit 0; }
-    new_url2=$(_wt_input "Instance 2 URL" "URL for chrome, or stream path for VLC:" "${URL2:-}") || { echo "Cancelled."; exit 0; }
-    if [ -z "$new_url2" ]; then
-      whiptail --title "Kiosk Monitor" --msgbox "URL2 cannot be empty. Aborting." 10 50
-      exit 1
-    fi
-    if [ "${#output_tags[@]}" -ge 2 ]; then
-      new_output2=$(_wt_menu "Instance 2 Output" "Which display should instance 2 render on?" 16 70 8 \
-        "${output_tags[@]}") || { echo "Cancelled."; exit 0; }
-    fi
-    if _wt_yesno "Force Resolution (2)" "Force a specific resolution/rotation for instance 2?" \
-         "$( [ -n "${FORCE_RESOLUTION_2:-}${FORCE_ROTATION_2:-}" ] && echo yes || echo no )"; then
-      new_res2=$(_wt_input "Instance 2 Resolution" \
-        "WxH or WxH@Hz (blank = leave alone):" "${FORCE_RESOLUTION_2:-}") || { echo "Cancelled."; exit 0; }
-      new_rot2=$(_wt_menu "Instance 2 Rotation" "Force the output orientation for instance 2." 16 60 9 \
-        ""             "Do not override" \
-        "normal"       "0° (no rotation)" \
-        "90"           "90° clockwise" \
-        "180"          "180°" \
-        "270"          "270° clockwise" \
-        "flipped"      "mirrored" \
-        "flipped-90"   "mirrored + 90°" \
-        "flipped-180"  "mirrored + 180°" \
-        "flipped-270"  "mirrored + 270°") || { echo "Cancelled."; exit 0; }
-    fi
-  fi
-
-  # --- Frigate tweaks (if any chrome instance present) ---
-  if [ "$new_mode" = "chrome" ] || [ "$new_mode2" = "chrome" ]; then
-    new_dark=$(_wt_menu "Frigate Dark Mode" "Force Frigate's theme, or leave unchanged." 13 60 4 \
-      ""      "Do not override" \
-      "Light" "Force light theme" \
-      "Dark"  "Force dark theme") || { echo "Cancelled."; exit 0; }
-
-    new_theme=$(_wt_menu "Frigate Theme" "Force Frigate's color theme, or leave unchanged." 17 60 8 \
-      ""              "Do not override" \
-      "Default"       "Frigate default" \
-      "Blue"          "Blue accent" \
-      "Green"         "Green accent" \
-      "Nord"          "Nord palette" \
-      "Red"           "Red accent" \
-      "High Contrast" "High-contrast theme") || { echo "Cancelled."; exit 0; }
-
-    new_autofill="false"
-    if _wt_yesno "Frigate Birdseye Auto-Fill" \
-         "Inject CSS to force the Frigate Birdseye grid to fill the window?" \
-         "$( [ "${FRIGATE_BIRDSEYE_AUTO_FILL:-false}" = "true" ] && echo yes || echo no )"; then
-      new_autofill="true"
-    fi
-  fi
-
-  # --- Summary + confirm ---
-  local summary
-  summary=$(printf "Instance 1:\n  mode       : %s\n  url        : %s\n  output     : %s\n  resolution : %s\n  rotation   : %s\n\n" \
-              "$new_mode" "$new_url" "${new_output:-auto}" "${new_res:-(unchanged)}" "${new_rot:-(unchanged)}")
-  if [ -n "$new_mode2" ]; then
-    summary+=$(printf "Instance 2:\n  mode       : %s\n  url        : %s\n  output     : %s\n  resolution : %s\n  rotation   : %s\n\n" \
-                 "$new_mode2" "$new_url2" "${new_output2:-auto}" "${new_res2:-(unchanged)}" "${new_rot2:-(unchanged)}")
+_tui_output_picker() {
+  if [ "${#TUI_OUTPUT_TAGS[@]}" -lt 2 ]; then
+    _wt_input "$1" "Output name (e.g. HDMI-A-1), blank = auto:" "$2"
   else
-    summary+=$(printf "Instance 2: disabled\n\n")
+    _wt_menu "$1" "Which display?" 16 70 8 "${TUI_OUTPUT_TAGS[@]}"
   fi
-  if [ "$new_mode" = "chrome" ] || [ "$new_mode2" = "chrome" ]; then
-    summary+=$(printf "Frigate:\n  dark-mode          : %s\n  theme              : %s\n  birdseye-autofill  : %s\n" \
-                 "${new_dark:-(unchanged)}" "${new_theme:-(unchanged)}" "$new_autofill")
-  fi
-  whiptail --title "Review" --scrolltext --yesno "$summary
-Save to $CONFIG_FILE?" 24 78 || { echo "Cancelled — no changes saved."; exit 0; }
+}
 
-  # --- Persist ---
+_tui_edit_instance() {
+  # args: id (1 or 2), vref_mode, vref_url, vref_output, vref_res, vref_rot
+  local id=$1
+  # shellcheck disable=SC2034  # referenced via nameref
+  local -n m=$2 u=$3 o=$4 r=$5 rot=$6
+  while true; do
+    local m_disp; m_disp=$(_tui_preview_value "$m" "(not set)")
+    local u_disp; u_disp=$(_tui_preview_value "$u" "(not set)")
+    local o_disp; o_disp=$(_tui_preview_value "$o" "(auto)")
+    local r_disp; r_disp=$(_tui_preview_value "$r" "(compositor default)")
+    local rot_disp; rot_disp=$(_tui_preview_value "$rot" "(compositor default)")
+    local choice
+    choice=$(_wt_menu "Instance $id" "Edit instance-$id settings. Pick a field to change, or Back to return." 17 72 7 \
+      "mode"       "$m_disp" \
+      "url"        "$u_disp" \
+      "output"     "$o_disp" \
+      "resolution" "$r_disp" \
+      "rotation"   "$rot_disp" \
+      "back"       "Return to the main menu") || return 0
+    case "$choice" in
+      mode)
+        local v; v=$(_tui_mode_picker "Instance $id — mode") || continue
+        m="$v"; TUI_DIRTY="yes" ;;
+      url)
+        local v; v=$(_wt_input "Instance $id — URL" "URL for chrome, or stream path for VLC:" "$u") || continue
+        u="$v"; TUI_DIRTY="yes" ;;
+      output)
+        local v; v=$(_tui_output_picker "Instance $id — output" "$o") || continue
+        o="$v"; TUI_DIRTY="yes" ;;
+      resolution)
+        local v; v=$(_wt_input "Instance $id — force resolution" \
+          "WxH or WxH@Hz (blank = leave alone):" "$r") || continue
+        r="$v"; TUI_DIRTY="yes" ;;
+      rotation)
+        local v; v=$(_tui_rotation_picker "Instance $id — force rotation") || continue
+        rot="$v"; TUI_DIRTY="yes" ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+_tui_edit_instance2() {
+  while true; do
+    local enabled_label
+    if [ -n "$TUI_MODE2" ]; then
+      enabled_label="enabled ($TUI_MODE2 → $(_tui_preview_value "$TUI_URL2" "not set"))"
+    else
+      enabled_label="disabled"
+    fi
+    local choice
+    choice=$(_wt_menu "Instance 2" "Second display configuration." 13 68 4 \
+      "toggle" "Enable / disable instance 2 — $enabled_label" \
+      "edit"   "Edit mode / URL / output / resolution / rotation" \
+      "back"   "Return to the main menu" \
+      "help"   "About dual-display (experimental)") || return 0
+    case "$choice" in
+      toggle)
+        if [ -n "$TUI_MODE2" ]; then
+          TUI_MODE2=""; TUI_URL2=""; TUI_OUTPUT2=""; TUI_RES2=""; TUI_ROT2=""
+        else
+          TUI_MODE2="chrome"
+          [ -z "$TUI_URL2" ] && TUI_URL2="$TUI_URL"
+        fi
+        TUI_DIRTY="yes" ;;
+      edit)
+        if [ -z "$TUI_MODE2" ]; then
+          whiptail --title "Instance 2" --msgbox "Enable instance 2 first." 10 50
+          continue
+        fi
+        _tui_edit_instance 2 TUI_MODE2 TUI_URL2 TUI_OUTPUT2 TUI_RES2 TUI_ROT2 ;;
+      help)
+        whiptail --title "Instance 2 (experimental)" --scrolltext --msgbox \
+"Running two instances side-by-side on a Pi is supported for Chromium
+but VLC routing on Wayland is still flaky. labwc window rules are
+auto-generated in ~/.config/labwc/rc.xml to route each window to its
+configured output. Single-instance setups (Instance 2 disabled) leave
+the compositor config untouched." 16 70 ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+_tui_edit_frigate() {
+  while true; do
+    local size_disp
+    if [ -n "$TUI_FRIGATE_WIDTH" ] || [ -n "$TUI_FRIGATE_HEIGHT" ]; then
+      size_disp="$(_tui_preview_value "$TUI_FRIGATE_WIDTH" auto)x$(_tui_preview_value "$TUI_FRIGATE_HEIGHT" auto) (fixed)"
+    else
+      size_disp="auto (viewport minus ${TUI_FRIGATE_MARGIN}px margin)"
+    fi
+    local choice
+    choice=$(_wt_menu "Frigate helper" \
+"Tweaks applied by the injected Chrome extension when the URL points at Frigate." 18 72 7 \
+      "dark"     "Dark mode: $(_tui_preview_value "$TUI_FRIGATE_DARK" smart-default)" \
+      "theme"    "Colour theme: $(_tui_preview_value "$TUI_FRIGATE_THEME" smart-default)" \
+      "autofill" "Birdseye auto-fill: $TUI_FRIGATE_AUTOFILL" \
+      "size"     "Birdseye grid size: $size_disp" \
+      "margin"   "Auto-size margin: ${TUI_FRIGATE_MARGIN}px" \
+      "back"     "Return to the main menu") || return 0
+    case "$choice" in
+      dark)
+        local v; v=$(_wt_menu "Dark mode" "Force Frigate's theme." 12 60 4 \
+          ""      "Smart default (based on URL)" \
+          "None"  "Explicitly leave unchanged" \
+          "Light" "Force light theme" \
+          "Dark"  "Force dark theme") || continue
+        TUI_FRIGATE_DARK="$v"; TUI_DIRTY="yes" ;;
+      theme)
+        local v; v=$(_wt_menu "Colour theme" "Force Frigate's colour theme." 17 60 8 \
+          ""              "Smart default (based on URL)" \
+          "None"          "Explicitly leave unchanged" \
+          "Default"       "Frigate default" \
+          "Blue"          "Blue accent" \
+          "Green"         "Green accent" \
+          "Nord"          "Nord palette" \
+          "Red"           "Red accent" \
+          "High Contrast" "High-contrast theme") || continue
+        TUI_FRIGATE_THEME="$v"; TUI_DIRTY="yes" ;;
+      autofill)
+        TUI_FRIGATE_AUTOFILL=$(_tui_bool_toggle "$TUI_FRIGATE_AUTOFILL")
+        TUI_DIRTY="yes" ;;
+      size)
+        local w h
+        w=$(_wt_input "Birdseye width" "Grid width in pixels (blank = auto from viewport):" "$TUI_FRIGATE_WIDTH") || continue
+        h=$(_wt_input "Birdseye height" "Grid height in pixels (blank = auto from viewport):" "$TUI_FRIGATE_HEIGHT") || continue
+        TUI_FRIGATE_WIDTH="$w"; TUI_FRIGATE_HEIGHT="$h"; TUI_DIRTY="yes" ;;
+      margin)
+        local v; v=$(_wt_input "Birdseye margin" "Pixels trimmed from each axis when auto-sizing:" "$TUI_FRIGATE_MARGIN") || continue
+        TUI_FRIGATE_MARGIN="$v"; TUI_DIRTY="yes" ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+_tui_edit_timing() {
+  while true; do
+    local choice
+    choice=$(_wt_menu "Timing & restart" "Watchdog cadence and restart thresholds." 20 72 11 \
+      "health"      "Health-check interval: ${TUI_HEALTH_INTERVAL}s" \
+      "screen"      "Screen-freeze check delay: ${TUI_SCREEN_DELAY}s" \
+      "stall"       "Screen-stall retries (chrome): ${TUI_STALL_RETRIES}" \
+      "vlcstall"    "Screen-stall retries (vlc):    ${TUI_VLC_STALL_RETRIES}" \
+      "fail"        "HTTP health-fail retries: ${TUI_HEALTH_RETRIES}" \
+      "uptime"      "Minimum system uptime before start: ${TUI_MIN_UPTIME}s" \
+      "session"     "GUI session wait timeout: ${TUI_SESSION_WAIT}s" \
+      "wayland"     "Wayland/labwc ready timeout: ${TUI_WAYLAND_WAIT}s" \
+      "back"        "Return to the main menu") || return 0
+    case "$choice" in
+      health)   TUI_HEALTH_INTERVAL=$(_wt_input "Health interval (seconds)" "Seconds between watchdog ticks:" "$TUI_HEALTH_INTERVAL") || continue; TUI_DIRTY="yes" ;;
+      screen)   TUI_SCREEN_DELAY=$(_wt_input "Screen delay (seconds)" "Grace period before freeze detection kicks in:" "$TUI_SCREEN_DELAY") || continue; TUI_DIRTY="yes" ;;
+      stall)    TUI_STALL_RETRIES=$(_wt_input "Chrome stall retries" "Identical-frame hashes before restarting chrome:" "$TUI_STALL_RETRIES") || continue; TUI_DIRTY="yes" ;;
+      vlcstall) TUI_VLC_STALL_RETRIES=$(_wt_input "VLC stall retries" "Identical-frame hashes before restarting VLC:" "$TUI_VLC_STALL_RETRIES") || continue; TUI_DIRTY="yes" ;;
+      fail)     TUI_HEALTH_RETRIES=$(_wt_input "Health retries" "Failed HTTP probes before restarting:" "$TUI_HEALTH_RETRIES") || continue; TUI_DIRTY="yes" ;;
+      uptime)   TUI_MIN_UPTIME=$(_wt_input "Min uptime (seconds)" "Wait until system uptime \u2265 N seconds:" "$TUI_MIN_UPTIME") || continue; TUI_DIRTY="yes" ;;
+      session)  TUI_SESSION_WAIT=$(_wt_input "Session wait timeout" "Seconds to wait for a loginctl session:" "$TUI_SESSION_WAIT") || continue; TUI_DIRTY="yes" ;;
+      wayland)  TUI_WAYLAND_WAIT=$(_wt_input "Wayland wait timeout" "Seconds to wait for labwc + wayland socket:" "$TUI_WAYLAND_WAIT") || continue; TUI_DIRTY="yes" ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+_tui_edit_profile_logs() {
+  while true; do
+    local choice
+    choice=$(_wt_menu "Profile & logging" "Log rotation, Chromium profile, VLC options, prewarm." 18 72 9 \
+      "logmax"    "Log max bytes: $TUI_LOG_MAX_BYTES" \
+      "logkeep"   "Rotate keep (.1 file): $TUI_LOG_ROTATE_KEEP" \
+      "tmpfs"     "Profile in tmpfs: $TUI_PROFILE_TMPFS" \
+      "syncback"  "Profile sync back on exit: $TUI_PROFILE_SYNC_BACK" \
+      "prewarm"   "Prewarm binaries/profile: $TUI_PREWARM" \
+      "vlcloop"   "VLC --loop: $TUI_VLC_LOOP" \
+      "vlcmute"   "VLC --no-audio: $TUI_VLC_NO_AUDIO" \
+      "vlccache"  "VLC network-caching (ms): $(_tui_preview_value "$TUI_VLC_NETWORK_CACHING" default)" \
+      "back"      "Return to the main menu") || return 0
+    case "$choice" in
+      logmax)   TUI_LOG_MAX_BYTES=$(_wt_input "Log max bytes" "Truncate /dev/shm/kiosk.log once it exceeds N bytes:" "$TUI_LOG_MAX_BYTES") || continue; TUI_DIRTY="yes" ;;
+      logkeep)  TUI_LOG_ROTATE_KEEP=$(_wt_input "Log rotate keep" "Keep N previous copies (.1):" "$TUI_LOG_ROTATE_KEEP") || continue; TUI_DIRTY="yes" ;;
+      tmpfs)    TUI_PROFILE_TMPFS=$(_tui_bool_toggle "$TUI_PROFILE_TMPFS"); TUI_DIRTY="yes" ;;
+      syncback) TUI_PROFILE_SYNC_BACK=$(_tui_bool_toggle "$TUI_PROFILE_SYNC_BACK"); TUI_DIRTY="yes" ;;
+      prewarm)  TUI_PREWARM=$(_tui_bool_toggle "$TUI_PREWARM"); TUI_DIRTY="yes" ;;
+      vlcloop)  TUI_VLC_LOOP=$(_tui_bool_toggle "$TUI_VLC_LOOP"); TUI_DIRTY="yes" ;;
+      vlcmute)  TUI_VLC_NO_AUDIO=$(_tui_bool_toggle "$TUI_VLC_NO_AUDIO"); TUI_DIRTY="yes" ;;
+      vlccache) TUI_VLC_NETWORK_CACHING=$(_wt_input "VLC network caching" "Milliseconds (blank = VLC default; raise for flaky RTSP):" "$TUI_VLC_NETWORK_CACHING") || continue; TUI_DIRTY="yes" ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+_tui_edit_in_editor() {
+  local editor=${EDITOR:-nano}
+  command -v "$editor" >/dev/null 2>&1 || editor="nano"
+  command -v "$editor" >/dev/null 2>&1 || editor="vi"
+  whiptail --title "Edit config" --msgbox \
+"About to open $CONFIG_FILE in $editor.
+Save and exit to return here — values will be re-read." 11 70
+  clear
+  "$editor" "$CONFIG_FILE"
+  _tui_load_config
+}
+
+_tui_write_all() {
   mkdir -p "$CONFIG_DIR"
   [ -f "$CONFIG_FILE" ] || render_config_file
-  set_or_append_conf_value MODE              "$new_mode"     "$CONFIG_FILE"
-  set_or_append_conf_value URL               "$new_url"      "$CONFIG_FILE"
-  set_or_append_conf_value OUTPUT            "$new_output"   "$CONFIG_FILE"
-  set_or_append_conf_value FORCE_RESOLUTION  "$new_res"      "$CONFIG_FILE"
-  set_or_append_conf_value FORCE_ROTATION    "$new_rot"      "$CONFIG_FILE"
-  set_or_append_conf_value MODE2             "$new_mode2"    "$CONFIG_FILE"
-  set_or_append_conf_value URL2              "$new_url2"     "$CONFIG_FILE"
-  set_or_append_conf_value OUTPUT2           "$new_output2"  "$CONFIG_FILE"
-  set_or_append_conf_value FORCE_RESOLUTION_2 "$new_res2"    "$CONFIG_FILE"
-  set_or_append_conf_value FORCE_ROTATION_2   "$new_rot2"    "$CONFIG_FILE"
-  if [ "$new_mode" = "chrome" ] || [ "$new_mode2" = "chrome" ]; then
-    set_or_append_conf_value FRIGATE_DARK_MODE           "$new_dark"     "$CONFIG_FILE"
-    set_or_append_conf_value FRIGATE_THEME               "$new_theme"    "$CONFIG_FILE"
-    set_or_append_conf_value FRIGATE_BIRDSEYE_AUTO_FILL  "$new_autofill" "$CONFIG_FILE"
-  fi
-  echo "Saved configuration to $CONFIG_FILE."
+  local cf=$CONFIG_FILE
+  set_or_append_conf_value MODE                        "$TUI_MODE"                 "$cf"
+  set_or_append_conf_value URL                         "$TUI_URL"                  "$cf"
+  set_or_append_conf_value OUTPUT                      "$TUI_OUTPUT"               "$cf"
+  set_or_append_conf_value FORCE_RESOLUTION            "$TUI_RES"                  "$cf"
+  set_or_append_conf_value FORCE_ROTATION              "$TUI_ROT"                  "$cf"
+  set_or_append_conf_value MODE2                       "$TUI_MODE2"                "$cf"
+  set_or_append_conf_value URL2                        "$TUI_URL2"                 "$cf"
+  set_or_append_conf_value OUTPUT2                     "$TUI_OUTPUT2"              "$cf"
+  set_or_append_conf_value FORCE_RESOLUTION_2          "$TUI_RES2"                 "$cf"
+  set_or_append_conf_value FORCE_ROTATION_2            "$TUI_ROT2"                 "$cf"
+  set_or_append_conf_value FRIGATE_DARK_MODE           "$TUI_FRIGATE_DARK"         "$cf"
+  set_or_append_conf_value FRIGATE_THEME               "$TUI_FRIGATE_THEME"        "$cf"
+  set_or_append_conf_value FRIGATE_BIRDSEYE_AUTO_FILL  "$TUI_FRIGATE_AUTOFILL"     "$cf"
+  set_or_append_conf_value FRIGATE_BIRDSEYE_WIDTH      "$TUI_FRIGATE_WIDTH"        "$cf"
+  set_or_append_conf_value FRIGATE_BIRDSEYE_HEIGHT     "$TUI_FRIGATE_HEIGHT"       "$cf"
+  set_or_append_conf_value FRIGATE_BIRDSEYE_MARGIN     "$TUI_FRIGATE_MARGIN"       "$cf"
+  set_or_append_conf_value GUI_USER                    "$TUI_GUI_USER"             "$cf"
+  set_or_append_conf_value HEALTH_INTERVAL             "$TUI_HEALTH_INTERVAL"      "$cf"
+  set_or_append_conf_value SCREEN_DELAY                "$TUI_SCREEN_DELAY"         "$cf"
+  set_or_append_conf_value STALL_RETRIES               "$TUI_STALL_RETRIES"        "$cf"
+  set_or_append_conf_value VLC_STALL_RETRIES           "$TUI_VLC_STALL_RETRIES"    "$cf"
+  set_or_append_conf_value HEALTH_RETRIES              "$TUI_HEALTH_RETRIES"       "$cf"
+  set_or_append_conf_value MIN_UPTIME_BEFORE_START     "$TUI_MIN_UPTIME"           "$cf"
+  set_or_append_conf_value GUI_SESSION_WAIT_TIMEOUT    "$TUI_SESSION_WAIT"         "$cf"
+  set_or_append_conf_value WAYLAND_READY_TIMEOUT       "$TUI_WAYLAND_WAIT"         "$cf"
+  set_or_append_conf_value LOG_MAX_BYTES               "$TUI_LOG_MAX_BYTES"        "$cf"
+  set_or_append_conf_value LOG_ROTATE_KEEP             "$TUI_LOG_ROTATE_KEEP"      "$cf"
+  set_or_append_conf_value PROFILE_TMPFS               "$TUI_PROFILE_TMPFS"        "$cf"
+  set_or_append_conf_value PROFILE_SYNC_BACK           "$TUI_PROFILE_SYNC_BACK"    "$cf"
+  set_or_append_conf_value PREWARM_ENABLED             "$TUI_PREWARM"              "$cf"
+  set_or_append_conf_value VLC_LOOP                    "$TUI_VLC_LOOP"             "$cf"
+  set_or_append_conf_value VLC_NO_AUDIO                "$TUI_VLC_NO_AUDIO"         "$cf"
+  set_or_append_conf_value VLC_NETWORK_CACHING         "$TUI_VLC_NETWORK_CACHING"  "$cf"
+  TUI_DIRTY="no"
+}
 
-  # --- Offer restart ---
-  if command -v systemctl >/dev/null 2>&1 && \
-     systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' | grep -qx 'kiosk-monitor.service'; then
-    local was_active="no"
-    systemctl is-active --quiet kiosk-monitor.service && was_active="yes"
-    local prompt
-    if [ "$was_active" = "yes" ]; then
-      prompt="Service is running. Restart kiosk-monitor.service to apply?"
-    else
-      prompt="Service is not running. Start kiosk-monitor.service now?"
-    fi
-    if _wt_yesno "Apply" "$prompt"; then
-      if [ "$was_active" = "yes" ]; then
-        systemctl restart kiosk-monitor.service && echo "Service restarted."
-      else
-        systemctl start kiosk-monitor.service && echo "Service started."
-      fi
-    fi
-  else
-    echo "Tip: run '$SCRIPT_NAME --install' first to create the systemd service."
+_tui_save_and_exit() {
+  if [ "$TUI_DIRTY" = "no" ]; then
+    whiptail --title "Save" --msgbox "No pending changes to save." 10 50
+    return 0
   fi
-  rc=0
-  return $rc
+  _tui_write_all
+  whiptail --title "Saved" --msgbox "Configuration written to $CONFIG_FILE." 10 70
+  _tui_offer_restart
+  return 1   # tell the caller the main loop should exit
+}
+
+_tui_offer_restart() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' | grep -qx 'kiosk-monitor.service' || {
+    whiptail --title "Tip" --msgbox \
+"kiosk-monitor.service is not installed yet.
+Run 'sudo kiosk-monitor --install' to create it." 10 70
+    return 0
+  }
+  local was_active="no"
+  systemctl is-active --quiet kiosk-monitor.service && was_active="yes"
+  local prompt
+  if [ "$was_active" = "yes" ]; then
+    prompt="Service is running. Restart it to apply the new config?"
+  else
+    prompt="Service is not running. Start it now?"
+  fi
+  if _wt_yesno "Apply" "$prompt"; then
+    if [ "$was_active" = "yes" ]; then
+      systemctl restart kiosk-monitor.service
+    else
+      systemctl start kiosk-monitor.service
+    fi
+  fi
+}
+
+_tui_main_menu() {
+  local inst1_label inst2_label frig_label adv_label
+  while true; do
+    inst1_label="$TUI_MODE @ $(_tui_preview_value "$TUI_OUTPUT" auto) → $(_tui_preview_value "$TUI_URL" not-set)"
+    if [ -n "$TUI_MODE2" ]; then
+      inst2_label="$TUI_MODE2 @ $(_tui_preview_value "$TUI_OUTPUT2" auto) → $(_tui_preview_value "$TUI_URL2" not-set)"
+    else
+      inst2_label="disabled"
+    fi
+    frig_label="dark=$(_tui_preview_value "$TUI_FRIGATE_DARK" auto), theme=$(_tui_preview_value "$TUI_FRIGATE_THEME" auto), autofill=$TUI_FRIGATE_AUTOFILL"
+    adv_label="interval=${TUI_HEALTH_INTERVAL}s, stall=${TUI_STALL_RETRIES}/${TUI_VLC_STALL_RETRIES}"
+
+    local dirty_marker=""
+    [ "$TUI_DIRTY" = "yes" ] && dirty_marker=" *"
+    local choice
+    choice=$(_wt_menu "kiosk-monitor ${SCRIPT_VERSION}${dirty_marker}" \
+      "Main menu — pick an area to edit, or save and exit." 20 78 10 \
+      "instance1"  "Instance 1:  $inst1_label" \
+      "instance2"  "Instance 2:  $inst2_label" \
+      "frigate"    "Frigate helper:  $frig_label" \
+      "timing"     "Timing & restart thresholds:  $adv_label" \
+      "profile"    "Profile / logging / VLC options" \
+      "editor"     "Open $CONFIG_FILE in \$EDITOR" \
+      "reload"     "Reload config file (discard in-memory edits)" \
+      "save"       "Save changes and exit" \
+      "quit"       "Discard changes and exit") || return 0
+    case "$choice" in
+      instance1) _tui_edit_instance 1 TUI_MODE TUI_URL TUI_OUTPUT TUI_RES TUI_ROT ;;
+      instance2) _tui_edit_instance2 ;;
+      frigate)   _tui_edit_frigate ;;
+      timing)    _tui_edit_timing ;;
+      profile)   _tui_edit_profile_logs ;;
+      editor)    _tui_edit_in_editor ;;
+      reload)
+        _tui_load_config
+        whiptail --title "Reloaded" --msgbox "Re-read $CONFIG_FILE into memory." 10 60 ;;
+      save)
+        _tui_save_and_exit && continue
+        return 0 ;;
+      quit)
+        if [ "$TUI_DIRTY" = "yes" ]; then
+          _wt_yesno "Discard changes?" "You have unsaved changes. Discard them and exit?" no \
+            && return 0 || continue
+        fi
+        return 0 ;;
+    esac
+  done
+}
+
+configure_self() {
+  require_root
+  if ! command -v whiptail >/dev/null 2>&1; then
+    echo "Error: whiptail not installed. Run: sudo apt install whiptail" >&2
+    exit 1
+  fi
+  _tui_load_config
+  _tui_probe_outputs
+  _tui_main_menu
 }
 
 logs_self() {
@@ -2777,7 +3050,11 @@ trap handle_reload_signal HUP
 
 # --- wait for labwc + wayland socket (desktop open) ---
 wait_for_gui_session
-wait_for_wayland_ready "$GUI_UID"
+if ! wait_for_wayland_ready "$GUI_UID"; then
+  log "Exiting — no supported compositor. systemd will restart us; fix the"
+  log "desktop session first (see the previous log lines for guidance)."
+  exit 1
+fi
 
 # --- profile runtime (shared among chrome instances) ---
 PROFILE_PERSIST_ROOT="${PROFILE_ROOT:-/home/${GUI_USER}/.local/share/kiosk-monitor}"
