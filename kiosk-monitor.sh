@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 6.3.0
+# kiosk-monitor.sh :: version 6.4.0
 # ======================================================================
 # Kiosk watchdog for Raspberry Pi OS trixie 64-bit (or newer Debian/RPi).
 # Supports Chromium fullscreen kiosk and VLC fullscreen video playback,
@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.3.0"
+SCRIPT_VERSION="6.4.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 
 # ------------------------------------------------------------------
@@ -553,59 +553,101 @@ wait_for_gui_session() {
   return 0
 }
 
-wait_for_wayland_ready() {
+_detect_wayland() {
+  # Set WAYLAND_DISPLAY if a live socket + matching compositor exist for $1.
+  # Echoes "ok" on success, nothing on failure.
+  local uid=$1 rt="/run/user/$1" found="" comp=""
+  local -a KNOWN=( labwc labwc-pi wayfire sway hyprland river weston )
+  if [ -d "$rt" ]; then
+    local sock
+    for sock in "$rt"/wayland-*; do
+      case "$sock" in *.lock) continue ;; esac
+      [ -S "$sock" ] && { found=$(basename "$sock"); break; }
+    done
+  fi
+  if [ -n "$found" ]; then
+    local p
+    for p in "${KNOWN[@]}"; do
+      pgrep -u "$uid" -x "$p" >/dev/null 2>&1 && { comp="$p"; break; }
+    done
+  fi
+  [ -n "$found" ] && [ -n "$comp" ] || return 1
+  WAYLAND_DISPLAY="$found"
+  export WAYLAND_DISPLAY
+  SESSION_TYPE="wayland"
+  SESSION_COMPOSITOR="$comp"
+  return 0
+}
+
+_detect_x11() {
+  # Find an active X11 DISPLAY that we can talk to. Sets DISPLAY on success.
+  local uid=$1 disp=""
+  # Candidate list: $DISPLAY if already set, common :0/:1/:2, plus anything
+  # that has an X11 socket in /tmp/.X11-unix/.
+  local -a candidates=()
+  [ -n "${DISPLAY:-}" ] && candidates+=( "$DISPLAY" )
+  local sock
+  for sock in /tmp/.X11-unix/X*; do
+    [ -S "$sock" ] || continue
+    candidates+=( ":${sock#/tmp/.X11-unix/X}" )
+  done
+  # Try each candidate with xset q (cheap identity-free probe).
+  local cand
+  command -v xset >/dev/null 2>&1 || return 1
+  for cand in "${candidates[@]}"; do
+    [ -n "$cand" ] || continue
+    if DISPLAY="$cand" XAUTHORITY="/home/$GUI_USER/.Xauthority" \
+        sudo -n -u "$GUI_USER" env DISPLAY="$cand" \
+        XAUTHORITY="/home/$GUI_USER/.Xauthority" xset q >/dev/null 2>&1; then
+      disp="$cand"; break
+    fi
+  done
+  [ -n "$disp" ] || return 1
+  DISPLAY="$disp"
+  export DISPLAY
+  : "${XAUTHORITY:=/home/$GUI_USER/.Xauthority}"
+  export XAUTHORITY
+  SESSION_TYPE="x11"
+  SESSION_COMPOSITOR="$(pgrep -u "$uid" -x Xorg >/dev/null 2>&1 && echo Xorg || echo Xwayland)"
+  return 0
+}
+
+wait_for_display_ready() {
+  # Block until either a Wayland compositor (preferred) or an X11 server
+  # is reachable. Sets SESSION_TYPE + WAYLAND_DISPLAY or DISPLAY.
   local uid=${1:-$GUI_UID}
   local timeout="${WAYLAND_READY_TIMEOUT:-0}"
   [[ "$timeout" =~ ^[0-9]+$ ]] && [ "$timeout" -gt 0 ] || timeout=0
-  local rt="/run/user/${uid}"
-  local waited=0 found="" comp=""
-  # Known wlroots-based compositors we're willing to attach to. labwc is
-  # the Raspberry Pi OS trixie default; the others work the same at our
-  # API surface (wl_output + xdg-shell + screenshot via grim).
-  local -a KNOWN=( labwc labwc-pi wayfire sway hyprland river weston )
-  local announced=no
+  SESSION_TYPE=""
+  local waited=0 announced=no
   while true; do
-    found=""
-    if [ -d "$rt" ]; then
-      for sock in "$rt"/wayland-*; do
-        case "$sock" in *.lock) continue ;; esac
-        [ -S "$sock" ] && { found=$(basename "$sock"); break; }
-      done
+    if _detect_wayland "$uid"; then
+      log "Desktop session ready: wayland socket=$WAYLAND_DISPLAY, compositor=$SESSION_COMPOSITOR."
+      return 0
     fi
-    comp=""
-    if [ -n "$found" ]; then
-      local p
-      for p in "${KNOWN[@]}"; do
-        if pgrep -u "$uid" -x "$p" >/dev/null 2>&1; then comp="$p"; break; fi
-      done
-    fi
-    if [ -n "$found" ] && [ -n "$comp" ]; then
-      WAYLAND_DISPLAY="$found"
-      export WAYLAND_DISPLAY
-      log "Desktop session ready: wayland socket=$WAYLAND_DISPLAY, compositor=$comp."
+    if _detect_x11 "$uid"; then
+      log "Desktop session ready: X11 DISPLAY=$DISPLAY (session=$SESSION_COMPOSITOR)."
       return 0
     fi
     if [ "$timeout" -gt 0 ] && [ "$waited" -ge "$timeout" ]; then
-      log "No Wayland compositor detected after ${timeout}s."
-      log "kiosk-monitor requires a Wayland session (labwc on Raspberry Pi OS trixie)."
-      # Xorg often runs as root via LightDM, so check the whole process
-      # table and also the X11 socket — either is a giveaway.
-      if pgrep -x Xorg >/dev/null 2>&1 \
-         || pgrep -x Xwayland >/dev/null 2>&1 \
-         || [ -S /tmp/.X11-unix/X0 ]; then
-        log "An X11 server is running — switch the session to Wayland via 'sudo raspi-config' (Advanced → Wayland) or by setting 'autologin-session=labwc' in /etc/lightdm/lightdm.conf."
-      fi
+      log "No Wayland or X11 session detected after ${timeout}s."
+      log "Check 'loginctl list-sessions' and that a desktop is logged in."
       return 1
     fi
     if [ "$announced" = "no" ]; then
-      log "Waiting for a Wayland session (compositor not yet running; timeout ${timeout}s)…"
+      log "Waiting for a graphical session (timeout ${timeout}s)…"
       announced=yes
     elif [ "$waited" -gt 0 ] && [ $((waited % 60)) -eq 0 ]; then
-      log "Still waiting for Wayland (waited ${waited}s)…"
+      log "Still waiting for a graphical session (waited ${waited}s)…"
     fi
     sleep 5
     waited=$((waited + 5))
   done
+}
+
+# Backward-compat shim — older code paths still call wait_for_wayland_ready.
+wait_for_wayland_ready() {
+  wait_for_display_ready "$@"
 }
 
 maybe_defer_launch() {
@@ -641,11 +683,43 @@ as_gui() {
       env XDG_RUNTIME_DIR="/run/user/$GUI_UID" \
           WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
           DISPLAY="${DISPLAY:-}" \
+          XAUTHORITY="${XAUTHORITY:-/home/$GUI_USER/.Xauthority}" \
           "$@"
   fi
 }
 
+_refresh_outputs_x11() {
+  OUTPUTS_NAMES=()
+  OUTPUT_GEOMETRY=()
+  command -v xrandr >/dev/null 2>&1 || return 1
+  local line
+  while IFS= read -r line; do
+    # lines like:  "HDMI-1 connected primary 1920x1080+0+0 ..."
+    #        or:  "HDMI-2 connected 1280x720+1920+0 ..."
+    [[ "$line" == *" connected "* ]] || continue
+    local name geom
+    name="${line%% *}"
+    geom=$(printf '%s' "$line" | grep -oE '[0-9]+x[0-9]+\+[0-9-]+\+[0-9-]+' | head -1)
+    [ -n "$geom" ] || continue
+    local w h x y
+    w="${geom%%x*}"; rest="${geom#*x}"
+    h="${rest%%+*}"; rest="${rest#*+}"
+    x="${rest%%+*}"
+    y="${rest#*+}"
+    OUTPUTS_NAMES+=( "$name" )
+    OUTPUT_GEOMETRY["$name"]="$x $y $w $h"
+  done < <(as_gui xrandr --query 2>/dev/null)
+  if [ "${#OUTPUTS_NAMES[@]}" -gt 1 ]; then
+    mapfile -t OUTPUTS_NAMES < <(printf '%s\n' "${OUTPUTS_NAMES[@]}" | LC_ALL=C sort)
+  fi
+  [ "${#OUTPUTS_NAMES[@]}" -gt 0 ]
+}
+
 refresh_outputs() {
+  if [ "${SESSION_TYPE:-}" = "x11" ]; then
+    _refresh_outputs_x11
+    return $?
+  fi
   OUTPUTS_NAMES=()
   OUTPUT_GEOMETRY=()
   command -v wlr-randr >/dev/null 2>&1 || return 1
@@ -1126,7 +1200,6 @@ launch_chrome_instance() {
     --disable-logging-redirect
     --log-level=3
     "--enable-features=OverlayScrollbar,UseOzonePlatform"
-    --ozone-platform=wayland
     --password-store=basic
     --allow-running-insecure-content
     "--user-data-dir=$profile_root"
@@ -1135,6 +1208,11 @@ launch_chrome_instance() {
     "--class=${INSTANCE_CLASS[$id]}"
     --new-window
   )
+  if [ "${SESSION_TYPE:-}" = "x11" ]; then
+    flags+=( --ozone-platform=x11 )
+  else
+    flags+=( --ozone-platform=wayland )
+  fi
   local ext_path
   if ext_path=$(ensure_frigate_extension "$id"); then
     flags+=( "--load-extension=$ext_path" "--disable-extensions-except=$ext_path" )
@@ -1318,12 +1396,22 @@ capture_output_hash() {
   local name="${INSTANCE_OUTPUT[$id]:-}"
   local tmp
   tmp=$(mktemp 2>/dev/null) || return 1
-  local -a cmd=( as_gui grim )
-  [ -n "$name" ] && cmd+=( -o "$name" )
-  cmd+=( -t ppm - )
-  if ! "${cmd[@]}" >"$tmp" 2>/dev/null; then
-    debug_instance "$id" "grim capture failed (output=$name)"
-    rm -f "$tmp"; return 1
+  if [ "${SESSION_TYPE:-}" = "x11" ]; then
+    # xwd captures the whole root; per-output capture would need scrot/maim
+    # with geometry. For now, hash the full root — works on single-display
+    # X11 setups and gracefully degrades on multi-display.
+    if ! as_gui xwd -silent -root -display "$DISPLAY" >"$tmp" 2>/dev/null; then
+      debug_instance "$id" "xwd capture failed (DISPLAY=$DISPLAY)"
+      rm -f "$tmp"; return 1
+    fi
+  else
+    local -a cmd=( as_gui grim )
+    [ -n "$name" ] && cmd+=( -o "$name" )
+    cmd+=( -t ppm - )
+    if ! "${cmd[@]}" >"$tmp" 2>/dev/null; then
+      debug_instance "$id" "grim capture failed (output=$name)"
+      rm -f "$tmp"; return 1
+    fi
   fi
   local hash
   hash=$(HASH_MODE="$SCREEN_SAMPLE_MODE" python3 - "$tmp" <<'PY' 2>/dev/null
@@ -1581,6 +1669,7 @@ ensure_labwc_window_rules() {
   # Single-instance setups never need this — labwc's default placement
   # already puts the sole window on the primary output, so skip the
   # file entirely and leave the compositor config untouched.
+  [ "${SESSION_TYPE:-}" = "wayland" ] || return 0
   if [ "${#INSTANCES[@]}" -le 1 ]; then
     return 0
   fi
@@ -1648,6 +1737,25 @@ apply_display_overrides() {
   local rot="${INSTANCE_FORCE_ROTATION[$id]:-}"
   [ -n "$out" ] || return 0
   [ -n "$mode" ] || [ -n "$rot" ] || return 0
+  if [ "${SESSION_TYPE:-}" = "x11" ]; then
+    command -v xrandr >/dev/null 2>&1 || return 0
+    local -a args=( --output "$out" )
+    [ -n "$mode" ] && args+=( --mode "${mode%@*}" )
+    case "$rot" in
+      ""|normal) ;;
+      90)  args+=( --rotate left ) ;;
+      180) args+=( --rotate inverted ) ;;
+      270) args+=( --rotate right ) ;;
+      *)   log_instance "$id" "X11: rotation '$rot' not directly supported; skipping" ;;
+    esac
+    if [ "${#args[@]}" -gt 2 ]; then
+      log_instance "$id" "applying display override: xrandr ${args[*]}"
+      as_gui xrandr "${args[@]}" >/dev/null 2>&1 \
+        || log_instance "$id" "xrandr override failed"
+      refresh_outputs || true
+    fi
+    return 0
+  fi
   command -v wlr-randr >/dev/null 2>&1 || return 0
 
   local mode_valid="no" rot_valid="no"
@@ -2011,6 +2119,9 @@ ensure_apt_dependencies() {
     [whiptail]=whiptail
     [flock]=util-linux
     [sha256sum]=coreutils
+    [xwd]=x11-apps
+    [xset]=x11-xserver-utils
+    [xrandr]=x11-xserver-utils
   )
 
   # chromium / vlc: any of several commands satisfies the dep; install
