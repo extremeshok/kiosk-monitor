@@ -1,48 +1,82 @@
-# kiosk-monitor configuration
-# Copy to /etc/kiosk-monitor/kiosk-monitor.conf and adjust values as needed.
+# kiosk-monitor configuration (sample)
+# Copy to /etc/kiosk-monitor/kiosk-monitor.conf and edit.
+# Values here are shell-quoted: keep the double quotes around strings.
+# Minimum required: set MODE and URL for instance 1.
 
+# ---- Instance 1 (primary display) ----------------------------------------
+MODE="chrome"                  # chrome or vlc
 URL="http://192.168.3.222:30059/?Birdseye"
-GUI_USER=""          # set to the desktop user if auto-detection fails
-BROWSER="chromium"    # Chromium/Chrome only
-# CHROMIUM_BIN="/usr/bin/chromium-browser"
-DEBUG=false
-PROFILE_ROOT=""       # override kiosk profile directory if needed
-WAIT_FOR_URL=true
-CHROME_LAUNCH_DELAY=3
-CHROME_READY_DELAY=2
-MIN_UPTIME_BEFORE_START=60   # ensure the Pi has been up at least N seconds before launching
+OUTPUT=""                      # e.g. HDMI-A-1; leave blank to auto-pick primary
+
+# ---- Instance 2 (optional, for second display) ---------------------------
+MODE2=""                       # "chrome", "vlc", or blank to disable
+URL2=""                        # URL / stream for second display
+OUTPUT2=""                     # e.g. HDMI-A-2; leave blank to auto-pick secondary
+
+# ---- Desktop user --------------------------------------------------------
+# Leave blank to auto-detect (checks active seat0 session, autologin,
+# lightdm, SUDO_USER, first non-system UID>=1000, in that order).
+GUI_USER=""
+
+# ---- Chromium-specific (MODE=chrome) -------------------------------------
+#CHROMIUM_BIN="/usr/bin/chromium"
+BIRDSEYE_AUTO_FILL=false       # true => inject Frigate Birdseye fullscreen CSS
+#BIRDSEYE_MATCH_PATTERN=""     # override match pattern (auto-derived from URL)
+#BIRDSEYE_EXTENSION_DIR=""     # custom extension dir (default: inside profile)
+DEVTOOLS_AUTO_OPEN=false
+#DEVTOOLS_REMOTE_PORT=9222
+
+# ---- VLC-specific (MODE=vlc) --------------------------------------------
+#VLC_BIN="/usr/bin/vlc"
+VLC_LOOP=true
+VLC_NO_AUDIO=false
+#VLC_NETWORK_CACHING=1500      # ms; raise for flaky RTSP streams
+#VLC_EXTRA_ARGS="--avcodec-hw=any"
+
+# ---- Profile / cache -----------------------------------------------------
+#PROFILE_ROOT=""                # default: /home/<GUI_USER>/.local/share/kiosk-monitor
 PROFILE_TMPFS=false
 PROFILE_TMPFS_PATH="/dev/shm/kiosk-monitor"
 PROFILE_SYNC_BACK=false
 PROFILE_TMPFS_PURGE=false
-PROFILE_ARCHIVE=""
-PROFILE_SYNC_INTERVAL=0
+#PROFILE_ARCHIVE=""             # optional tar archive to seed the profile
+PROFILE_SYNC_INTERVAL=0         # seconds between background syncs (0 disables)
+
+# ---- Boot / readiness ----------------------------------------------------
+MIN_UPTIME_BEFORE_START=60      # wait for system uptime >= N seconds
+GUI_SESSION_WAIT_TIMEOUT=300    # wait for loginctl session for GUI_USER
+WAYLAND_READY_TIMEOUT=300       # wait for wayland-N socket + labwc to be up
+SESSION_READY_DELAY=0
+SESSION_READY_CMD=""
+SESSION_READY_TIMEOUT=0
+WAIT_FOR_URL=true               # block http/https instances until URL responds
+WAIT_FOR_URL_TIMEOUT=0          # 0 = wait forever
+CHROME_LAUNCH_DELAY=3
+CHROME_READY_DELAY=2
+VLC_LAUNCH_DELAY=3
+
+# ---- Monitoring ----------------------------------------------------------
+HEALTH_INTERVAL=30              # seconds between watchdog iterations
+HEALTH_CONNECT_TIMEOUT=3
+HEALTH_TOTAL_TIMEOUT=8
+HEALTH_RETRIES=6                # failed http probes before restarting
+STALL_RETRIES=3                 # identical-frame hashes before restarting chrome
+VLC_STALL_RETRIES=6             # identical-frame hashes before restarting vlc
+SCREEN_DELAY=120                # skip freeze checks for first N seconds of runtime
+SCREEN_SAMPLE_MODE="sample"     # "sample" (top-left 50%) or "full"
+SCREEN_SAMPLE_BYTES=524288
+RESTART_WINDOW=600              # restart-rate window (seconds)
+MAX_RESTARTS=10                 # max restarts in window before 5-min backoff
+CLEAN_RESET=600                 # healthy run length that resets the restart log
+
+# ---- Prewarm (SD-card cold-start optimisation) --------------------------
 PREWARM_ENABLED=true
 PREWARM_PATHS=""
 PREWARM_MAX_FILES=512
 PREWARM_SLICE_SIZE=262144
-SESSION_READY_DELAY=0
-SESSION_READY_CMD=""
-SESSION_READY_TIMEOUT=0
-GUI_SESSION_WAIT_TIMEOUT=120   # wait up to N seconds for the GUI user’s loginctl session before launching (0 disables)
-WAIT_FOR_URL_TIMEOUT=0         # seconds to wait for initial health check before proceeding anyway (0=wait forever)
-SCREEN_SAMPLE_BYTES=524288     # bytes hashed when region hashing fails (legacy fallback)
-SCREEN_SAMPLE_MODE="sample"    # "sample" hashes the top-left 50% via SHA-256; set to "full" for the entire frame
-SCREEN_DELAY=120               # seconds the browser must run before screen-freeze checks begin
-HEALTH_INTERVAL=30             # seconds between health-check cycles
-HEALTH_CONNECT_TIMEOUT=2       # curl connect timeout (seconds) for health checks
-HEALTH_TOTAL_TIMEOUT=6         # max curl duration (seconds) per health check
-STALL_RETRIES=3                # unchanged screen hashes before forcing a restart
-HEALTH_RETRIES=6               # consecutive failed health probes before restarting browser
-RESTART_WINDOW=600             # seconds considered when rate-limiting restarts
-MAX_RESTARTS=10                # max restarts allowed within RESTART_WINDOW before backoff
-CLEAN_RESET=600                # seconds of healthy run needed to reset restart history
-DEVTOOLS_AUTO_OPEN=false       # set true to auto-open Chromium DevTools for each tab
-DEVTOOLS_REMOTE_PORT=          # set a port (e.g., 9222) to enable Chromium remote debugging
-LOCK_FILE="/var/lock/kiosk-monitor.lock"  # non-root runs fall back to $XDG_RUNTIME_DIR/kiosk-monitor.lock or /tmp automatically
+
+# ---- Paths ---------------------------------------------------------------
+LOCK_FILE="/var/lock/kiosk-monitor.lock"
 INSTALL_DIR="/usr/local/bin"
 SERVICE_PATH="/etc/systemd/system/kiosk-monitor.service"
 BASE_URL="https://raw.githubusercontent.com/extremeshok/kiosk-monitor/main"
-BIRDSEYE_AUTO_FILL=true       # set to false to disable the Frigate Birdseye auto-fill CSS
-BIRDSEYE_MATCH_PATTERN=""     # override the Chrome extension match pattern (defaults to scheme://host/* derived from URL)
-BIRDSEYE_EXTENSION_DIR=""     # optional custom directory; defaults to <PROFILE_ROOT>/birdseye-autofill with fallback to /usr/local/share/kiosk-monitor

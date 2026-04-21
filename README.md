@@ -1,118 +1,147 @@
 # kiosk-monitor
 
-Browser watchdog for kiosk-style displays. The service keeps a single kiosk window pinned to your dashboard, restarts the browser when the page or GPU freezes, and scrubs the profile so crash prompts and duplicate tabs never appear after a reboot.
+Watchdog for kiosk-style displays. Launches Chromium in fullscreen kiosk mode **or** VLC against a video stream, then monitors the page/video for freezes and restarts automatically. Supports one or two displays at once, each running either Chromium or VLC independently.
 
 ## Features
-- Launches Chromium in kiosk mode against a configurable URL (default Birdseye view)
-- Monitors reachability of the target URL and captures screen hashes to detect frozen frames
-- Auto-recovers from network outages, browser crashes, or repeated stalls with storm-protection backoff
-- Self-install, update, and removal via `--install`, `--update`, `--remove`
-- Maintains dedicated browser profiles to suppress "restore previous session" prompts and duplicate tabs
-- Enforces a single kiosk browser instance by pruning stray processes
-- Pre-warms browser binaries/profile caches to shorten cold-start times on slow media
+- **Two launch modes** per instance: `chrome` (fullscreen Chromium) or `vlc` (fullscreen video player).
+- **Dual-display** support — run Chromium on HDMI-A-1 and VLC on HDMI-A-2 (or any combination) from a single watchdog.
+- **Per-output freeze detection** using `grim`: each instance is checked against its own monitor so a hang on one display never restarts the other.
+- **URL health checks** for http/https targets, independent per instance.
+- **Automatic restart** on frozen screens, dead processes, or repeated health failures, with per-instance storm-protection backoff.
+- **Auto-detects the default desktop user** (active seat0 session → systemd autologin → lightdm autologin → SUDO_USER → first non-system UID).
+- **Waits for the desktop to be open** before launching (labwc process + `wayland-*` socket).
+- **Self-install / update / remove** via `--install`, `--update`, `--remove`, `--reconfig`, `--status`.
+- Dedicated, isolated Chromium profiles per instance (no "restore previous session" prompts, no duplicate tabs).
+- Optional tmpfs profile staging, prewarm, and periodic sync back to disk.
 
 ## Requirements
-- Debian/Raspberry Pi OS or other systemd-based distro with a graphical session on `seat0`
-- Packages: `chromium-browser`, `curl`, `sudo`, `x11-apps`, `grim` (Wayland), `wayland-utils`, `fbset`, `coreutils`, `procps` (provides `ps`/`pgrep`)
-- Chromium binary at `/usr/bin/chromium-browser` when `BROWSER=chromium` (override with `CHROMIUM_BIN`)
+- **Raspberry Pi OS trixie 64-bit Desktop** (Debian 13) or newer — this is the minimum supported platform.
+- Wayland (labwc compositor — default on trixie desktop).
+- Preinstalled on the stock image: `chromium`, `vlc`, `grim`, `wlr-randr`, `curl`, `python3`, `sudo`.
 
-## Quick Install
+## Quick install
 ```bash
 curl -fsSL https://raw.githubusercontent.com/extremeshok/kiosk-monitor/main/kiosk-monitor.sh \
-  | sudo bash -s -- --install --url "http://192.168.3.222:30059/?Birdseye" --gui-user spaceman
+  | sudo bash -s -- --install --mode chrome --url "http://192.168.3.222:30059/?Birdseye"
 ```
 
-The installer will download `kiosk-monitor.sh` and `kiosk-monitor.service`, place them in `/usr/local/bin` and `/etc/systemd/system`, create `/etc/kiosk-monitor/kiosk-monitor.conf` (alongside a `.sample`), run `systemctl daemon-reload`, and enable/start the service. Use `--no-start` if you want to enable without starting immediately.
-
-### Update or Remove
+Dual-display example (Chromium dashboard on primary, camera stream on secondary):
 ```bash
-# Update binaries (restarts the service if running)
-sudo kiosk-monitor.sh --update
-
-# Remove files; add --purge to delete /etc/kiosk-monitor
-sudo kiosk-monitor.sh --remove [--purge]
-
-# Refresh / regenerate the config (writes current values plus new defaults)
-sudo kiosk-monitor.sh --reconfig
+sudo kiosk-monitor.sh --install \
+  --mode chrome --url "http://192.168.3.222:30059/?Birdseye" --output HDMI-A-1 \
+  --mode2 vlc   --url2 "rtsp://192.168.3.210:8554/cam1"       --output2 HDMI-A-2
 ```
 
-To stage a custom branch or mirror, set `BASE_URL` before invoking any management command:
+The installer:
+1. Auto-detects the desktop user (or use `--gui-user USER`).
+2. Copies the script to `/usr/local/bin/kiosk-monitor.sh`.
+3. Creates `/etc/kiosk-monitor/kiosk-monitor.conf` (and a `.sample`).
+4. Writes `/etc/systemd/system/kiosk-monitor.service` with the correct `User=`, `XDG_RUNTIME_DIR=`, `WAYLAND_DISPLAY=`.
+5. Enables and starts the service (use `--no-start` to skip startup).
+
+### Update / remove / reconfigure
 ```bash
-BASE_URL="https://raw.githubusercontent.com/<fork>/kiosk-monitor/feature-branch" sudo kiosk-monitor.sh --install
+sudo kiosk-monitor.sh --update                 # refresh files; restart if running
+sudo kiosk-monitor.sh --remove [--purge]       # remove binaries; --purge also drops /etc/kiosk-monitor
+sudo kiosk-monitor.sh --reconfig               # re-write kiosk-monitor.conf with every supported option
+kiosk-monitor.sh --status                      # show instance config + service status
+kiosk-monitor.sh --version
 ```
 
-## Configuration (`/etc/kiosk-monitor/kiosk-monitor.conf`)
-The installer seeds an override file. Edit it to customise runtime behaviour.
+## Configuration — `/etc/kiosk-monitor/kiosk-monitor.conf`
+Edit and then `sudo systemctl restart kiosk-monitor`.
 
-| Variable      | Description                                                                 | Default |
-| ------------- | --------------------------------------------------------------------------- | ------- |
-| `URL`         | Page to load in browser kiosk mode                                           | Birdseye URL |
-| `GUI_USER`    | Desktop user that owns the display session; autodetected when empty          | *(auto)* |
-| `BROWSER`     | Chromium variant (`chromium`/`chrome` accepted; Chromium-only support)       | `chromium` |
-| `CHROMIUM_BIN`| Override path to Chromium binary                                             | `/usr/bin/chromium-browser` |
-| `DEBUG`       | Set to `true` for verbose logging                                            | `false` |
-| `PROFILE_ROOT`| Directory for the dedicated kiosk browser profile                            | `/home/<GUI_USER>/.local/share/kiosk-monitor` |
-| `LOCK_FILE`   | Path for the single-instance flock lock (non-root users automatically fall back to `$XDG_RUNTIME_DIR/kiosk-monitor.lock` or `/tmp`) | `/var/lock/kiosk-monitor.lock` |
-| `WAIT_FOR_URL`| `true` blocks Chromium until the dashboard responds; set `false` to start immediately | `true` |
-| `MIN_UPTIME_BEFORE_START` | Seconds the Pi must be up before kiosk-monitor proceeds (waits the remainder if boot is too fresh) | `60` |
-| `CHROME_LAUNCH_DELAY` | Seconds to pause after spawning Chromium before checking PIDs        | `3` |
-| `CHROME_READY_DELAY`  | Seconds to pause before detecting the main browser PID               | `2` |
-| `PROFILE_TMPFS` | `true` stages the browser profile in RAM (tmpfs) for faster cold starts | `false` |
-| `PROFILE_TMPFS_PATH` | Path to the tmpfs profile directory                                  | `/dev/shm/kiosk-monitor` |
-| `PROFILE_SYNC_BACK` | `true` rsyncs the tmpfs profile back to disk on shutdown              | `false` |
-| `PROFILE_TMPFS_PURGE` | `true` wipes the tmpfs directory after syncing back                   | `false` |
-| `PROFILE_ARCHIVE` | Optional tar archive extracted into the profile before launch          | *(unset)* |
-| `PROFILE_SYNC_INTERVAL` | Seconds between background syncs back to disk (0 disables)            | `0` |
-| `PREWARM_ENABLED` | `true` pre-reads browser binaries/profile into page cache before launch | `true` |
-| `PREWARM_PATHS` | Optional colon-separated extra paths to prewarm                             | *(unset)* |
-| `PREWARM_MAX_FILES` | Max files touched per path during prewarm                                   | `512` |
-| `PREWARM_SLICE_SIZE` | Bytes read from each file while prewarming                               | `262144` |
-| `SESSION_READY_DELAY` | Seconds to delay the very first launch after boot                        | `0` |
-| `SESSION_READY_CMD` | Optional command to wait for (runs until exit 0)                          | *(unset)* |
-| `SESSION_READY_TIMEOUT` | Max seconds to wait for `SESSION_READY_CMD` (0 = wait forever)         | `0` |
-| `GUI_SESSION_WAIT_TIMEOUT` | Seconds to wait for the GUI user’s login session before launching (0 disables) | `120` |
-| `WAIT_FOR_URL_TIMEOUT` | Seconds to wait for the initial health probe before continuing anyway (0 = wait forever) | `0` |
-| `SCREEN_SAMPLE_BYTES` | Bytes hashed when falling back to legacy sampling (used only if region hashing fails) | `524288` |
-| `SCREEN_SAMPLE_MODE` | `sample` hashes the top-left 50% of the frame; `full` hashes the entire screenshot | `sample` |
-| `SCREEN_DELAY` | Seconds the browser must run before screen-freeze hashing starts             | `120` |
-| `LOG`         | Optional override for the runtime log (default `/dev/shm/kiosk.log`)         | *(unset)* |
-| `HEALTH_INTERVAL` | Seconds between health-check cycles                                      | `30` |
-| `HEALTH_CONNECT_TIMEOUT` | Curl connect-timeout per health probe (seconds)                    | `2` |
-| `HEALTH_TOTAL_TIMEOUT` | Curl max-time per health probe (seconds)                             | `6` |
-| `STALL_RETRIES` | Screen-hash misses tolerated before forcing a restart                    | `3` |
-| `HEALTH_RETRIES` | Consecutive failed health probes before restarting the browser             | `6` |
-| `RESTART_WINDOW` | Seconds considered when throttling excessive restarts                      | `600` |
-| `MAX_RESTARTS` | Maximum restarts allowed within `RESTART_WINDOW` before backoff            | `10` |
-| `CLEAN_RESET` | Seconds of healthy run required to reset the restart history                | `600` |
-| `DEVTOOLS_AUTO_OPEN` | `true` auto-opens Chromium DevTools for each tab (useful for debugging) | `false` |
-| `DEVTOOLS_REMOTE_PORT` | Port that Chromium’s remote debugger binds to (blank disables)        | *(unset)* |
-| `BIRDSEYE_AUTO_FILL` | `true` injects CSS to force Frigate Birdseye to fill the viewport (Chromium only) | `true` |
-| `BIRDSEYE_MATCH_PATTERN` | Override the Chrome extension match pattern (defaults to `scheme://host/*` from `URL`) | *(derived)* |
-| `BIRDSEYE_EXTENSION_DIR` | Optional override for where the helper extension is written (defaults to `<PROFILE_ROOT>/birdseye-autofill`, then `/usr/local/share/kiosk-monitor/birdseye-autofill` if needed) | *(auto)* |
+### Minimum
+| Variable   | Purpose                                                      | Default |
+| ---------- | ------------------------------------------------------------ | ------- |
+| `MODE`     | `chrome` or `vlc` for instance 1                             | `chrome` |
+| `URL`      | Target page or stream for instance 1                         | Birdseye demo URL |
+| `OUTPUT`   | Output name (e.g. `HDMI-A-1`); blank → auto                  | *(auto)* |
+| `MODE2`    | `chrome`, `vlc`, or blank to disable instance 2              | *(disabled)* |
+| `URL2`     | Target for instance 2                                        | *(empty)* |
+| `OUTPUT2`  | Output name for instance 2; blank → auto                     | *(auto)* |
+| `GUI_USER` | Desktop user; blank → auto-detect                            | *(auto)* |
 
-Apply changes with `sudo systemctl restart kiosk-monitor`.
+Run `wlr-randr` as the desktop user to list available output names.
 
-The installer also writes `/etc/kiosk-monitor/kiosk-monitor.conf.sample`; copy or diff against it when introducing new options.
-All management commands accept `--config /path/to/config.conf` if you need to operate on an alternate configuration file.
-By default the watchdog waits up to `GUI_SESSION_WAIT_TIMEOUT` seconds for the GUI user’s `loginctl` session to appear before launching, and it hashes the top-left 50% of each screenshot (`SCREEN_SAMPLE_MODE=sample`) with SHA-256 when checking for stuck frames. Switch to `SCREEN_SAMPLE_MODE=full` to hash the entire frame, and adjust `SCREEN_SAMPLE_BYTES` only if you need to tune the legacy byte-sampling fallback.
+### Mode-specific
+Chromium (`MODE=chrome`):
+- `CHROMIUM_BIN` — path override (`/usr/bin/chromium` by default on trixie).
+- `BIRDSEYE_AUTO_FILL` — `true` injects CSS to force the Frigate Birdseye grid to fill the viewport.
+- `BIRDSEYE_MATCH_PATTERN` — override the extension match pattern (defaults to `scheme://host/*` from `URL`).
+- `BIRDSEYE_EXTENSION_DIR` — custom extension dir (default: under the profile).
+- `DEVTOOLS_AUTO_OPEN`, `DEVTOOLS_REMOTE_PORT` — debugging helpers.
 
-## Runtime Behaviour
-- Logs are mirrored to stdout and `/dev/shm/kiosk.log` (override via `LOG`)
-- Additional troubleshooting: `journalctl -u kiosk-monitor -f`
-- The watchdog sanitises the active browser profile before every launch, clearing session snapshots and ensuring only one kiosk tab is opened
+VLC (`MODE=vlc`):
+- `VLC_BIN` — path override (`/usr/bin/vlc` by default).
+- `VLC_LOOP` (`true`/`false`), `VLC_NO_AUDIO` (`true`/`false`).
+- `VLC_NETWORK_CACHING` — ms of network caching (raise for flaky RTSP).
+- `VLC_EXTRA_ARGS` — free-form args appended to the VLC command line.
 
-## Manual Run / Debugging
-You can execute the watchdog manually (from the project root) to trial changes:
+### Monitoring / timing
+| Variable                | Description                                                     | Default |
+| ----------------------- | --------------------------------------------------------------- | ------- |
+| `HEALTH_INTERVAL`       | Watchdog loop interval (seconds)                                | `30` |
+| `HEALTH_CONNECT_TIMEOUT`| curl connect timeout per probe (seconds)                        | `3` |
+| `HEALTH_TOTAL_TIMEOUT`  | curl max time per probe (seconds)                               | `8` |
+| `HEALTH_RETRIES`        | Consecutive failed http probes before restart                   | `6` |
+| `STALL_RETRIES`         | Identical-frame hashes before restart (Chromium)                | `3` |
+| `VLC_STALL_RETRIES`     | Identical-frame hashes before restart (VLC)                     | `6` |
+| `SCREEN_DELAY`          | Seconds of runtime before freeze checks begin                   | `120` |
+| `SCREEN_SAMPLE_MODE`    | `sample` (top-left 50%) or `full` frame                         | `sample` |
+| `SCREEN_SAMPLE_BYTES`   | Byte-sampling fallback when image parsing fails                 | `524288` |
+| `RESTART_WINDOW`        | Seconds the restart-rate ring buffer covers                     | `600` |
+| `MAX_RESTARTS`          | Max restarts allowed within `RESTART_WINDOW` before backoff     | `10` |
+| `CLEAN_RESET`           | Healthy-run seconds that reset the restart history              | `600` |
+
+### Boot readiness
+| Variable                 | Description                                                                  | Default |
+| ------------------------ | ---------------------------------------------------------------------------- | ------- |
+| `MIN_UPTIME_BEFORE_START`| Block until system uptime ≥ N seconds                                        | `60` |
+| `GUI_SESSION_WAIT_TIMEOUT`| Max seconds to wait for a loginctl session to appear                        | `300` |
+| `WAYLAND_READY_TIMEOUT`   | Max seconds to wait for `wayland-*` socket + labwc process                  | `300` |
+| `SESSION_READY_DELAY`    | Extra seconds to pause after session is up                                   | `0` |
+| `SESSION_READY_CMD`      | Optional command to poll until it returns 0                                  | *(unset)* |
+| `SESSION_READY_TIMEOUT`  | Max seconds to wait for `SESSION_READY_CMD` (0 = forever)                    | `0` |
+| `WAIT_FOR_URL`           | `true` blocks each http/https instance until its URL responds                | `true` |
+| `WAIT_FOR_URL_TIMEOUT`   | Seconds to wait for the initial URL probe (0 = forever)                      | `0` |
+| `CHROME_LAUNCH_DELAY`    | Seconds to sleep between spawning Chromium and resolving its main PID        | `3` |
+| `CHROME_READY_DELAY`     | Seconds to sleep before looking up the main-browser PID                      | `2` |
+| `VLC_LAUNCH_DELAY`       | Seconds to sleep between spawning VLC and resolving its PID                  | `3` |
+
+### Profile / cache (Chromium)
+| Variable                 | Description                                                                    | Default |
+| ------------------------ | ------------------------------------------------------------------------------ | ------- |
+| `PROFILE_ROOT`           | Profile parent dir (each chrome instance gets its own `chromium-N` subdir)     | `~/.local/share/kiosk-monitor` |
+| `PROFILE_TMPFS`          | `true` stages profiles in RAM                                                  | `false` |
+| `PROFILE_TMPFS_PATH`     | tmpfs profile root                                                             | `/dev/shm/kiosk-monitor` |
+| `PROFILE_SYNC_BACK`      | `true` rsyncs the tmpfs profile back to disk on shutdown                       | `false` |
+| `PROFILE_TMPFS_PURGE`    | `true` wipes the tmpfs profile on shutdown                                     | `false` |
+| `PROFILE_ARCHIVE`        | Optional tar archive extracted into the profile before launch                  | *(unset)* |
+| `PROFILE_SYNC_INTERVAL`  | Seconds between background tmpfs → disk syncs (0 disables)                     | `0` |
+| `PREWARM_ENABLED`        | Pre-read browser binary/profile files into page cache before launch            | `true` |
+| `PREWARM_PATHS`          | Colon-separated extra paths to prewarm                                         | *(unset)* |
+| `PREWARM_MAX_FILES`      | Max files touched per path during prewarm                                      | `512` |
+| `PREWARM_SLICE_SIZE`     | Bytes read from each file during prewarm                                       | `262144` |
+
+## Runtime behaviour
+- Logs go to stdout and `/dev/shm/kiosk.log` (override via `LOG=...`). Follow them live with `journalctl -u kiosk-monitor -f`.
+- Each Chromium instance runs with its own `--user-data-dir`, isolating cookies/session state.
+- VLC runs with `--intf=dummy` (no UI), `--fullscreen`, and a unique `--logfile` as a process fingerprint.
+- Window placement is computed from `wlr-randr --json`: each instance launches at its output's top-left with that output's native resolution, and labwc fullscreens it to the containing monitor.
+- Freeze detection uses `grim -o <OUTPUT>` so each instance is compared only against its own monitor.
+
+## Manual run / debugging
 ```bash
-sudo LOG=/tmp/kiosk.log DEBUG=true bash kiosk-monitor.sh --debug
+sudo LOG=/tmp/kiosk.log DEBUG=true /usr/local/bin/kiosk-monitor.sh --debug
 ```
-Press `Ctrl+C` to stop; the systemd unit will relaunch it when enabled.
+Press `Ctrl+C` to stop; systemd will relaunch if the service is enabled.
 
-## Service Reference
-`/etc/systemd/system/kiosk-monitor.service`:
+## systemd unit
+`/etc/systemd/system/kiosk-monitor.service` (generated by the installer):
 ```ini
 [Unit]
-Description=Kiosk Monitor Watchdog
+Description=Kiosk Monitor Watchdog (Chromium + VLC, dual-display)
 Documentation=https://github.com/extremeshok/kiosk-monitor
 After=network-online.target graphical.target
 Wants=network-online.target
@@ -121,63 +150,37 @@ StartLimitBurst=0
 
 [Service]
 Type=simple
-User=spaceman
-Environment=GUI_USER=spaceman
-Environment=BROWSER=chromium
-Environment=DISPLAY=:2
-Environment=XDG_RUNTIME_DIR=/run/user/1000
+User=<detected desktop user>
+Environment=GUI_USER=<detected desktop user>
+Environment=XDG_RUNTIME_DIR=/run/user/<uid>
+Environment=WAYLAND_DISPLAY=wayland-0
 EnvironmentFile=-/etc/kiosk-monitor/kiosk-monitor.conf
 ExecStart=/usr/local/bin/kiosk-monitor.sh
 ExecStop=/bin/kill -s TERM $MAINPID
 Restart=always
 RestartSec=5
 SyslogIdentifier=kiosk-monitor
+StandardOutput=journal
+StandardError=journal
 SuccessExitStatus=0 130 143
 
 [Install]
 WantedBy=multi-user.target
 WantedBy=graphical.target
 ```
+Reload after any manual edit: `sudo systemctl daemon-reload`.
 
-Reload systemd after any manual edits: `sudo systemctl daemon-reload`.
+If `tailscaled.service` is enabled on the host, `--install`/`--update` automatically add `Requires=tailscaled.service` and include it in the `After=` chain.
 
-`ExecStop` sends the main watchdog process a `TERM`, and `SuccessExitStatus` tells systemd those signal-driven exits are expected (preventing unwanted restarts after `systemctl stop`). `StartLimitIntervalSec=0`/`StartLimitBurst=0` disable systemd’s default back-off so kiosk-monitor keeps retrying even if the GUI session is still coming up when the unit first starts.
+## Frigate Birdseye auto-fill
+For Chromium instances pointed at Frigate's Birdseye view, set `BIRDSEYE_AUTO_FILL=true`. The watchdog writes a minimal Chrome extension into the instance profile that injects CSS to force the grid and canvas to fill the viewport. Tune the selectors in `<PROFILE_ROOT>/chromium-<id>/birdseye-autofill/fullscreen.css` and re-run `--update` if you need a different layout.
 
-The unit is tied to both `multi-user.target` and `graphical.target`, so it comes up automatically whether the system boots into a text console or a graphical desktop (no extra symlink juggling on different Pi images).
-
-Adjust the `User` and `Environment` lines to match the user that owns your kiosk session (for example, `pi`).
-
-When `PROFILE_TMPFS=true`, the value of `PROFILE_ROOT` is treated as the persistent on-disk copy that seeds the tmpfs runtime directory.
-
-If the host already has `tailscaled.service` enabled, `kiosk-monitor.sh --install/--update` automatically adds `Requires=tailscaled.service` and includes it in the `After=` chain so kiosk-monitor waits for the Tailscale tunnel before starting the browser.
-
-### Faster Launch Tips (Pi-class hardware)
-- **Run the profile from RAM:** set `PROFILE_TMPFS=true` and optionally `PROFILE_SYNC_BACK=true` to rsync changes back to disk on exit. The default tmpfs path is `/dev/shm/kiosk-monitor`; customise with `PROFILE_TMPFS_PATH` if needed.
-- **Keep the seed warm:** combine `PROFILE_SYNC_BACK=true` with `PROFILE_SYNC_INTERVAL=900` (for example) so the tmpfs profile is mirrored back to persistent storage every 15 minutes.
-- **Seed from a tarball:** build a tuned profile once (for example, `tar -cf /var/lib/kiosk-monitor/profile.tar .config/chromium/Default`) and point `PROFILE_ARCHIVE` to it. Extraction into tmpfs is much quicker than replaying thousands of tiny file operations.
-- **Pre-warm on boot:** leave `PREWARM_ENABLED=true` (and optionally extend `PREWARM_PATHS`) so the watchdog touches the browser binary/profile before launch, reducing SD-card cold start times.
-- **Defer the first launch:** set `SESSION_READY_DELAY=15` (and/or a `SESSION_READY_CMD`) to give the desktop stack a chance to finish initialising before the kiosk browser starts.
-- **Skip the initial URL wait:** if the dashboard is occasionally slow, set `WAIT_FOR_URL=false` so Chromium begins loading immediately while the watchdog continues health checks in the background.
-- **Trim the delays:** reduce `CHROME_LAUNCH_DELAY` / `CHROME_READY_DELAY` after observing a few boots; the defaults favour stability on slower SD cards.
-
-### Frigate Birdseye Auto-Fill
-If the Frigate Birdseye UI keeps the `.react-resizable` grid squashed until you drag the handle, set `BIRDSEYE_AUTO_FILL=true` in `/etc/kiosk-monitor/kiosk-monitor.conf`.
-When enabled (Chromium only), kiosk-monitor installs a minimal Chrome extension inside the kiosk profile (`<PROFILE_ROOT>/birdseye-autofill` by default, falling back to `/usr/local/share/kiosk-monitor/birdseye-autofill` if necessary, or a custom `BIRDSEYE_EXTENSION_DIR` when supplied) that injects CSS to force the grid to occupy the full viewport and hides the resize handle.
-You can adjust which pages receive the CSS by setting `BIRDSEYE_MATCH_PATTERN` (falls back to `scheme://host/*` based on your `URL`).
-
-The default stylesheet also hard-codes the Birdseye grid and canvas heights to `1000px` while capping the width at `1800px` so the Pi display renders predictably. Tweak those values (or remove them entirely) by editing `<PROFILE_ROOT>/birdseye-autofill/fullscreen.css` and re-running `kiosk-monitor.sh --update` if you need a different layout.
-
-
-### Example of freeze detection
-
+## Example: freeze detection in action
 ```
-Nov 12 01:34:05 pi4 kiosk-monitor[17214]: Waiting for http://192.168.3.222:30059/?Birdseye …
-Nov 12 01:34:05 pi4 kiosk-monitor[17214]: Target http://192.168.3.222:30059/?Birdseye is reachable at Wed Nov 12 01:34:05 AM 2025 — continuing.
-Nov 12 01:34:55 pi4 kiosk-monitor[17214]: Chromium main PID is 17258 (launcher 17256)
-Nov 12 01:44:31 pi4 kiosk-monitor[17214]: Screen unchanged for 1/3 cycles at Wed Nov 12 01:44:31 AM 2025
-Nov 12 01:45:01 pi4 kiosk-monitor[17214]: Screen unchanged for 2/3 cycles at Wed Nov 12 01:45:01 AM 2025
-Nov 12 01:45:32 pi4 kiosk-monitor[17214]: Screen unchanged for 3/3 cycles at Wed Nov 12 01:45:32 AM 2025
-Nov 12 01:45:32 pi4 kiosk-monitor[17214]: Screen appears frozen — restarting Chromium...
-Nov 12 01:45:32 pi4 kiosk-monitor[17214]: Stopping Chromium PID 17258…
-Nov 12 01:46:22 pi4 kiosk-monitor[17214]: Chromium main PID is 17793 (launcher 17791)
+2026-04-21 13:24:12 [1 chrome@HDMI-A-1] Launching Chromium on HDMI-A-1 (1920x1080+0+0) → http://192.168.3.222:30059/?Birdseye
+2026-04-21 13:24:55 [1 chrome@HDMI-A-1] Chromium main PID=17258
+2026-04-21 13:34:31 [1 chrome@HDMI-A-1] screen unchanged 1/3
+2026-04-21 13:35:01 [1 chrome@HDMI-A-1] screen unchanged 2/3
+2026-04-21 13:35:32 [1 chrome@HDMI-A-1] screen unchanged 3/3
+2026-04-21 13:35:32 [1 chrome@HDMI-A-1] screen appears frozen — restarting
 ```
