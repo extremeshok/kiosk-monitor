@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 6.5.0
+# kiosk-monitor.sh :: version 6.6.0
 # ======================================================================
 # Kiosk watchdog for Raspberry Pi OS trixie 64-bit (or newer Debian/RPi).
 # Supports Chromium fullscreen kiosk and VLC fullscreen video playback,
@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.5.0"
+SCRIPT_VERSION="6.6.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 
 # ------------------------------------------------------------------
@@ -293,6 +293,7 @@ declare -A INSTANCE_PAUSED=()
 declare -A INSTANCE_FORCE_RESOLUTION=()
 declare -A INSTANCE_FORCE_ROTATION=()
 declare -A INSTANCE_CLASS=()
+declare -A INSTANCE_ON_WAITING_PAGE=()
 INSTANCES=()
 
 # ======================================================================
@@ -1193,7 +1194,7 @@ write_waiting_page() {
 </head>
 <body>
   <main class="card">
-    <h1>Waiting for kiosk target</h1>
+    <h1>Waiting for target</h1>
     <div class="muted">kiosk-monitor will load it here as soon as it responds.</div>
     <div class="url">${esc_html}</div>
     <div class="spinner"></div>
@@ -1300,10 +1301,12 @@ launch_chrome_instance() {
   # never shows a bare error page and operators see something useful on
   # the display while the upstream is coming up.
   local launch_url="$url"
+  INSTANCE_ON_WAITING_PAGE[$id]="no"
   case "$url" in
     http://*|https://*)
       if ! health_check_instance "$id" >/dev/null 2>&1; then
         launch_url=$(write_waiting_page "$id")
+        INSTANCE_ON_WAITING_PAGE[$id]="yes"
         log_instance "$id" "Target not reachable yet — launching with waiting page, JS will redirect when $url responds."
       fi
       ;;
@@ -1625,6 +1628,7 @@ setup_instances() {
     INSTANCE_LAST_GOOD[$id]=$(date +%s)
     INSTANCE_RESTART_LOG[$id]=""
     INSTANCE_PAUSED[$id]="no"
+    INSTANCE_ON_WAITING_PAGE[$id]="no"
     # Window identifier used by launch flags and labwc window rules
     INSTANCE_CLASS[$id]="kiosk-monitor-${INSTANCE_MODE[$id]}-$id"
     case "${INSTANCE_MODE[$id]}" in
@@ -1986,6 +1990,11 @@ EnvironmentFile=-$CONFIG_FILE
 ExecStart=$INSTALL_DIR/kiosk-monitor --run
 ExecStop=/bin/kill -s TERM \$MAINPID
 ExecReload=/bin/kill -s HUP \$MAINPID
+# On cold boot we may spend minutes waiting for the desktop/URL — don't
+# let systemd kill us mid-wait. And every non-zero exit (including our
+# own 1s when the desktop never appears) must retry forever.
+TimeoutStartSec=infinity
+TimeoutStopSec=30
 Restart=always
 RestartSec=5
 SyslogIdentifier=kiosk-monitor
@@ -3419,21 +3428,38 @@ while true; do
 
     # 3. health check (http only)
     if health_check_instance "$id"; then
+      if [ "${INSTANCE_ON_WAITING_PAGE[$id]:-no}" = "yes" ]; then
+        log_instance "$id" "target ${INSTANCE_URL[$id]} now reachable — waiting page will redirect"
+        INSTANCE_ON_WAITING_PAGE[$id]="no"
+      fi
       INSTANCE_FAIL_COUNT[$id]=0
       INSTANCE_LAST_GOOD[$id]=$now
     else
-      case "${INSTANCE_URL[$id]}" in
-        http://*|https://*)
-          INSTANCE_FAIL_COUNT[$id]=$((INSTANCE_FAIL_COUNT[$id] + 1))
-          log_instance "$id" "health failed ${INSTANCE_FAIL_COUNT[$id]}/${HEALTH_RETRIES}"
-          ;;
-      esac
+      # If Chromium is currently showing the waiting page, the browser
+      # handles the retry loop — don't pile up health failures that would
+      # just restart Chromium into the same waiting state.
+      if [ "${INSTANCE_ON_WAITING_PAGE[$id]:-no}" = "yes" ]; then
+        debug_instance "$id" "URL still unreachable; waiting page is in charge"
+      else
+        case "${INSTANCE_URL[$id]}" in
+          http://*|https://*)
+            INSTANCE_FAIL_COUNT[$id]=$((INSTANCE_FAIL_COUNT[$id] + 1))
+            log_instance "$id" "health failed ${INSTANCE_FAIL_COUNT[$id]}/${HEALTH_RETRIES}"
+            ;;
+        esac
+      fi
     fi
 
     # 4. freeze / stall detection via per-output hash
+    # Skip while on the waiting page — it's intentionally static (mostly
+    # dark with a tiny centred spinner), so any frame-hash that misses the
+    # spinner looks "stuck" and would restart Chromium forever.
     proc_age=$(ps -p "$pid" -o etimes= --no-headers 2>/dev/null | tr -d ' ' || echo 0)
     [[ "$proc_age" =~ ^[0-9]+$ ]] || proc_age=0
-    if [ "$proc_age" -ge "$SCREEN_DELAY" ]; then
+    if [ "${INSTANCE_ON_WAITING_PAGE[$id]:-no}" = "yes" ]; then
+      INSTANCE_STALL_COUNT[$id]=0
+      INSTANCE_LAST_HASH[$id]=""
+    elif [ "$proc_age" -ge "$SCREEN_DELAY" ]; then
       curr_hash=$(capture_output_hash "$id" || true)
       if [ -n "$curr_hash" ]; then
         if [ -n "${INSTANCE_LAST_HASH[$id]}" ] && [ "$curr_hash" = "${INSTANCE_LAST_HASH[$id]}" ]; then

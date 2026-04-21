@@ -24,6 +24,11 @@ EnvironmentFile=-/etc/kiosk-monitor/kiosk-monitor.conf
 ExecStart=/usr/local/bin/kiosk-monitor --run
 ExecStop=/bin/kill -s TERM $MAINPID
 ExecReload=/bin/kill -s HUP $MAINPID
+# On cold boot we may spend minutes waiting for the desktop/URL — don't
+# let systemd kill us mid-wait. And every non-zero exit (including our
+# own 1s when the desktop never appears) must retry forever.
+TimeoutStartSec=infinity
+TimeoutStopSec=30
 Restart=always
 RestartSec=5
 SyslogIdentifier=kiosk-monitor
