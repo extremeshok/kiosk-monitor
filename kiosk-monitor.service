@@ -9,7 +9,7 @@
 [Unit]
 Description=Kiosk Monitor Watchdog (Chromium + VLC, dual-display)
 Documentation=https://github.com/extremeshok/kiosk-monitor
-After=network-online.target graphical.target
+After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
 StartLimitBurst=0

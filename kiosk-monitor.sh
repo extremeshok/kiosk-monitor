@@ -1959,7 +1959,15 @@ start_profile_sync_timer() {
 # ======================================================================
 write_service_unit() {
   local gui_user=$1 runtime_dir=$2 wayland_display=$3 target_path=${4:-$SERVICE_PATH} dependency=${5:-}
-  local after_targets="network-online.target graphical.target"
+  # NOTE: do NOT put graphical.target here. WantedBy=multi-user.target (in
+  # [Install]) implicitly sets Before=multi-user.target, and graphical.target
+  # is itself After=multi-user.target — the two together form a cycle
+  # (kiosk-monitor.service Before multi-user.target AND After graphical.target
+  # which is After multi-user.target). systemd breaks the cycle at boot by
+  # deleting our start job, so the service never auto-starts on reboot.
+  # The script's own wait_for_display_ready handles "desktop not ready yet"
+  # at runtime, so we don't need the ordering dependency.
+  local after_targets="network-online.target"
   [ -n "$dependency" ] && after_targets="$after_targets $dependency"
   local tmp
   tmp=$(mktemp)
