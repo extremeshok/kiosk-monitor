@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.6.0"
+SCRIPT_VERSION="6.7.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -1331,6 +1331,7 @@ launch_chrome_instance() {
   [ -z "$main_pid" ] && main_pid="$launcher_pid"
   INSTANCE_PID[$id]="$main_pid"
   log_instance "$id" "Chromium main PID=$main_pid (launcher=$launcher_pid)"
+  route_window_to_output_x11 "$id"
   return 0
 }
 
@@ -1402,6 +1403,7 @@ launch_vlc_instance() {
   [ -z "$pid" ] && pid="$launcher_pid"
   INSTANCE_PID[$id]="$pid"
   log_instance "$id" "VLC PID=$pid (launcher=$launcher_pid)"
+  route_window_to_output_x11 "$id"
   return 0
 }
 
@@ -1490,8 +1492,9 @@ capture_output_hash() {
   tmp=$(mktemp 2>/dev/null) || return 1
   if [ "${SESSION_TYPE:-}" = "x11" ]; then
     # xwd captures the whole root; per-output capture would need scrot/maim
-    # with geometry. For now, hash the full root — works on single-display
-    # X11 setups and gracefully degrades on multi-display.
+    # with geometry. For now, hash the full root — this works for dual-display
+    # X11 too, but any motion on either screen keeps the freeze counter at 0,
+    # so a freeze on one display is only detected when the other is also static.
     if ! as_gui xwd -silent -root -display "$DISPLAY" >"$tmp" 2>/dev/null; then
       debug_instance "$id" "xwd capture failed (DISPLAY=$DISPLAY)"
       rm -f "$tmp"; return 1
@@ -1817,6 +1820,105 @@ ensure_labwc_window_rules() {
   else
     log "labwc window rules written to $rc (could not SIGHUP labwc)."
   fi
+}
+
+route_window_to_output_x11() {
+  # Nudge an instance's window onto its configured X11 output. Called twice:
+  #  - once at launch (long wait, window may not exist yet)
+  #  - periodically from the main loop (short wait; handles the VLC --loop
+  #    case where an RTSP failure makes VLC destroy and recreate its video
+  #    window, which re-lands on the primary monitor at (0,0))
+  #
+  # Needed because VLC's --video-x / --video-y (and, to a lesser extent,
+  # Chromium's --window-position) are honoured for window creation but
+  # overridden by the _NET_WM_STATE_FULLSCREEN request the client sends
+  # at startup: EWMH window managers (openbox, metacity, mutter, kwin)
+  # fullscreen to the monitor the window is *currently* on at request time,
+  # which on a multi-head X root is almost always the primary output. The
+  # result: set OUTPUT=HDMI-1 / OUTPUT2=HDMI-2 and both kiosk windows pile
+  # up on HDMI-1 while HDMI-2 shows the bare desktop.
+  #
+  # Fix: drop the fullscreen state, move+resize the window into the target
+  # output's rectangle, then re-add fullscreen. The WM fullscreens on the
+  # monitor containing the new window origin. Verified on openbox 3.6
+  # (Raspberry Pi OS trixie rpd-x session); this is also how wmctrl's own
+  # README recommends multi-head placement.
+  #
+  # Idempotent: if the window's current X is already inside the target
+  # output's horizontal range, returns 0 silently without touching the WM.
+  # Cheap to call every health-check tick.
+  local id=$1
+  local wait_secs="${2:-20}"
+  [ "${SESSION_TYPE:-}" = "x11" ] || return 0
+  [ -n "${INSTANCE_OUTPUT[$id]:-}" ] || return 0
+  if ! command -v wmctrl >/dev/null 2>&1; then
+    debug_instance "$id" "wmctrl not installed; skipping X11 window routing"
+    return 0
+  fi
+  local geo out x y w h
+  geo=$(resolve_output_geometry "$id" || true)
+  IFS=$'\t' read -r out x y w h <<< "$geo"
+  [ -n "${x:-}" ] && [ -n "${w:-}" ] || return 0
+  local cls="${INSTANCE_CLASS[$id]}"
+  local mode="${INSTANCE_MODE[$id]}"
+
+  # Wait for the window to appear. VLC sets _NET_WM_NAME via --video-title
+  # (WM_CLASS stays "vlc"/"Vlc"); Chromium sets WM_CLASS instance/class via
+  # --class=NAME. `wmctrl -l` matches by title, `wmctrl -lx` matches by
+  # WM_CLASS in instance.class form.
+  local deadline=$(( $(date +%s) + wait_secs ))
+  local match=""
+  while [ "$(date +%s)" -le "$deadline" ]; do
+    if [ "$mode" = "vlc" ]; then
+      if as_gui wmctrl -l 2>/dev/null | awk -v t="$cls" 'index($0,t){found=1} END{exit !found}'; then
+        match="title"; break
+      fi
+    else
+      if as_gui wmctrl -lx 2>/dev/null | awk -v t="$cls" 'index($3,t) || index($0,t){found=1} END{exit !found}'; then
+        match="class"; break
+      fi
+    fi
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep 0.5
+  done
+  if [ -z "$match" ]; then
+    [ "$wait_secs" -ge 10 ] && debug_instance "$id" "wmctrl: window for '$cls' did not appear within ${wait_secs}s"
+    return 0
+  fi
+
+  # Idempotency check: if the window is already anchored inside the target
+  # output's horizontal range (and at a reasonable y), don't disturb it.
+  # Saves 400 ms of wmctrl chatter per health tick when placement is stable.
+  local cur_line cur_x cur_y
+  if [ "$match" = "class" ]; then
+    cur_line=$(as_gui wmctrl -lxG 2>/dev/null | awk -v t="$cls" '($3 ~ t) || index($0,t){print; exit}')
+  else
+    cur_line=$(as_gui wmctrl -lG 2>/dev/null | awk -v t="$cls" 'index($0,t){print; exit}')
+  fi
+  if [ -n "$cur_line" ]; then
+    cur_x=$(awk '{print $3}' <<< "$cur_line")
+    cur_y=$(awk '{print $4}' <<< "$cur_line")
+    if [[ "$cur_x" =~ ^-?[0-9]+$ ]] && [[ "$cur_y" =~ ^-?[0-9]+$ ]]; then
+      if [ "$cur_x" -ge "$x" ] && [ "$cur_x" -lt "$((x + w))" ] \
+         && [ "$cur_y" -ge "$((y - 8))" ] && [ "$cur_y" -lt "$((y + h))" ]; then
+        return 0
+      fi
+    fi
+  fi
+
+  local -a wargs=( -r "$cls" )
+  [ "$match" = "class" ] && wargs=( -r "$cls" -x )
+
+  # The move/resize is no-op while the window is fullscreen, so drop that
+  # state first. 200 ms between steps lets openbox process each EWMH
+  # ClientMessage before the next arrives.
+  as_gui wmctrl "${wargs[@]}" -b remove,fullscreen 2>/dev/null || true
+  sleep 0.2
+  as_gui wmctrl "${wargs[@]}" -e "0,${x},${y},${w},${h}" 2>/dev/null || true
+  sleep 0.2
+  as_gui wmctrl "${wargs[@]}" -b add,fullscreen 2>/dev/null || true
+  log_instance "$id" "Routed window to $out (${w}x${h}+${x}+${y}) via wmctrl (match=$match)"
+  return 0
 }
 
 apply_display_overrides() {
@@ -2228,6 +2330,7 @@ ensure_apt_dependencies() {
     [xwd]=x11-apps
     [xset]=x11-xserver-utils
     [xrandr]=x11-xserver-utils
+    [wmctrl]=wmctrl
   )
 
   # chromium / vlc: any of several commands satisfies the dep; install
@@ -2757,7 +2860,7 @@ _tui_edit_instance2() {
       "toggle" "Enable / disable instance 2 — $enabled_label" \
       "edit"   "Edit mode / URL / output / resolution / rotation" \
       "back"   "Return to the main menu" \
-      "help"   "About dual-display (experimental)") || return 0
+      "help"   "About dual-display") || return 0
     case "$choice" in
       toggle)
         if [ -n "$TUI_MODE2" ]; then
@@ -2774,12 +2877,28 @@ _tui_edit_instance2() {
         fi
         _tui_edit_instance 2 TUI_MODE2 TUI_URL2 TUI_OUTPUT2 TUI_RES2 TUI_ROT2 ;;
       help)
-        whiptail --title "Instance 2 (experimental)" --scrolltext --msgbox \
-"Running two instances side-by-side on a Pi is supported for Chromium
-but VLC routing on Wayland is still flaky. labwc window rules are
-auto-generated in ~/.config/labwc/rc.xml to route each window to its
-configured output. Single-instance setups (Instance 2 disabled) leave
-the compositor config untouched." 16 70 ;;
+        whiptail --title "Instance 2" --scrolltext --msgbox \
+"Dual-display is tested end-to-end on X11 (Chromium on one HDMI and
+VLC RTSP on the other, both kiosk-fullscreen, both supervised
+independently).
+
+On X11 each instance is routed after launch, and re-verified on
+every health-check tick, using wmctrl: the fullscreen state is
+dropped, the window is moved into the target output rectangle,
+then fullscreen is re-added. This works around EWMH window
+managers (openbox, mutter, kwin) that fullscreen to the monitor
+the window is currently on at request time, which on a cold boot
+is always the primary output, and catches VLC's --loop behaviour
+of recreating the video window on every RTSP reconnect.
+
+On Wayland the script writes labwc window rules to
+~/.config/labwc/rc.xml to route Chromium (matched by --class) to the
+requested output — this is reliable. VLC on Wayland is routed by
+title= match and depends on the compositor honouring it; it is
+best-effort on labwc.
+
+Single-instance setups (Instance 2 disabled) leave the compositor
+config untouched." 24 72 ;;
       back) return 0 ;;
     esac
   done
@@ -3433,6 +3552,14 @@ while true; do
       fi
       # (we don't force-prune here; --user-data-dir ensures uniqueness per instance)
     fi
+
+    # 2.5. X11: reassert window placement. VLC --loop recreates its video
+    #      window on every RTSP reconnect and drops it back at (0,0) on the
+    #      primary output; Chromium occasionally does the same after a
+    #      renderer crash. The route helper is idempotent — it no-ops when
+    #      the window is already inside the target output's rectangle, so
+    #      calling it every tick is cheap when placement is stable.
+    route_window_to_output_x11 "$id" 1 || true
 
     # 3. health check (http only)
     if health_check_instance "$id"; then

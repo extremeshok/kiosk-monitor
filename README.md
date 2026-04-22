@@ -5,7 +5,7 @@ Watchdog for kiosk-style displays. Launches Chromium in fullscreen kiosk mode **
 ## Features
 - **Two launch modes** per instance: `chrome` (fullscreen Chromium) or `vlc` (fullscreen video player).
 - **Works on Wayland or X11** — detects labwc/wayfire/sway/… or an X11 DISPLAY and picks the right capture + output tooling automatically.
-- **Dual-display** support (**experimental**) — Chromium can be routed to specific outputs via a generated labwc window rule; VLC routing is unreliable because its Wayland window identity isn't easily matched. Single-instance (one display) is the supported configuration today.
+- **Dual-display** support — tested end-to-end on X11 (Chromium on one HDMI + VLC RTSP on the other, both kiosk-fullscreen, both supervised independently). On X11 each instance is routed to its configured output after launch **and on every health-check tick** via `wmctrl` (drop fullscreen → move/resize to target rect → re-add fullscreen). The periodic re-check catches VLC's `--loop` behaviour of destroying and recreating its video window on every RTSP reconnect (which re-lands on the primary output); the check is idempotent so it's a silent no-op when placement is stable. On Wayland the script writes an auto-generated labwc window rule instead; Chromium routing (`identifier=` class match) is reliable, VLC routing (`title=` match) is best-effort on labwc.
 - **"Waiting for target" page** — when the configured kiosk URL isn't reachable at startup, Chromium launches a local HTML page that shows the target, a spinner, and the retry count; its JS polls the URL and auto-navigates once it responds. No more silent blank screens.
 - **Per-output freeze detection** using `grim` (Wayland) or `xwd` (X11): each instance is checked against its own monitor so a hang on one display never restarts the other.
 - **URL health checks** for http/https targets, independent per instance.
@@ -159,7 +159,7 @@ VLC (`MODE=vlc`):
 - Each Chromium instance runs with its own `--user-data-dir`, isolating cookies/session state. Chromium is launched with `--ozone-platform=wayland` on Wayland and `--ozone-platform=x11` on X11.
 - VLC runs with `--intf=dummy` (no UI), `--fullscreen`, and a unique `--logfile` as a process fingerprint.
 - Window placement is computed from `wlr-randr --json` on Wayland or `xrandr --query` on X11: each instance launches at its output's top-left with that output's native resolution, and the compositor fullscreens it to the containing monitor.
-- Freeze detection uses `grim -o <OUTPUT>` on Wayland or `xwd -root` on X11; on Wayland each instance is compared against its own monitor, on X11 against the whole root (single-display setups).
+- Freeze detection uses `grim -o <OUTPUT>` on Wayland or `xwd -root` on X11. Wayland compares each instance against its own monitor, so a freeze on one display never restarts the other. X11 currently hashes the whole root, so any motion on either screen keeps the freeze counter at 0 — dual-display X11 works but gives less isolation than dual-display Wayland.
 - Sending `SIGHUP` (via `sudo systemctl reload kiosk-monitor`) re-reads the config file, stops all instances, and relaunches. Editing the config file directly and reloading is always an option.
 
 ## Waiting page
@@ -193,7 +193,7 @@ Press `Ctrl+C` to stop; systemd will relaunch if the service is enabled.
 [Unit]
 Description=Kiosk Monitor Watchdog (Chromium + VLC, dual-display)
 Documentation=https://github.com/extremeshok/kiosk-monitor
-After=network-online.target graphical.target
+After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
 StartLimitBurst=0
