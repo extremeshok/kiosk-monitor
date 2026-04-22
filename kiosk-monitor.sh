@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.7.0"
+SCRIPT_VERSION="6.8.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -2667,16 +2667,56 @@ _wt_run() {
   return $rc
 }
 
+_wt_term_cols() {
+  # Terminal columns with sensible fallback; `stty` is the most reliable
+  # source inside whiptail contexts where `tput cols` can return 0.
+  local c=""
+  c=$(stty size 2>/dev/null | awk '{print $2}')
+  [ -z "$c" ] && c=$(tput cols 2>/dev/null || true)
+  [ -z "$c" ] && c="${COLUMNS:-80}"
+  [ "$c" -lt 40 ] 2>/dev/null && c=80
+  printf '%d\n' "$c"
+}
+
+_wt_fit_menu_width() {
+  # args: requested_width tag1 desc1 [tag2 desc2 ...]
+  # Returns the caller's hint widened to fit the longest tag+description,
+  # clamped to the terminal. Prevents truncation when a label (e.g. a URL)
+  # exceeds the caller's chosen width.
+  local requested=$1; shift
+  local max_term; max_term=$(( $(_wt_term_cols) - 4 ))
+  local max_tag=0 max_desc=0 tag desc
+  while [ "$#" -gt 1 ]; do
+    tag=$1 desc=$2; shift 2
+    [ "${#tag}"  -gt "$max_tag"  ] && max_tag=${#tag}
+    [ "${#desc}" -gt "$max_desc" ] && max_desc=${#desc}
+  done
+  # whiptail menu layout: tag column (max_tag + 2) + description + borders/padding (~10)
+  local needed=$(( max_tag + max_desc + 12 ))
+  local width=$requested
+  [ "$needed" -gt "$width"   ] && width=$needed
+  [ "$width"  -gt "$max_term" ] && width=$max_term
+  [ "$width"  -lt 60          ] && width=60
+  printf '%d\n' "$width"
+}
+
 _wt_menu() {
   # title, prompt, height, width, list-height, then tag/description pairs
   local title=$1 prompt=$2 h=$3 w=$4 lh=$5
   shift 5
+  w=$(_wt_fit_menu_width "$w" "$@")
   _wt_run whiptail --title "$title" --menu "$prompt" "$h" "$w" "$lh" "$@"
 }
 
 _wt_input() {
   local title=$1 prompt=$2 default=$3
-  _wt_run whiptail --title "$title" --inputbox "$prompt" 10 78 "$default"
+  local w=78
+  local max_term; max_term=$(( $(_wt_term_cols) - 4 ))
+  local needed=$(( ${#default} + 8 ))
+  [ "$needed" -gt "$w"        ] && w=$needed
+  [ "$w"      -gt "$max_term" ] && w=$max_term
+  [ "$w"      -lt 60          ] && w=60
+  _wt_run whiptail --title "$title" --inputbox "$prompt" 10 "$w" "$default"
 }
 
 _wt_yesno() {
@@ -2878,9 +2918,15 @@ _tui_edit_instance2() {
         _tui_edit_instance 2 TUI_MODE2 TUI_URL2 TUI_OUTPUT2 TUI_RES2 TUI_ROT2 ;;
       help)
         whiptail --title "Instance 2" --scrolltext --msgbox \
-"Dual-display is tested end-to-end on X11 (Chromium on one HDMI and
-VLC RTSP on the other, both kiosk-fullscreen, both supervised
-independently).
+"Dual-display is tested end-to-end on both Wayland (labwc) and X11
+(Chromium on one HDMI and VLC RTSP on the other, both
+kiosk-fullscreen, both supervised independently).
+
+On Wayland the script writes labwc window rules to
+~/.config/labwc/rc.xml that route each instance to the requested
+output via MoveToOutput: Chromium is matched by --class
+(identifier=) and VLC by --video-title (title=). Both route
+reliably on labwc.
 
 On X11 each instance is routed after launch, and re-verified on
 every health-check tick, using wmctrl: the fullscreen state is
@@ -2890,12 +2936,6 @@ managers (openbox, mutter, kwin) that fullscreen to the monitor
 the window is currently on at request time, which on a cold boot
 is always the primary output, and catches VLC's --loop behaviour
 of recreating the video window on every RTSP reconnect.
-
-On Wayland the script writes labwc window rules to
-~/.config/labwc/rc.xml to route Chromium (matched by --class) to the
-requested output — this is reliable. VLC on Wayland is routed by
-title= match and depends on the compositor honouring it; it is
-best-effort on labwc.
 
 Single-instance setups (Instance 2 disabled) leave the compositor
 config untouched." 24 72 ;;
@@ -3062,6 +3102,159 @@ _tui_write_all() {
   TUI_DIRTY="no"
 }
 
+_tui_service_installed() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  [ -f "$SERVICE_PATH" ] || return 1
+  systemctl list-unit-files --no-legend 2>/dev/null \
+    | awk '{print $1}' | grep -qx 'kiosk-monitor.service'
+}
+
+_tui_service_state_label() {
+  # Short label like "installed, enabled, running" for menu display.
+  if ! _tui_service_installed; then
+    printf 'not installed\n'; return 0
+  fi
+  local parts="installed"
+  if systemctl is-enabled --quiet kiosk-monitor.service 2>/dev/null; then
+    parts="$parts, enabled at boot"
+  else
+    parts="$parts, disabled at boot"
+  fi
+  if systemctl is-active --quiet kiosk-monitor.service 2>/dev/null; then
+    parts="$parts, running"
+  else
+    parts="$parts, stopped"
+  fi
+  printf '%s\n' "$parts"
+}
+
+_tui_service_install_unit() {
+  # Write + daemon-reload the unit file. Uses the TUI's GUI_USER for User=.
+  local gui="${TUI_GUI_USER:-${GUI_USER:-}}"
+  if [ -z "$gui" ] || [ "$gui" = "root" ]; then
+    auto_detect_gui_user 2>/dev/null || true
+    gui="${GUI_USER:-}"
+  fi
+  if [ -z "$gui" ] || [ "$gui" = "root" ]; then
+    whiptail --title "Install service" --msgbox \
+"Could not detect a desktop user.
+Set GUI_USER under 'timing' / config first (or run
+'sudo kiosk-monitor --install --gui-user NAME' from a terminal)." 12 70
+    return 1
+  fi
+  local uid; uid=$(id -u "$gui" 2>/dev/null || echo "")
+  if [ -z "$uid" ]; then
+    whiptail --title "Install service" --msgbox \
+"User '$gui' does not exist on this system." 10 60
+    return 1
+  fi
+  local runtime_dir="/run/user/$uid" wayland_display="" sock
+  for sock in "$runtime_dir"/wayland-*; do
+    [ -S "$sock" ] || continue
+    case "$sock" in *.lock) continue ;; esac
+    wayland_display=$(basename "$sock"); break
+  done
+  [ -z "$wayland_display" ] && wayland_display="wayland-0"
+  local dep=""; dep=$(tailscaled_dependency_unit 2>/dev/null || true)
+  write_service_unit "$gui" "$runtime_dir" "$wayland_display" "$SERVICE_PATH" "$dep"
+  systemctl daemon-reload
+  return 0
+}
+
+_tui_service_menu() {
+  while true; do
+    local label; label=$(_tui_service_state_label)
+    local choice
+    choice=$(_wt_menu "Service" "kiosk-monitor systemd service — $label" 17 78 9 \
+      "status"   "Show detailed service status" \
+      "install"  "Install + enable at boot + start now" \
+      "enable"   "Enable at boot (no start)" \
+      "disable"  "Disable at boot (leaves it running if started)" \
+      "start"    "Start the service now" \
+      "stop"     "Stop the service now" \
+      "restart"  "Restart now (apply current config)" \
+      "logs"     "Show last 40 log lines" \
+      "back"     "Return to the main menu") || return 0
+    case "$choice" in
+      status)
+        local out
+        if _tui_service_installed; then
+          out=$(systemctl status kiosk-monitor.service --no-pager --lines=0 2>&1 | head -12)
+        else
+          out="kiosk-monitor.service is not installed.
+Use 'install' above to create the systemd unit and enable auto-start on boot."
+        fi
+        whiptail --title "Service status" --scrolltext --msgbox "$out" 20 78 ;;
+      install)
+        _wt_yesno "Install service" \
+"Write /etc/systemd/system/kiosk-monitor.service, enable it on boot,
+and start it now. This is the same as running --install from the CLI.
+Proceed?" || continue
+        if _tui_service_install_unit; then
+          systemctl enable --now kiosk-monitor.service 2>&1
+          whiptail --title "Installed" --msgbox \
+"Service installed, enabled at boot, and started." 10 70
+        fi ;;
+      enable)
+        _tui_service_installed || { _tui_service_install_unit || continue; }
+        systemctl enable kiosk-monitor.service >/dev/null 2>&1
+        whiptail --title "Enabled" --msgbox "Service will start automatically on boot." 10 70 ;;
+      disable)
+        _tui_service_installed || { whiptail --title "Not installed" --msgbox "Nothing to disable." 10 50; continue; }
+        systemctl disable kiosk-monitor.service >/dev/null 2>&1
+        whiptail --title "Disabled" --msgbox "Service will no longer auto-start on boot." 10 70 ;;
+      start)
+        _tui_service_installed || { _tui_service_install_unit || continue; }
+        systemctl start kiosk-monitor.service 2>&1
+        whiptail --title "Started" --msgbox "Service started." 10 50 ;;
+      stop)
+        _tui_service_installed || { whiptail --title "Not installed" --msgbox "Nothing to stop." 10 50; continue; }
+        systemctl stop kiosk-monitor.service 2>&1
+        whiptail --title "Stopped" --msgbox "Service stopped." 10 50 ;;
+      restart)
+        _tui_service_installed || { _tui_service_install_unit || continue; }
+        systemctl restart kiosk-monitor.service 2>&1
+        whiptail --title "Restarted" --msgbox "Service restarted (current config applied)." 10 60 ;;
+      logs)
+        local logs
+        logs=$(journalctl -u kiosk-monitor.service --no-pager -n 40 2>&1 || echo "journalctl unavailable")
+        whiptail --title "Last 40 log lines" --scrolltext --msgbox "$logs" 24 100 ;;
+      back) return 0 ;;
+    esac
+  done
+}
+
+_tui_apply_now() {
+  # Save (if dirty) + restart the service. Stay in the TUI.
+  if [ "$TUI_DIRTY" = "yes" ]; then
+    _tui_write_all
+  fi
+  if ! _tui_service_installed; then
+    if _wt_yesno "Install service" \
+"kiosk-monitor is not yet installed as a systemd service.
+Install it now (enable at boot + start)?"; then
+      _tui_service_install_unit || return 0
+      systemctl enable --now kiosk-monitor.service 2>&1
+      whiptail --title "Installed" --msgbox \
+"Service installed, enabled at boot, and running with the new config." 10 70
+      return 0
+    fi
+    whiptail --title "Saved" --msgbox \
+"Configuration saved to $CONFIG_FILE.
+The service is not installed, so nothing was (re)started." 11 70
+    return 0
+  fi
+  if systemctl is-active --quiet kiosk-monitor.service; then
+    systemctl restart kiosk-monitor.service 2>&1
+    whiptail --title "Applied" --msgbox \
+"Saved and restarted — new config is live." 10 60
+  else
+    systemctl start kiosk-monitor.service 2>&1
+    whiptail --title "Applied" --msgbox \
+"Saved and started — new config is live." 10 60
+  fi
+}
+
 _tui_save_and_exit() {
   if [ "$TUI_DIRTY" = "no" ]; then
     whiptail --title "Save" --msgbox "No pending changes to save." 10 50
@@ -3075,12 +3268,15 @@ _tui_save_and_exit() {
 
 _tui_offer_restart() {
   command -v systemctl >/dev/null 2>&1 || return 0
-  systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' | grep -qx 'kiosk-monitor.service' || {
-    whiptail --title "Tip" --msgbox \
-"kiosk-monitor.service is not installed yet.
-Run 'sudo kiosk-monitor --install' to create it." 10 70
+  if ! _tui_service_installed; then
+    if _wt_yesno "Install service" \
+"kiosk-monitor is not yet installed as a systemd service.
+Install it now (enable at boot + start)?"; then
+      _tui_service_install_unit || return 0
+      systemctl enable --now kiosk-monitor.service 2>&1
+    fi
     return 0
-  }
+  fi
   local was_active="no"
   systemctl is-active --quiet kiosk-monitor.service && was_active="yes"
   local prompt
@@ -3099,7 +3295,7 @@ Run 'sudo kiosk-monitor --install' to create it." 10 70
 }
 
 _tui_main_menu() {
-  local inst1_label inst2_label frig_label adv_label
+  local inst1_label inst2_label frig_label adv_label svc_label
   while true; do
     inst1_label="$TUI_MODE @ $(_tui_preview_value "$TUI_OUTPUT" auto) → $(_tui_preview_value "$TUI_URL" not-set)"
     if [ -n "$TUI_MODE2" ]; then
@@ -3109,19 +3305,22 @@ _tui_main_menu() {
     fi
     frig_label="dark=$(_tui_preview_value "$TUI_FRIGATE_DARK" auto), theme=$(_tui_preview_value "$TUI_FRIGATE_THEME" auto), autofill=$TUI_FRIGATE_AUTOFILL"
     adv_label="interval=${TUI_HEALTH_INTERVAL}s, stall=${TUI_STALL_RETRIES}/${TUI_VLC_STALL_RETRIES}"
+    svc_label=$(_tui_service_state_label)
 
     local dirty_marker=""
     [ "$TUI_DIRTY" = "yes" ] && dirty_marker=" *"
     local choice
     choice=$(_wt_menu "kiosk-monitor ${SCRIPT_VERSION}${dirty_marker}" \
-      "Main menu — pick an area to edit, or save and exit." 20 78 10 \
+      "Main menu — pick an area to edit, or save and apply." 22 78 12 \
       "instance1"  "Instance 1:  $inst1_label" \
       "instance2"  "Instance 2:  $inst2_label" \
       "frigate"    "Frigate helper:  $frig_label" \
       "timing"     "Timing & restart thresholds:  $adv_label" \
       "profile"    "Profile / logging / VLC options" \
+      "service"    "Service:  $svc_label" \
       "editor"     "Open $CONFIG_FILE in \$EDITOR" \
       "reload"     "Reload config file (discard in-memory edits)" \
+      "apply"      "Save and restart the service (stay in menu)" \
       "save"       "Save changes and exit" \
       "quit"       "Discard changes and exit") || return 0
     case "$choice" in
@@ -3130,10 +3329,13 @@ _tui_main_menu() {
       frigate)   _tui_edit_frigate ;;
       timing)    _tui_edit_timing ;;
       profile)   _tui_edit_profile_logs ;;
+      service)   _tui_service_menu ;;
       editor)    _tui_edit_in_editor ;;
       reload)
         _tui_load_config
         whiptail --title "Reloaded" --msgbox "Re-read $CONFIG_FILE into memory." 10 60 ;;
+      apply)
+        _tui_apply_now ;;
       save)
         _tui_save_and_exit && continue
         return 0 ;;

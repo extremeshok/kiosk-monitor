@@ -11,13 +11,13 @@ FORCE_RESOLUTION=""            # e.g. "1920x1080" or "1920x1080@60"; blank = kee
 FORCE_ROTATION=""              # normal | 90 | 180 | 270 | flipped | flipped-90 | flipped-180 | flipped-270
 
 # ---- Instance 2 (optional, for second display) ---------------------------
-# Dual-display is tested end-to-end on X11 (Chromium on one HDMI + VLC RTSP
-# on the other). On X11 each instance is positioned directly via
-# --window-position / --window-size, so routing is reliable for both modes.
-# On Wayland Chromium is routed via an auto-generated labwc window rule
-# (matched by --class) and is reliable; VLC on Wayland is matched by title=
-# and is best-effort — if you hit routing problems, run VLC on the primary
-# output and Chromium on the secondary, or use X11.
+# Dual-display is tested end-to-end on both Wayland (labwc) and X11
+# (Chromium on one HDMI + VLC RTSP on the other, both kiosk-fullscreen).
+# On Wayland the script writes a labwc window rule that routes Chromium by
+# --class (identifier=) and VLC by --video-title (title=) to the configured
+# OUTPUT / OUTPUT2; both route reliably. On X11 each instance is positioned
+# directly via --window-position / --window-size and reaffirmed on every
+# health-check tick via wmctrl.
 MODE2=""                          # "chrome", "vlc", or blank to disable
 URL2=""                           # URL / stream for second display
 OUTPUT2=""                        # e.g. HDMI-A-2; leave blank to auto-pick secondary

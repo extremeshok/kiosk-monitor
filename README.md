@@ -2,10 +2,35 @@
 
 Watchdog for kiosk-style displays. Launches Chromium in fullscreen kiosk mode **or** VLC against a video stream, then monitors the page/video for freezes and restarts automatically. Supports one or two displays at once, each running either Chromium or VLC independently.
 
+![kiosk-monitor TUI walkthrough](docs/media/kiosk-monitor-demo.gif)
+
+> Running Frigate? See [**docs/frigate-kiosk-guide.md**](docs/frigate-kiosk-guide.md)
+> for a Frigate-focused install walk-through with built-in Birdseye smart defaults.
+
+## Interactive configuration
+
+Run `sudo kiosk-monitor` on the Pi with no arguments to open the
+menu-driven editor — no hand-editing `kiosk-monitor.conf` required. The
+menu covers both display instances, the Frigate helper, timing /
+restart thresholds, logging, and **the systemd service itself**
+(install, enable on boot, start, stop, restart, tail logs). Save +
+Apply stays in the menu; Save + Exit leaves it.
+
+| Main menu                          | Service submenu                        |
+| ---------------------------------- | -------------------------------------- |
+| ![Main menu](docs/media/main-menu.png) | ![Service submenu](docs/media/service-menu.png) |
+
+| Instance editor                           | Frigate helper                             |
+| ----------------------------------------- | ------------------------------------------ |
+| ![Instance editor](docs/media/instance-edit.png) | ![Frigate helper](docs/media/frigate-menu.png) |
+
+See [**docs/media/README.md**](docs/media/README.md) for how these
+screenshots and the demo GIF are regenerated.
+
 ## Features
 - **Two launch modes** per instance: `chrome` (fullscreen Chromium) or `vlc` (fullscreen video player).
 - **Works on Wayland or X11** — detects labwc/wayfire/sway/… or an X11 DISPLAY and picks the right capture + output tooling automatically.
-- **Dual-display** support — tested end-to-end on X11 (Chromium on one HDMI + VLC RTSP on the other, both kiosk-fullscreen, both supervised independently). On X11 each instance is routed to its configured output after launch **and on every health-check tick** via `wmctrl` (drop fullscreen → move/resize to target rect → re-add fullscreen). The periodic re-check catches VLC's `--loop` behaviour of destroying and recreating its video window on every RTSP reconnect (which re-lands on the primary output); the check is idempotent so it's a silent no-op when placement is stable. On Wayland the script writes an auto-generated labwc window rule instead; Chromium routing (`identifier=` class match) is reliable, VLC routing (`title=` match) is best-effort on labwc.
+- **Dual-display** support — tested end-to-end on **both Wayland (labwc) and X11** (Chromium on one HDMI + VLC RTSP on the other, both kiosk-fullscreen, both supervised independently). On Wayland the script writes an auto-generated labwc window rule (`MoveToOutput`) — Chromium matched by `identifier=` class, VLC by `title=`; both route reliably to the configured output. On X11 each instance is routed to its configured output after launch **and on every health-check tick** via `wmctrl` (drop fullscreen → move/resize to target rect → re-add fullscreen). The periodic re-check catches VLC's `--loop` behaviour of destroying and recreating its video window on every RTSP reconnect (which re-lands on the primary output); the check is idempotent so it's a silent no-op when placement is stable.
 - **"Waiting for target" page** — when the configured kiosk URL isn't reachable at startup, Chromium launches a local HTML page that shows the target, a spinner, and the retry count; its JS polls the URL and auto-navigates once it responds. No more silent blank screens.
 - **Per-output freeze detection** using `grim` (Wayland) or `xwd` (X11): each instance is checked against its own monitor so a hang on one display never restarts the other.
 - **URL health checks** for http/https targets, independent per instance.
