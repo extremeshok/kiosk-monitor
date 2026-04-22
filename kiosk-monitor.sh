@@ -27,7 +27,7 @@
 set -Eeuo pipefail
 
 SCRIPT_VERSION="6.6.0"
-SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
 # CLI pre-pass: --config only (so --config works for every action)
@@ -2322,7 +2322,7 @@ install_self() {
   [ -z "$wayland_display" ] && wayland_display="wayland-0"
 
   local resolved_script script_dir
-  resolved_script=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+  resolved_script=$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]:-$0}")
   script_dir=$(dirname "$resolved_script")
 
   mkdir -p "$INSTALL_DIR"
@@ -2480,7 +2480,7 @@ update_self() {
     install_bash_completion /nonexistent
   else
     local resolved_script script_dir
-    resolved_script=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+    resolved_script=$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]:-$0}")
     script_dir=$(dirname "$resolved_script")
     ensure_script_installed "$resolved_script" "$INSTALL_DIR/kiosk-monitor"
     install_bash_completion "$script_dir"
