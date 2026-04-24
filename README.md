@@ -29,7 +29,7 @@ screenshots and the demo GIF are regenerated.
 
 ## Features
 - **Two launch modes** per instance: `chrome` (fullscreen Chromium) or `vlc` (fullscreen video player).
-- **Works on Wayland or X11** — detects labwc/wayfire/sway/… or an X11 DISPLAY and picks the right capture + output tooling automatically.
+- **Works on Wayland/labwc first, with X11 fallback retained** — detects labwc or a reachable X11 DISPLAY and picks the right capture + output tooling automatically.
 - **Dual-display** support — tested end-to-end on **both Wayland (labwc) and X11** (Chromium on one HDMI + VLC RTSP on the other, both kiosk-fullscreen, both supervised independently). On Wayland the script writes an auto-generated labwc window rule (`MoveToOutput`) — Chromium matched by `identifier=` class, VLC by `title=`; both route reliably to the configured output. On X11 each instance is routed to its configured output after launch **and on every health-check tick** via `wmctrl` (drop fullscreen → move/resize to target rect → re-add fullscreen). The periodic re-check catches VLC's `--loop` behaviour of destroying and recreating its video window on every RTSP reconnect (which re-lands on the primary output); the check is idempotent so it's a silent no-op when placement is stable.
 - **"Waiting for target" page** — when the configured kiosk URL isn't reachable at startup, Chromium launches a local HTML page that shows the target, a spinner, and the retry count; its JS polls the URL and auto-navigates once it responds. No more silent blank screens.
 - **Per-output freeze detection** using `grim` (Wayland) or `xwd` (X11): each instance is checked against its own monitor so a hang on one display never restarts the other.
@@ -47,7 +47,7 @@ screenshots and the demo GIF are regenerated.
 
 ## Requirements
 - **Raspberry Pi OS trixie 64-bit Desktop** (Debian 13) or newer — this is the minimum supported platform.
-- Either a Wayland compositor (labwc on the stock trixie Desktop) **or** an X11 session (e.g. LightDM's `rpd-x`). Both are auto-detected.
+- Primary target: the stock labwc Wayland session on Raspberry Pi OS trixie Desktop. The X11 `rpd-x` session remains supported as a fallback.
 - Needed packages: `chromium`, `vlc`, `curl`, `python3`, `sudo`, plus `grim` + `wlr-randr` on Wayland or `x11-apps` (xwd) + `x11-xserver-utils` (xset, xrandr) on X11; `whiptail` for the TUI. Anything missing is installed automatically by `--install` / `--update` via `apt-get`. Pass `--skip-apt` to opt out.
 
 ## Quick install
@@ -85,9 +85,10 @@ sudo kiosk-monitor --update --force            # reinstall even when the remote 
 sudo kiosk-monitor --remove [--purge]          # remove binaries; --purge also drops /etc/kiosk-monitor
 sudo kiosk-monitor --reconfig                  # re-write kiosk-monitor.conf with every supported option (alias: --reconfigure)
 kiosk-monitor --status                         # show instance config + service status
+kiosk-monitor --doctor                         # read-only environment/config diagnostics
 kiosk-monitor --version
 ```
-`--update` fetches `kiosk-monitor.sh` + `kiosk-monitor.conf.sample` from `$BASE_URL` (default `https://raw.githubusercontent.com/extremeshok/kiosk-monitor/main`). Override with `--base-url URL` for forks or staging branches.
+`--update` fetches `kiosk-monitor.sh` + `kiosk-monitor.conf.sample` from `$BASE_URL` (default `https://raw.githubusercontent.com/extremeshok/kiosk-monitor/HEAD`). Override with `--base-url URL` for forks or staging branches.
 
 ## Configuration — `/etc/kiosk-monitor/kiosk-monitor.conf`
 Edit and then `sudo systemctl restart kiosk-monitor`.
@@ -158,8 +159,8 @@ VLC (`MODE=vlc`):
 | `SESSION_READY_DELAY`    | Extra seconds to pause after session is up                                   | `0` |
 | `SESSION_READY_CMD`      | Optional command to poll until it returns 0                                  | *(unset)* |
 | `SESSION_READY_TIMEOUT`  | Max seconds to wait for `SESSION_READY_CMD` (0 = forever)                    | `0` |
-| `WAIT_FOR_URL`           | `true` blocks each http/https instance until its URL responds                | `true` |
-| `WAIT_FOR_URL_TIMEOUT`   | Seconds to wait for the initial URL probe (0 = forever)                      | `0` |
+| `WAIT_FOR_URL`           | `true` uses the Chromium waiting page and blocks VLC http/https starts until the URL responds | `true` |
+| `WAIT_FOR_URL_TIMEOUT`   | Seconds to wait for VLC's initial URL probe (0 = forever)                    | `0` |
 | `CHROME_LAUNCH_DELAY`    | Seconds to sleep between spawning Chromium and resolving its main PID        | `3` |
 | `CHROME_READY_DELAY`     | Seconds to sleep before looking up the main-browser PID                      | `2` |
 | `VLC_LAUNCH_DELAY`       | Seconds to sleep between spawning VLC and resolving its PID                  | `3` |
@@ -195,7 +196,7 @@ When a Chromium instance's configured URL isn't reachable at launch time, `kiosk
 
 While the instance is on the waiting page the watchdog **does not** count health-probe failures against `HEALTH_RETRIES` and **does not** run freeze detection against the (intentionally static) page. Otherwise a target that stayed unreachable for more than a couple of minutes would trigger an endless "restart Chromium → relaunch waiting page → restart" loop, and the freeze detector would see the static page as a hung screen. Once the URL probe succeeds the log records `target <URL> now reachable — waiting page will redirect` and normal health + freeze supervision resumes.
 
-No configuration toggle: the waiting page is only used when the target fails the initial health probe. If the URL is reachable, Chromium launches directly at it with no indirection. The same flow applies when the watchdog restarts a chrome instance mid-run.
+Set `WAIT_FOR_URL=false` to disable the Chromium waiting page and launch directly at the configured URL even when the initial health probe fails. When enabled, the waiting page is only used if the target fails the initial probe. If the URL is reachable, Chromium launches directly at it with no indirection. The same flow applies when the watchdog restarts a chrome instance mid-run.
 
 VLC instances still block on the old `wait_for_url_ready_instance` loop (no in-player equivalent); only Chromium gets the visual fallback.
 

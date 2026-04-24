@@ -1,6 +1,6 @@
 # kiosk-monitor configuration (sample)
 # Copy to /etc/kiosk-monitor/kiosk-monitor.conf and edit.
-# Values here are shell-quoted: keep the double quotes around strings.
+# Values here are shell-quoted: keep the quotes around strings.
 # Minimum required: set MODE and URL for instance 1.
 
 # ---- Instance 1 (primary display) ----------------------------------------
@@ -73,8 +73,8 @@ WAYLAND_READY_TIMEOUT=300       # wait for wayland-N socket + labwc to be up
 SESSION_READY_DELAY=0
 SESSION_READY_CMD=""
 SESSION_READY_TIMEOUT=0
-WAIT_FOR_URL=true               # block http/https instances until URL responds
-WAIT_FOR_URL_TIMEOUT=0          # 0 = wait forever
+WAIT_FOR_URL=true               # chrome waiting page + VLC http/https startup gate
+WAIT_FOR_URL_TIMEOUT=0          # VLC startup gate timeout; 0 = wait forever
 CHROME_LAUNCH_DELAY=3
 CHROME_READY_DELAY=2
 VLC_LAUNCH_DELAY=3
@@ -103,4 +103,4 @@ PREWARM_SLICE_SIZE=262144
 LOCK_FILE="/var/lock/kiosk-monitor.lock"
 INSTALL_DIR="/usr/local/bin"
 SERVICE_PATH="/etc/systemd/system/kiosk-monitor.service"
-BASE_URL="https://raw.githubusercontent.com/extremeshok/kiosk-monitor/main"
+BASE_URL="https://raw.githubusercontent.com/extremeshok/kiosk-monitor/HEAD"

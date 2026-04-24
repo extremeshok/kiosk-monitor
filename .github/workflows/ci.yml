@@ -22,4 +22,6 @@ jobs:
         run: bash -n kiosk-monitor.sh
 
       - name: shellcheck (warning level)
-        run: shellcheck -x -S warning kiosk-monitor.sh
+        run: |
+          shellcheck -x -S warning kiosk-monitor.sh
+          shellcheck -x -S warning kiosk-monitor.bash-completion docs/media/record-tui.sh

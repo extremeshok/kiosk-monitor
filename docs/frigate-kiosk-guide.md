@@ -83,6 +83,7 @@ From then on:
 sudo kiosk-monitor                # interactive TUI (see below)
 sudo kiosk-monitor --logs         # tail journalctl for the service
 sudo kiosk-monitor --status       # print current instance state
+sudo kiosk-monitor --doctor       # read-only diagnostics
 sudo kiosk-monitor --update       # pull the latest release
 ```
 

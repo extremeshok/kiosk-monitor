@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 6.6.0
+# kiosk-monitor.sh :: version 6.8.1
 # ======================================================================
 # Kiosk watchdog for Raspberry Pi OS trixie 64-bit (or newer Debian/RPi).
 # Supports Chromium fullscreen kiosk and VLC fullscreen video playback,
@@ -16,17 +16,17 @@
 #   - Chromium, VLC, grim, wlr-randr, curl, python3 (all in the default image)
 # ======================================================================
 # Usage:
-#   sudo kiosk-monitor.sh --install       [options]
-#   sudo kiosk-monitor.sh --update        [options]
-#   sudo kiosk-monitor.sh --remove        [--purge]
-#   sudo kiosk-monitor.sh --reconfig
-#        kiosk-monitor.sh --status
-#        kiosk-monitor.sh --help | --version
+#   sudo kiosk-monitor --install       [options]
+#   sudo kiosk-monitor --update        [options]
+#   sudo kiosk-monitor --remove        [--purge]
+#   sudo kiosk-monitor --reconfig
+#        kiosk-monitor --status
+#        kiosk-monitor --help | --version
 # ======================================================================
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.8.0"
+SCRIPT_VERSION="6.8.1"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -225,35 +225,39 @@ apply_frigate_smart_defaults
 # Ensure autofill has a concrete value once smart defaults have run.
 FRIGATE_BIRDSEYE_AUTO_FILL="${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
 
-# Normalize booleans/strings (lower-case)
-for _var in MODE MODE2 VLC_LOOP VLC_NO_AUDIO PROFILE_TMPFS PROFILE_SYNC_BACK PROFILE_TMPFS_PURGE \
-            PREWARM_ENABLED FRIGATE_BIRDSEYE_AUTO_FILL DEVTOOLS_AUTO_OPEN WAIT_FOR_URL; do
-  val="${!_var}"
-  val="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
-  printf -v "$_var" '%s' "$val"
-done
-unset _var val
+normalize_config_values() {
+  local _var val _theme_lc
+  for _var in MODE MODE2 VLC_LOOP VLC_NO_AUDIO PROFILE_TMPFS PROFILE_SYNC_BACK PROFILE_TMPFS_PURGE \
+              PREWARM_ENABLED FRIGATE_BIRDSEYE_AUTO_FILL DEVTOOLS_AUTO_OPEN WAIT_FOR_URL; do
+    val="${!_var:-}"
+    val="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
+    printf -v "$_var" '%s' "$val"
+  done
 
-case "$MODE" in chromium|chrome) MODE="chrome" ;; esac
-case "$MODE2" in chromium|chrome) MODE2="chrome" ;; esac
+  case "$MODE" in chromium|chrome) MODE="chrome" ;; esac
+  case "$MODE2" in chromium|chrome) MODE2="chrome" ;; esac
 
-# Normalize FRIGATE_DARK_MODE: "Light"/"Dark" → lower; "None"/anything else → empty
-case "$(printf '%s' "$FRIGATE_DARK_MODE" | tr '[:upper:]' '[:lower:]')" in
-  light) FRIGATE_DARK_MODE="light" ;;
-  dark)  FRIGATE_DARK_MODE="dark" ;;
-  *)     FRIGATE_DARK_MODE="" ;;
-esac
+  case "$(printf '%s' "$FRIGATE_DARK_MODE" | tr '[:upper:]' '[:lower:]')" in
+    light) FRIGATE_DARK_MODE="light" ;;
+    dark)  FRIGATE_DARK_MODE="dark" ;;
+    *)     FRIGATE_DARK_MODE="" ;;
+  esac
 
-# Normalize FRIGATE_THEME to lowercase/dash (shadcn-style slug).
-# "Default"/"None"/"" all mean "no override".
-_theme_lc=$(printf '%s' "$FRIGATE_THEME" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
-case "$_theme_lc" in
-  blue|green|nord|red|high-contrast) FRIGATE_THEME="$_theme_lc" ;;
-  ""|default|none)                   FRIGATE_THEME="" ;;
-  *)  echo "Warning: unrecognized FRIGATE_THEME='$FRIGATE_THEME' (passing through as-is)" >&2
-      FRIGATE_THEME="$_theme_lc" ;;
-esac
-unset _theme_lc
+  _theme_lc=$(printf '%s' "$FRIGATE_THEME" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+  case "$_theme_lc" in
+    blue|green|nord|red|high-contrast) FRIGATE_THEME="$_theme_lc" ;;
+    ""|default|none)                   FRIGATE_THEME="" ;;
+    *)  echo "Warning: unrecognized FRIGATE_THEME='$FRIGATE_THEME' (passing through as-is)" >&2
+        FRIGATE_THEME="$_theme_lc" ;;
+  esac
+
+  case "$SCREEN_SAMPLE_MODE" in full|sample) ;; *) SCREEN_SAMPLE_MODE="sample" ;; esac
+  if ! [[ "$SCREEN_SAMPLE_BYTES" =~ ^[0-9]+$ ]] || [ "$SCREEN_SAMPLE_BYTES" -le 0 ]; then
+    SCREEN_SAMPLE_BYTES=524288
+  fi
+}
+
+normalize_config_values
 
 if [ "$MODE" != "chrome" ] && [ "$MODE" != "vlc" ]; then
   echo "Error: unsupported MODE='$MODE' (expected chrome or vlc)" >&2
@@ -262,11 +266,6 @@ fi
 if [ -n "$MODE2" ] && [ "$MODE2" != "chrome" ] && [ "$MODE2" != "vlc" ]; then
   echo "Error: unsupported MODE2='$MODE2' (expected chrome, vlc, or empty)" >&2
   exit 1
-fi
-
-case "$SCREEN_SAMPLE_MODE" in full|sample) ;; *) SCREEN_SAMPLE_MODE="sample" ;; esac
-if ! [[ "$SCREEN_SAMPLE_BYTES" =~ ^[0-9]+$ ]] || [ "$SCREEN_SAMPLE_BYTES" -le 0 ]; then
-  SCREEN_SAMPLE_BYTES=524288
 fi
 
 SHUTDOWN_REQUESTED=false
@@ -1068,8 +1067,8 @@ CSS
     applyHtmlClass();
     resizeBirdseye();
   }
-  setAll(THEME_ALIASES, DARK);
-  setAll(COLOR_ALIASES, THEME);
+  setAll(THEME_ALIASES, THEME);
+  setAll(COLOR_ALIASES, DARK);
   applyAll();
   document.addEventListener("DOMContentLoaded", applyAll);
   window.addEventListener("resize", resizeBirdseye);
@@ -1302,15 +1301,17 @@ launch_chrome_instance() {
   # the display while the upstream is coming up.
   local launch_url="$url"
   INSTANCE_ON_WAITING_PAGE[$id]="no"
-  case "$url" in
-    http://*|https://*)
-      if ! health_check_instance "$id" >/dev/null 2>&1; then
-        launch_url=$(write_waiting_page "$id")
-        INSTANCE_ON_WAITING_PAGE[$id]="yes"
-        log_instance "$id" "Target not reachable yet — launching with waiting page, JS will redirect when $url responds."
-      fi
-      ;;
-  esac
+  if [ "$WAIT_FOR_URL" = "true" ]; then
+    case "$url" in
+      http://*|https://*)
+        if ! health_check_instance "$id" >/dev/null 2>&1; then
+          launch_url=$(write_waiting_page "$id")
+          INSTANCE_ON_WAITING_PAGE[$id]="yes"
+          log_instance "$id" "Target not reachable yet — launching with waiting page, JS will redirect when $url responds."
+        fi
+        ;;
+    esac
+  fi
   flags+=( "$launch_url" )
 
   log_instance "$id" "Launching Chromium on $name (${w}x${h}+${x}+${y}) → $launch_url"
@@ -1762,17 +1763,34 @@ ensure_labwc_window_rules() {
   # kiosk-monitor run placed the managed marker. Anything else is left
   # alone so we don't clobber a user's hand-rolled compositor config.
   #
-  # Single-instance setups never need this — labwc's default placement
-  # already puts the sole window on the primary output, so skip the
-  # file entirely and leave the compositor config untouched.
   [ "${SESSION_TYPE:-}" = "wayland" ] || return 0
-  if [ "${#INSTANCES[@]}" -le 1 ]; then
-    return 0
-  fi
   local rc="/home/${GUI_USER}/.config/labwc/rc.xml"
   local rc_dir
   rc_dir=$(dirname "$rc")
   local marker="kiosk-monitor: managed rc.xml"
+  local needs_rules="no" id requested
+
+  if [ "${#INSTANCES[@]}" -gt 1 ]; then
+    needs_rules="yes"
+  else
+    for id in "${INSTANCES[@]}"; do
+      case "$id" in
+        1) requested="${OUTPUT:-}" ;;
+        2) requested="${OUTPUT2:-}" ;;
+        *) requested="" ;;
+      esac
+      [ -n "$requested" ] && { needs_rules="yes"; break; }
+    done
+  fi
+
+  if [ "$needs_rules" != "yes" ]; then
+    if [ -f "$rc" ] && grep -qF "$marker" "$rc" 2>/dev/null; then
+      as_gui rm -f "$rc" 2>/dev/null || true
+      pkill -SIGHUP -u "$GUI_USER" -x labwc 2>/dev/null || true
+      log "Removed kiosk-monitor-managed labwc window rules; no explicit routing is needed."
+    fi
+    return 0
+  fi
 
   if ! as_gui mkdir -p "$rc_dir" 2>/dev/null; then
     log "Warning: could not create $rc_dir — skipping labwc window rules."
@@ -1792,7 +1810,6 @@ ensure_labwc_window_rules() {
     printf '<!-- %s — remove this comment to opt out of auto-management -->\n' "$marker"
     printf '<labwc_config>\n'
     printf '  <windowRules>\n'
-    local id
     for id in "${INSTANCES[@]}"; do
       local out="${INSTANCE_OUTPUT[$id]:-}"
       local cls="${INSTANCE_CLASS[$id]:-}"
@@ -2161,12 +2178,13 @@ ensure_script_installed() {
   rm -f "${target}.sh"
 }
 
-escape_config_value() {
-  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+quote_config_value() {
+  local value=$1
+  printf "'%s'" "${value//\'/\'\\\'\'}"
 }
 
 emit_config_line() {
-  printf '%s="%s"\n' "$1" "$(escape_config_value "$2")"
+  printf '%s=%s\n' "$1" "$(quote_config_value "$2")"
 }
 
 write_effective_config_file() {
@@ -2274,7 +2292,7 @@ EOF
     emit_config_line URL2     "${URL2:-}"
     emit_config_line OUTPUT2  "${OUTPUT2:-}"
     cat <<'EOF'
-# Optional tuning: run `kiosk-monitor.sh --reconfig` to persist the full list of options.
+# Optional tuning: run `kiosk-monitor --reconfig` to persist the full list of options.
 # Docs: https://github.com/extremeshok/kiosk-monitor#readme
 EOF
   } > "$tmp"
@@ -2284,11 +2302,13 @@ EOF
 
 set_or_append_conf_value() {
   local key=$1 value=$2 target=$3
-  local escaped; escaped=$(escape_config_value "$value")
+  local quoted replacement
+  quoted=$(quote_config_value "$value")
+  replacement=$(printf '%s=%s' "$key" "$quoted" | sed -e 's/[&|\\]/\\&/g')
   if grep -q "^${key}=" "$target" 2>/dev/null; then
-    sed -i "s|^${key}=.*|${key}=\"${escaped}\"|" "$target"
+    sed -i "s|^${key}=.*|${replacement}|" "$target"
   else
-    printf '%s="%s"\n' "$key" "$escaped" >> "$target"
+    printf '%s=%s\n' "$key" "$quoted" >> "$target"
   fi
 }
 
@@ -2937,8 +2957,9 @@ the window is currently on at request time, which on a cold boot
 is always the primary output, and catches VLC's --loop behaviour
 of recreating the video window on every RTSP reconnect.
 
-Single-instance setups (Instance 2 disabled) leave the compositor
-config untouched." 24 72 ;;
+Single-instance setups with automatic output selection leave the
+compositor config untouched; setting an explicit OUTPUT still writes a
+labwc rule so the window lands on that monitor." 24 72 ;;
       back) return 0 ;;
     esac
   done
@@ -3400,7 +3421,7 @@ status_self() {
   else
     printf '\nInstance 2: disabled\n'
   fi
-  if [ "$MODE" = "chrome" ] || [ -n "${MODE2:-}" ] && [ "${MODE2:-}" = "chrome" ]; then
+  if [ "$MODE" = "chrome" ] || { [ -n "${MODE2:-}" ] && [ "${MODE2:-}" = "chrome" ]; }; then
     printf '\nFrigate helper:\n'
     printf '  dark-mode         : %s\n' "${FRIGATE_DARK_MODE:-(none)}"
     printf '  theme             : %s\n' "${FRIGATE_THEME:-(none)}"
@@ -3422,9 +3443,116 @@ status_self() {
   fi
 }
 
+doctor_self() {
+  local errors=0 warnings=0
+
+  doctor_ok() { printf '[ok] %s\n' "$*"; }
+  doctor_warn() { warnings=$((warnings + 1)); printf '[warn] %s\n' "$*"; }
+  doctor_error() { errors=$((errors + 1)); printf '[error] %s\n' "$*"; }
+
+  printf 'kiosk-monitor doctor\n'
+  printf 'Version: %s\n' "$SCRIPT_VERSION"
+  printf 'Config : %s\n\n' "$CONFIG_FILE"
+
+  if [ -f "$CONFIG_FILE" ]; then
+    doctor_ok "config file exists"
+  else
+    doctor_warn "config file does not exist yet"
+  fi
+
+  if validate_runtime_config; then
+    doctor_ok "runtime config validates"
+  else
+    doctor_error "runtime config has errors"
+  fi
+
+  local cmd
+  for cmd in curl flock sha256sum python3 grim wlr-randr; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      doctor_ok "found command: $cmd"
+    else
+      doctor_error "missing command: $cmd"
+    fi
+  done
+
+  if [ "$MODE" = "chrome" ] || { [ -n "${MODE2:-}" ] && [ "${MODE2:-}" = "chrome" ]; }; then
+    local chrome
+    chrome=$(chromium_binary)
+    if [ -x "$chrome" ]; then
+      doctor_ok "Chromium binary is executable: $chrome"
+    else
+      doctor_error "Chromium binary is not executable: $chrome"
+    fi
+  fi
+
+  if [ "$MODE" = "vlc" ] || { [ -n "${MODE2:-}" ] && [ "${MODE2:-}" = "vlc" ]; }; then
+    local vlc
+    vlc=$(vlc_binary)
+    if [ -x "$vlc" ]; then
+      doctor_ok "VLC binary is executable: $vlc"
+    else
+      doctor_error "VLC binary is not executable: $vlc"
+    fi
+  fi
+
+  if [ -z "${GUI_USER:-}" ] || [ "$GUI_USER" = "root" ]; then
+    auto_detect_gui_user >/dev/null 2>&1 || true
+  fi
+  if [ -n "${GUI_USER:-}" ] && [ "$GUI_USER" != "root" ] && id -u "$GUI_USER" >/dev/null 2>&1; then
+    GUI_UID=$(id -u "$GUI_USER")
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${GUI_UID}}"
+    doctor_ok "desktop user: $GUI_USER (uid=$GUI_UID)"
+  else
+    doctor_error "desktop user could not be detected; set GUI_USER"
+  fi
+
+  if [ -n "${GUI_UID:-}" ]; then
+    if _detect_wayland "$GUI_UID"; then
+      doctor_ok "Wayland session reachable: $WAYLAND_DISPLAY ($SESSION_COMPOSITOR)"
+      case "$SESSION_COMPOSITOR" in
+        labwc|labwc-pi) ;;
+        *) doctor_warn "Wayland compositor is $SESSION_COMPOSITOR; labwc window rules may not apply" ;;
+      esac
+    elif _detect_x11 "$GUI_UID"; then
+      doctor_ok "X11 fallback session reachable: DISPLAY=$DISPLAY ($SESSION_COMPOSITOR)"
+    else
+      doctor_warn "no reachable Wayland or X11 graphical session detected"
+    fi
+  fi
+
+  PROFILE_RUNTIME_ROOT="${PROFILE_ROOT:-/home/${GUI_USER:-${USER:-pi}}/.local/share/kiosk-monitor}"
+  setup_instances
+  if refresh_outputs; then
+    doctor_ok "outputs detected: ${OUTPUTS_NAMES[*]}"
+    local id req found name
+    for id in "${INSTANCES[@]}"; do
+      req=""
+      case "$id" in
+        1) req="${OUTPUT:-}" ;;
+        2) req="${OUTPUT2:-}" ;;
+      esac
+      [ -n "$req" ] || continue
+      found="no"
+      for name in "${OUTPUTS_NAMES[@]}"; do
+        [ "$name" = "$req" ] && { found="yes"; break; }
+      done
+      if [ "$found" = "yes" ]; then
+        doctor_ok "instance $id output is connected: $req"
+      else
+        doctor_warn "instance $id output is not currently connected: $req"
+      fi
+    done
+  else
+    doctor_warn "could not query outputs"
+  fi
+
+  printf '\nDoctor summary: %s error(s), %s warning(s)\n' "$errors" "$warnings"
+  [ "$errors" -eq 0 ]
+}
+
 usage() {
   cat <<'EOF'
-kiosk-monitor — Browser/VLC kiosk watchdog (v6, Wayland + labwc)
+kiosk-monitor — Browser/VLC kiosk watchdog (v6, Wayland/labwc + X11 fallback)
 
 Usage:
   kiosk-monitor                           Open the interactive TUI (terminal-only default)
@@ -3438,6 +3566,7 @@ Usage:
   kiosk-monitor --remove  [--purge]
   kiosk-monitor --reconfig | --reconfigure [--config PATH]
   kiosk-monitor --status
+  kiosk-monitor --doctor
   kiosk-monitor --logs [--no-follow] [--lines N|all]
   kiosk-monitor --help | --version
 
@@ -3450,8 +3579,9 @@ Config (/etc/kiosk-monitor/kiosk-monitor.conf):
   OUTPUT2    output name e.g. HDMI-A-2         (instance 2)
 
 Run as root for install/update/remove/reconfig. Runtime service runs as
-the detected desktop user. Prereqs on Raspberry Pi OS trixie Desktop are
-preinstalled (chromium, vlc, grim, wlr-randr, curl, python3).
+the detected desktop user. Primary-target prereqs on Raspberry Pi OS
+trixie Desktop are preinstalled (chromium, vlc, grim, wlr-randr, curl,
+python3); X11 fallback helpers are installed when needed.
 EOF
 }
 
@@ -3464,6 +3594,7 @@ case "${1:-}" in
   --reconfig|--reconfigure)                ACTION="reconfig"; shift ;;
   --run)     ACTION="run";     shift ;;
   --status)  ACTION="status";  shift ;;
+  --doctor)  ACTION="doctor";  shift ;;
   --logs)    ACTION="logs";    shift ;;
   --help|-h) ACTION="help";    shift ;;
   --version) ACTION="version"; shift ;;
@@ -3496,6 +3627,7 @@ case "$ACTION" in
   configure) configure_self;                    exit 0 ;;
   reconfig)  reconfigure_self;                  exit 0 ;;
   status)    status_self;                       exit 0 ;;
+  doctor)    doctor_self;                       exit $? ;;
   logs)      logs_self    "${ACTION_ARGS[@]}"; exit 0 ;;
   help)      usage;                             exit 0 ;;
   version)   printf '%s\n' "$SCRIPT_VERSION";   exit 0 ;;
@@ -3680,23 +3812,19 @@ reload_instances() {
     # shellcheck disable=SC1090
     . "$CONFIG_FILE"
   fi
-  # Re-apply smart defaults + basic mode normalization. Full normalization
-  # happens only at script startup; these are the bits that matter for
-  # deciding what to launch on reload.
   apply_frigate_smart_defaults
-  MODE=$(printf '%s' "${MODE:-chrome}" | tr '[:upper:]' '[:lower:]')
-  MODE2=$(printf '%s' "${MODE2:-}"    | tr '[:upper:]' '[:lower:]')
-  case "$MODE"  in chromium|chrome) MODE="chrome" ;; esac
-  case "$MODE2" in chromium|chrome) MODE2="chrome" ;; esac
   FRIGATE_BIRDSEYE_AUTO_FILL="${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
+  normalize_config_values
   validate_runtime_config || { log "Reload aborted: config invalid."; return 1; }
   setup_instances
   refresh_outputs || true
-  ensure_labwc_window_rules
   for id in "${INSTANCES[@]}"; do
     resolve_output_geometry "$id" >/dev/null || true
     log_instance "$id" "resolved output=${INSTANCE_OUTPUT[$id]}"
     apply_display_overrides "$id"
+  done
+  ensure_labwc_window_rules
+  for id in "${INSTANCES[@]}"; do
     launch_instance "$id" || log_instance "$id" "reload launch failed"
     INSTANCE_LAST_GOOD[$id]=$(date +%s)
     INSTANCE_LAST_HASH[$id]=$(capture_output_hash "$id" || true)

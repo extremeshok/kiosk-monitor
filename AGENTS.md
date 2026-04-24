@@ -22,8 +22,8 @@ When automated tooling would otherwise add such attribution, strip it before com
 ## Project scope
 
 - Target platform: **Raspberry Pi OS trixie 64-bit Desktop** (Debian 13) or newer. Drop compatibility shims for older distros when touching code paths they no longer exercise.
-- Wayland + labwc only; no X11 fallbacks.
-- Prerequisites (chromium, vlc, grim, wlr-randr, curl, python3) are part of the stock trixie desktop image — don't add install steps for them.
+- Primary desktop target is Wayland + labwc. Existing X11/rpd-x fallback code is intentionally retained; don't remove it unless the task explicitly asks for that.
+- Prerequisites for the primary target (chromium, vlc, grim, wlr-randr, curl, python3) are part of the stock trixie desktop image — don't add install steps for them. Optional X11 fallback packages may remain installer-managed.
 
 ## Style
 
