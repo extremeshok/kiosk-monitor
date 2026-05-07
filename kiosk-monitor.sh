@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 6.8.1
+# kiosk-monitor.sh :: version 6.8.2
 # ======================================================================
 # Kiosk watchdog for Raspberry Pi OS trixie 64-bit (or newer Debian/RPi).
 # Supports Chromium fullscreen kiosk and VLC fullscreen video playback,
@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.8.1"
+SCRIPT_VERSION="6.8.2"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -1357,6 +1357,14 @@ launch_vlc_instance() {
     chown "$GUI_USER":"$GUI_USER" "$logfile" 2>/dev/null || true
   fi
 
+  # Window placement on the right output is handled post-launch by labwc
+  # window rules (Wayland) and route_window_to_output_x11/wmctrl (X11), so
+  # don't pass --video-x/--video-y/--width/--height. Those flags don't size
+  # the window — they enforce the video output buffer dimensions, which
+  # defeats VLC's autoscale and causes a 1080p source to render in the
+  # top-left quadrant of a 4K display when the TV comes up at its native
+  # mode. Letting them default (-1) lets autoscale + --fullscreen fill the
+  # display regardless of source vs display resolution.
   local -a flags=(
     --intf=dummy
     --no-qt-privacy-ask
@@ -1367,10 +1375,6 @@ launch_vlc_instance() {
     "--logfile=$logfile"
     --fullscreen
     --video-on-top
-    "--video-x=${x}"
-    "--video-y=${y}"
-    "--width=${w}"
-    "--height=${h}"
   )
   [ "$VLC_LOOP" = "true" ] && flags+=( --loop )
   [ "$VLC_NO_AUDIO" = "true" ] && flags+=( --no-audio )
