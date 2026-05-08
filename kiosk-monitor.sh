@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.8.3"
+SCRIPT_VERSION="6.8.4"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -826,16 +826,25 @@ resolve_output_geometry() {
 # Chromium: profile + extension + launch
 # ======================================================================
 # Read --enable-features / --disable-features values from the system
-# Chromium wrapper's conf files. Debian/Ubuntu/Mint chromium ships
-# /etc/chromium.d/*.conf snippets that set CHROMIUM_FLAGS, typically
-# enabling VaapiVideoDecoder and friends so hardware video decode works.
+# Chromium wrapper's conf files AND from the wrapper script itself.
 # Chromium's command-line parser uses last-wins semantics for repeated
 # switches (CommandLine::GetSwitchValueASCII returns only the final value),
 # so if we appended a bare --enable-features=OverlayScrollbar,UseOzonePlatform
-# of our own it would silently strip the distro's VAAPI enablement and
-# Birdseye/H.264 would fall back to software decode — pegging dual-core
-# boxes within minutes and freezing the renderer. Instead, parse what's
-# already there and merge with our additions in merge_chromium_features().
+# of our own it would silently strip whatever the distro chromium wrapper
+# put on the line first — most importantly VaapiVideoDecoder and friends
+# that turn on iGPU H.264 decode. With those gone Birdseye/H.264 falls back
+# to software decode and pegs dual-core boxes within minutes, freezing the
+# renderer. So: detect what the wrapper passes, dedup-merge with our
+# additions, emit one combined switch each.
+#
+# Files vary by distro:
+#   - Debian/RPi:   /etc/chromium.d/* (Debian's own file is "default-flags",
+#                   no extension — DO NOT restrict to *.conf)
+#   - Ubuntu/Mint:  the wrapper at /usr/bin/chromium itself often has the
+#                   --enable-features=Vaapi… string baked in; the user's
+#                   .config/chromium-flags.conf may add more.
+#   - Raspberry Pi: /etc/chromium-browser/default historically; some
+#                   forks use /etc/chromium/customizations/* or similar.
 chromium_distro_features() {
   local kind=$1                          # "enable" or "disable"
   local switch="--${kind}-features="
@@ -843,15 +852,34 @@ chromium_distro_features() {
   if [ -n "${GUI_USER:-}" ]; then
     user_home=$(getent passwd "$GUI_USER" 2>/dev/null | cut -d: -f6 || true)
   fi
+  # Plain conf files / fragments. No *.conf restriction — Debian's actual
+  # filename is /etc/chromium.d/default-flags with no extension. Pull in
+  # everything readable; they're shell snippets that set CHROMIUM_FLAGS.
   local -a files=(
-    /etc/chromium.d/*.conf
+    /etc/chromium.d/*
+    /etc/chromium/customizations/*
     /etc/chromium-browser/default
     /etc/chromium-browser/customizations/*
-    /etc/chromium/customizations/*
+    /etc/default/chromium
+    /etc/default/chromium-browser
+    /etc/default/google-chrome
   )
-  [ -n "$user_home" ] && files+=( "$user_home/.config/chromium-flags.conf" )
+  [ -n "$user_home" ] && files+=(
+    "$user_home/.config/chromium-flags.conf"
+    "$user_home/.config/chrome-flags.conf"
+    "$user_home/.config/google-chrome-flags.conf"
+  )
+  # Also grep the wrapper script itself — Linux Mint's /usr/bin/chromium
+  # bakes the VAAPI flags directly into its source, no /etc snippet
+  # involved. file -b would work but is overkill; just grep paths that
+  # exist and are text-ish.
+  local wrapper
+  wrapper=$(chromium_binary)
+  [ -n "$wrapper" ] && [ -r "$wrapper" ] && files+=( "$wrapper" )
   local combined="" path features
   for path in "${files[@]}"; do
+    [ -e "$path" ] || continue          # glob may produce literal pattern
+    [ -d "$path" ] && continue          # skip dirs that fell out of /*
     [ -r "$path" ] || continue
     while IFS= read -r features; do
       [ -n "$features" ] || continue
@@ -866,7 +894,10 @@ chromium_distro_features() {
 
 # Merge requested feature names with the distro's --(en|dis)able-features
 # values, dedup, and emit one comma-joined string. Caller passes one
-# feature per arg.
+# feature per arg. Detection is best-effort, so callers should still
+# pass the features they critically need (e.g. VaapiVideoDecoder) as
+# explicit arguments — that way hardware decode stays on even when the
+# distro stashes its flags somewhere we don't grep.
 merge_chromium_features() {
   local kind=$1; shift
   local distro user_added joined
@@ -1312,18 +1343,30 @@ launch_chrome_instance() {
 
   local url="${INSTANCE_URL[$id]}"
   # Merge our feature toggles with whatever the distro chromium wrapper
-  # already sets in /etc/chromium.d/*.conf (typically VaapiVideoDecoder
-  # and friends). A bare --enable-features=…/--disable-features=… on the
-  # cmdline is last-wins, so passing our own would silently disable
-  # hardware video decode — Birdseye then falls back to software H.264 and
-  # the renderer freezes within minutes on modest CPUs.
+  # already sets (in /etc/chromium.d/*, /etc/chromium-browser/default,
+  # ~/.config/chromium-flags.conf, or hardcoded inside the wrapper
+  # script itself). A bare --enable-features=…/--disable-features=… on
+  # the cmdline is last-wins, so passing our own without merging would
+  # silently disable hardware video decode — Birdseye then falls back to
+  # software H.264 and the renderer freezes within minutes on modest CPUs.
+  #
+  # We also pass the canonical VAAPI feature names ourselves, regardless
+  # of what's detected: detection is best-effort across distros, but
+  # Chromium's behaviour is consistent — these features are no-ops on
+  # systems without the relevant iGPU/driver, and they keep hardware
+  # decode on where it exists. Same logic for GlobalVaapiLock on the
+  # disable side — it's the lock-around-decode mutex that the distro
+  # wrappers turn off to enable parallel decode threads.
   local merged_disable merged_enable
   merged_disable=$(merge_chromium_features disable \
     TranslateUI ChromeWhatsNewUI \
     IntensiveWakeUpThrottling BackForwardCache \
-    CalculateNativeWinOcclusion)
+    CalculateNativeWinOcclusion \
+    GlobalVaapiLock)
   merged_enable=$(merge_chromium_features enable \
-    OverlayScrollbar UseOzonePlatform)
+    OverlayScrollbar UseOzonePlatform \
+    VaapiVideoDecoder VaapiVideoEncoder \
+    VaapiVideoDecodeLinuxGL UseChromeOSDirectVideoDecoder)
   local -a flags=(
     --kiosk
     --start-fullscreen
