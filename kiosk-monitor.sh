@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.8.2"
+SCRIPT_VERSION="6.8.3"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -825,6 +825,60 @@ resolve_output_geometry() {
 # ======================================================================
 # Chromium: profile + extension + launch
 # ======================================================================
+# Read --enable-features / --disable-features values from the system
+# Chromium wrapper's conf files. Debian/Ubuntu/Mint chromium ships
+# /etc/chromium.d/*.conf snippets that set CHROMIUM_FLAGS, typically
+# enabling VaapiVideoDecoder and friends so hardware video decode works.
+# Chromium's command-line parser uses last-wins semantics for repeated
+# switches (CommandLine::GetSwitchValueASCII returns only the final value),
+# so if we appended a bare --enable-features=OverlayScrollbar,UseOzonePlatform
+# of our own it would silently strip the distro's VAAPI enablement and
+# Birdseye/H.264 would fall back to software decode — pegging dual-core
+# boxes within minutes and freezing the renderer. Instead, parse what's
+# already there and merge with our additions in merge_chromium_features().
+chromium_distro_features() {
+  local kind=$1                          # "enable" or "disable"
+  local switch="--${kind}-features="
+  local user_home=""
+  if [ -n "${GUI_USER:-}" ]; then
+    user_home=$(getent passwd "$GUI_USER" 2>/dev/null | cut -d: -f6 || true)
+  fi
+  local -a files=(
+    /etc/chromium.d/*.conf
+    /etc/chromium-browser/default
+    /etc/chromium-browser/customizations/*
+    /etc/chromium/customizations/*
+  )
+  [ -n "$user_home" ] && files+=( "$user_home/.config/chromium-flags.conf" )
+  local combined="" path features
+  for path in "${files[@]}"; do
+    [ -r "$path" ] || continue
+    while IFS= read -r features; do
+      [ -n "$features" ] || continue
+      combined+="${combined:+,}$features"
+    done < <(
+      grep -hoE -- "${switch}[\"']?[A-Za-z0-9_,/\\-]+" "$path" 2>/dev/null \
+        | sed -e "s|^${switch}||" -e "s|^[\"']||" -e "s|[\"']\$||"
+    )
+  done
+  printf '%s\n' "$combined"
+}
+
+# Merge requested feature names with the distro's --(en|dis)able-features
+# values, dedup, and emit one comma-joined string. Caller passes one
+# feature per arg.
+merge_chromium_features() {
+  local kind=$1; shift
+  local distro user_added joined
+  distro=$(chromium_distro_features "$kind")
+  user_added="$*"
+  joined=$(printf '%s\n%s\n' "$distro" "$user_added" \
+    | tr ',[:space:]' '\n\n' \
+    | awk 'NF && !seen[$0]++' \
+    | paste -sd ',' -)
+  printf '%s\n' "$joined"
+}
+
 chromium_binary() {
   if [ -n "$CHROMIUM_BIN" ] && [ -x "$CHROMIUM_BIN" ]; then
     printf '%s\n' "$CHROMIUM_BIN"; return 0
@@ -1257,6 +1311,19 @@ launch_chrome_instance() {
   cleanup_stray_processes "$id"
 
   local url="${INSTANCE_URL[$id]}"
+  # Merge our feature toggles with whatever the distro chromium wrapper
+  # already sets in /etc/chromium.d/*.conf (typically VaapiVideoDecoder
+  # and friends). A bare --enable-features=…/--disable-features=… on the
+  # cmdline is last-wins, so passing our own would silently disable
+  # hardware video decode — Birdseye then falls back to software H.264 and
+  # the renderer freezes within minutes on modest CPUs.
+  local merged_disable merged_enable
+  merged_disable=$(merge_chromium_features disable \
+    TranslateUI ChromeWhatsNewUI \
+    IntensiveWakeUpThrottling BackForwardCache \
+    CalculateNativeWinOcclusion)
+  merged_enable=$(merge_chromium_features enable \
+    OverlayScrollbar UseOzonePlatform)
   local -a flags=(
     --kiosk
     --start-fullscreen
@@ -1266,14 +1333,20 @@ launch_chrome_instance() {
     --disable-translate
     --disable-infobars
     --disable-session-crashed-bubble
-    "--disable-features=TranslateUI,ChromeWhatsNewUI"
     --disable-component-update
     --disable-sync
     --noerrdialogs
     --disable-logging
     --disable-logging-redirect
     --log-level=3
-    "--enable-features=OverlayScrollbar,UseOzonePlatform"
+    # Keep JS timers, video pumps, and the page itself running even when
+    # Chromium thinks the kiosk window is occluded or backgrounded — the
+    # compositor's occlusion detection on multi-monitor labwc/Mate is
+    # flaky, and Frigate's Birdseye player drives its WebSocket pump from
+    # JS timers that would otherwise be throttled to ~1 Hz.
+    --disable-background-timer-throttling
+    --disable-renderer-backgrounding
+    --disable-backgrounding-occluded-windows
     --password-store=basic
     --allow-running-insecure-content
     "--user-data-dir=$profile_root"
@@ -1282,6 +1355,8 @@ launch_chrome_instance() {
     "--class=${INSTANCE_CLASS[$id]}"
     --new-window
   )
+  [ -n "$merged_disable" ] && flags+=( "--disable-features=$merged_disable" )
+  [ -n "$merged_enable" ]  && flags+=( "--enable-features=$merged_enable" )
   if [ "${SESSION_TYPE:-}" = "x11" ]; then
     flags+=( --ozone-platform=x11 )
   else
@@ -1496,13 +1571,43 @@ capture_output_hash() {
   local tmp
   tmp=$(mktemp 2>/dev/null) || return 1
   if [ "${SESSION_TYPE:-}" = "x11" ]; then
-    # xwd captures the whole root; per-output capture would need scrot/maim
-    # with geometry. For now, hash the full root — this works for dual-display
-    # X11 too, but any motion on either screen keeps the freeze counter at 0,
-    # so a freeze on one display is only detected when the other is also static.
-    if ! as_gui xwd -silent -root -display "$DISPLAY" >"$tmp" 2>/dev/null; then
-      debug_instance "$id" "xwd capture failed (DISPLAY=$DISPLAY)"
-      rm -f "$tmp"; return 1
+    # On dual-display X11 we want a per-output crop — hashing the whole
+    # root means motion on either display resets the freeze counter, so a
+    # freeze on one display is only detected when the other is also
+    # static. Prefer ImageMagick's `import` (or `maim`) to crop directly
+    # to the instance's output rectangle. Fall back to `xwd -root` if
+    # neither crop tool is installed; with a single output that fallback
+    # is fine, with two it's the original blind-spot behaviour.
+    local geo="" gx gy gw gh
+    [ -n "$name" ] && geo="${OUTPUT_GEOMETRY[$name]:-}"
+    if [ -n "$geo" ]; then
+      # geo is "X Y W H"
+      # shellcheck disable=SC2086
+      set -- $geo
+      gx=$1; gy=$2; gw=$3; gh=$4
+    fi
+    local captured="no"
+    if [ -n "$geo" ] && command -v import >/dev/null 2>&1; then
+      if as_gui import -silent -window root -crop "${gw}x${gh}+${gx}+${gy}" \
+            -display "$DISPLAY" ppm:- >"$tmp" 2>/dev/null \
+         && [ -s "$tmp" ]; then
+        captured="yes"
+      fi
+    fi
+    if [ "$captured" = "no" ] && [ -n "$geo" ] && command -v maim >/dev/null 2>&1; then
+      if as_gui maim -g "${gw}x${gh}+${gx}+${gy}" -f ppm "$tmp" >/dev/null 2>&1 \
+         && [ -s "$tmp" ]; then
+        captured="yes"
+      fi
+    fi
+    if [ "$captured" = "no" ]; then
+      if ! as_gui xwd -silent -root -display "$DISPLAY" >"$tmp" 2>/dev/null; then
+        debug_instance "$id" "xwd capture failed (DISPLAY=$DISPLAY)"
+        rm -f "$tmp"; return 1
+      fi
+      if [ -n "$geo" ] && [ "${#OUTPUTS_NAMES[@]}" -gt 1 ]; then
+        debug_instance "$id" "X11 multi-monitor: install imagemagick or maim for per-output stall detection"
+      fi
     fi
   else
     local -a cmd=( as_gui grim )
