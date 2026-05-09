@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.8.4"
+SCRIPT_VERSION="6.8.5"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -1362,7 +1362,8 @@ launch_chrome_instance() {
     TranslateUI ChromeWhatsNewUI \
     IntensiveWakeUpThrottling BackForwardCache \
     CalculateNativeWinOcclusion \
-    GlobalVaapiLock)
+    GlobalVaapiLock \
+    MediaSessionService HardwareMediaKeyHandling)
   merged_enable=$(merge_chromium_features enable \
     OverlayScrollbar UseOzonePlatform \
     VaapiVideoDecoder VaapiVideoEncoder \
@@ -1390,6 +1391,14 @@ launch_chrome_instance() {
     --disable-background-timer-throttling
     --disable-renderer-backgrounding
     --disable-backgrounding-occluded-windows
+    # Let MSE / autoplay video elements start (and resume after buffer
+    # stalls) without a synthetic user gesture. Without this Chromium 147
+    # treats Birdseye's <video> as an autoplay-restricted element and
+    # leaves it paused after MediaSource buffer underruns — the page
+    # itself stays alive (sidebar GIFs keep animating) but the video
+    # grid freezes until a click "activates" the document. Reproducible
+    # in #1 of extremeshok/kiosk-monitor on Linux Mint + Frigate Birdseye.
+    --autoplay-policy=no-user-gesture-required
     --password-store=basic
     --allow-running-insecure-content
     "--user-data-dir=$profile_root"
