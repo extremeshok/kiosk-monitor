@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.8.5"
+SCRIPT_VERSION="6.8.6"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -1358,16 +1358,27 @@ launch_chrome_instance() {
   # disable side — it's the lock-around-decode mutex that the distro
   # wrappers turn off to enable parallel decode threads.
   local merged_disable merged_enable
+  # UseChromeOSDirectVideoDecoder: Chromium 147's new ChromeOS-derived
+  # direct video decoder path. The distro chromium wrapper turns it on,
+  # but on Haswell-class iGPUs with i965 it reliably stalls a long-
+  # running MSE/WebRTC stream after a few minutes — JS keeps running,
+  # other media on the page keeps animating, only the video pipeline
+  # freezes. Force-disable it so Chromium falls back to the older
+  # accelerated decoder path that actually works there. When a feature
+  # appears in both --enable-features and --disable-features, Chromium's
+  # parser registers disable second and disable wins, so the merged
+  # enable list still containing it from the distro is harmless.
   merged_disable=$(merge_chromium_features disable \
     TranslateUI ChromeWhatsNewUI \
     IntensiveWakeUpThrottling BackForwardCache \
     CalculateNativeWinOcclusion \
     GlobalVaapiLock \
-    MediaSessionService HardwareMediaKeyHandling)
+    MediaSessionService HardwareMediaKeyHandling \
+    UseChromeOSDirectVideoDecoder)
   merged_enable=$(merge_chromium_features enable \
     OverlayScrollbar UseOzonePlatform \
     VaapiVideoDecoder VaapiVideoEncoder \
-    VaapiVideoDecodeLinuxGL UseChromeOSDirectVideoDecoder)
+    VaapiVideoDecodeLinuxGL)
   local -a flags=(
     --kiosk
     --start-fullscreen
