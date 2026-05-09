@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.8.6"
+SCRIPT_VERSION="6.8.7"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -923,6 +923,53 @@ chromium_binary() {
   echo /usr/bin/chromium
 }
 
+# Detect whether libva is actually using the legacy i965 driver. The
+# newer iHD driver (intel-media-va-driver) is preferred where the
+# hardware supports it; i965 is the fallback that's still shipped for
+# Sandy Bridge through Coffee Lake (≤ gen9.5) Intel iGPUs — Haswell-
+# class boxes like the Dell 3020 in extremeshok/kiosk-monitor#1 land
+# on i965.
+#
+# Why we care: Chromium's UseChromeOSDirectVideoDecoder feature path
+# (the new ChromeOS-derived direct decoder) is the standard
+# troubleshooting suspect when VAAPI playback stalls on Linux desktop —
+# the official Chromium VA-API doc and the ArchWiki Hardware-video-
+# acceleration page both list --disable-features=UseChromeOSDirectVideoDecoder
+# as the workaround when the new path misbehaves. Reports specific to
+# i965 + long-running MSE/WebRTC streams describe exactly the symptom
+# we see in #1: the page stays alive, only the video pipeline freezes.
+# We don't blanket-disable the feature for everyone (it's the better
+# path on iHD/newer hardware), only when we can see we'd be hitting
+# the legacy driver.
+#
+# Cached on first call so we don't fork vainfo per launch.
+KIOSK_VAAPI_USES_I965=""
+chromium_vaapi_uses_legacy_i965() {
+  if [ -n "$KIOSK_VAAPI_USES_I965" ]; then
+    [ "$KIOSK_VAAPI_USES_I965" = "yes" ]
+    return
+  fi
+  KIOSK_VAAPI_USES_I965="no"
+  # Best signal: ask vainfo what driver actually loaded for the GUI
+  # session. libva-utils ships /usr/bin/vainfo; not always installed.
+  if command -v vainfo >/dev/null 2>&1; then
+    if as_gui vainfo 2>&1 | grep -qi "Intel i965 driver"; then
+      KIOSK_VAAPI_USES_I965="yes"
+    fi
+  else
+    # Fall back to the SO files: if only i965_drv_video.so is present,
+    # libva will load it. If iHD is also there, libva prefers iHD on
+    # supported hardware, so don't tag the box as i965.
+    local d has_i965="no" has_ihd="no"
+    for d in /usr/lib/x86_64-linux-gnu/dri /usr/lib/aarch64-linux-gnu/dri /usr/lib/dri; do
+      [ -f "$d/i965_drv_video.so" ] && has_i965="yes"
+      [ -f "$d/iHD_drv_video.so" ]  && has_ihd="yes"
+    done
+    [ "$has_i965" = "yes" ] && [ "$has_ihd" = "no" ] && KIOSK_VAAPI_USES_I965="yes"
+  fi
+  [ "$KIOSK_VAAPI_USES_I965" = "yes" ]
+}
+
 vlc_binary() {
   if [ -n "$VLC_BIN" ] && [ -x "$VLC_BIN" ]; then
     printf '%s\n' "$VLC_BIN"; return 0
@@ -1358,23 +1405,29 @@ launch_chrome_instance() {
   # disable side — it's the lock-around-decode mutex that the distro
   # wrappers turn off to enable parallel decode threads.
   local merged_disable merged_enable
+  local -a feature_disable=(
+    TranslateUI ChromeWhatsNewUI
+    IntensiveWakeUpThrottling BackForwardCache
+    CalculateNativeWinOcclusion
+    GlobalVaapiLock
+    MediaSessionService HardwareMediaKeyHandling
+  )
   # UseChromeOSDirectVideoDecoder: Chromium 147's new ChromeOS-derived
-  # direct video decoder path. The distro chromium wrapper turns it on,
-  # but on Haswell-class iGPUs with i965 it reliably stalls a long-
-  # running MSE/WebRTC stream after a few minutes — JS keeps running,
-  # other media on the page keeps animating, only the video pipeline
-  # freezes. Force-disable it so Chromium falls back to the older
-  # accelerated decoder path that actually works there. When a feature
-  # appears in both --enable-features and --disable-features, Chromium's
-  # parser registers disable second and disable wins, so the merged
-  # enable list still containing it from the distro is harmless.
-  merged_disable=$(merge_chromium_features disable \
-    TranslateUI ChromeWhatsNewUI \
-    IntensiveWakeUpThrottling BackForwardCache \
-    CalculateNativeWinOcclusion \
-    GlobalVaapiLock \
-    MediaSessionService HardwareMediaKeyHandling \
-    UseChromeOSDirectVideoDecoder)
+  # direct video decoder. It's the better path on newer Intel/AMD where
+  # iHD/Mesa-VAAPI is loaded, so we don't blanket-disable it. On boxes
+  # where libva fell back to the legacy i965 driver (Sandy Bridge through
+  # Coffee Lake, including the Haswell box in extremeshok/kiosk-monitor#1)
+  # the new path is the standard suspect for VAAPI playback stalls
+  # (Chromium VA-API doc + ArchWiki hardware-video-acceleration page
+  # both list --disable-features=UseChromeOSDirectVideoDecoder as the
+  # workaround). When a feature is in both --enable-features and
+  # --disable-features, Chromium's parser registers disable second and
+  # disable wins, so we don't have to filter the merged enable list.
+  if chromium_vaapi_uses_legacy_i965; then
+    feature_disable+=( UseChromeOSDirectVideoDecoder )
+    log_instance "$id" "VAAPI loaded via legacy i965 driver — disabling UseChromeOSDirectVideoDecoder"
+  fi
+  merged_disable=$(merge_chromium_features disable "${feature_disable[@]}")
   merged_enable=$(merge_chromium_features enable \
     OverlayScrollbar UseOzonePlatform \
     VaapiVideoDecoder VaapiVideoEncoder \
