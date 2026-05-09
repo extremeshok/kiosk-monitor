@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 6.8.2
+# kiosk-monitor.sh :: version 6.8.7
 # ======================================================================
 # Kiosk watchdog for Raspberry Pi OS trixie 64-bit (or newer Debian/RPi).
 # Supports Chromium fullscreen kiosk and VLC fullscreen video playback,
