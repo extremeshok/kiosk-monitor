@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 6.10.0
+# kiosk-monitor.sh :: version 6.10.1
 # ======================================================================
 # Kiosk watchdog for Raspberry Pi OS trixie 64-bit (or newer Debian/RPi).
 # Supports Chromium fullscreen kiosk and VLC fullscreen video playback,
@@ -28,7 +28,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.10.0"
+SCRIPT_VERSION="6.10.1"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -3807,88 +3807,197 @@ _doctor_check_config_file() {
 #   1 = endpoint unreachable, no streams configured, or parse error
 #   2 = usage error (no URL provided)
 #
-# Surfaced by issue #1 reporter on v6.10.0: the doctor's VLC+HTTP guard
+# Surfaced by issue #1 reporter on v6.10.1: the doctor's VLC+HTTP guard
 # was telling them to "point at the go2rtc RTSP stream — e.g.
 # rtsp://<frigate>:8554/birdseye", but discovering the actual stream
 # names and port required curl+jq archaeology. This function turns
 # the doctor warning into a copy-pasteable answer.
 discover_frigate_streams() {
-  # `${1:-}` not `$1` — under `set -u` the latter blows up when no arg
-  # is given (which is exactly the path the usage-error branch below
-  # is supposed to handle).
-  local url=${1:-}
+  # Args:
+  #   $1                URL (Frigate web URL OR standalone go2rtc URL)
+  #   --rtsp-port N     override the RTSP port advertised in the output;
+  #                     useful for Dockerised Frigate where the externally-
+  #                     reachable RTSP port is Docker-mapped and differs
+  #                     from go2rtc.rtsp.listen reported by Frigate's
+  #                     /api/config (e.g. internal :8554 → external :30060).
+  local url="" rtsp_port_override=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --rtsp-port)
+        shift
+        [ "$#" -gt 0 ] || { printf 'Error: --rtsp-port requires an integer\n' >&2; return 2; }
+        rtsp_port_override=$1
+        shift
+        ;;
+      --rtsp-port=*)
+        rtsp_port_override=${1#--rtsp-port=}
+        shift
+        ;;
+      -*)
+        printf 'Error: unknown --discover-streams option: %s\n' "$1" >&2
+        return 2
+        ;;
+      *)
+        [ -z "$url" ] || { printf 'Error: only one URL allowed\n' >&2; return 2; }
+        url=$1
+        shift
+        ;;
+    esac
+  done
   if [ -z "$url" ]; then
-    printf 'usage: kiosk-monitor --discover-streams <frigate-or-go2rtc-url>\n' >&2
+    printf 'usage: kiosk-monitor --discover-streams <url> [--rtsp-port N]\n' >&2
     printf 'examples:\n' >&2
-    printf '  kiosk-monitor --discover-streams http://192.168.1.194:30059   # Frigate web UI\n' >&2
-    printf '  kiosk-monitor --discover-streams http://192.168.1.194:30060   # standalone go2rtc\n' >&2
+    printf '  kiosk-monitor --discover-streams http://192.168.1.194:30059\n' >&2
+    printf '  kiosk-monitor --discover-streams http://192.168.1.194:5000 --rtsp-port 8554\n' >&2
+    return 2
+  fi
+  if [ -n "$rtsp_port_override" ] && ! [[ "$rtsp_port_override" =~ ^[0-9]+$ ]]; then
+    printf 'Error: --rtsp-port must be an integer, got %q\n' "$rtsp_port_override" >&2
     return 2
   fi
   need_cmd curl
   need_cmd python3
   url=${url%/}
 
-  # The `|| body=""` on each probe swallows curl's non-zero exit
-  # (status 22 = HTTP 4xx/5xx, status 7 = couldn't resolve, etc.) so
-  # `set -e` doesn't abort the function before we get a chance to try
-  # the fallback endpoint. Empty body then drives the if/elif chain
-  # below to the next probe or the final error branch.
+  # Probe order matters. Each `|| body=""` swallows curl's non-zero exit
+  # (status 22 = HTTP 4xx/5xx, 7 = DNS / connect refused, etc.) so
+  # `set -e` doesn't abort before the next fallback runs.
+  #
+  #   1. <url>/api/go2rtc/streams — Frigate proxies go2rtc's runtime
+  #      streams endpoint here. This is the MOST RELIABLE probe
+  #      because it shows auto-generated streams (e.g. Birdseye when
+  #      `birdseye.restream: true` triggers an internal ffmpeg) that
+  #      DON'T appear in `go2rtc.streams` of Frigate's static config.
+  #      Discovered the hard way against a live Frigate where /api/config
+  #      reported `go2rtc.streams: {}` even though `rtsp://host/birdseye`
+  #      was a working stream — kiosk-monitor#1 thread.
+  #   2. <url>/api/config — Frigate's main config. Falls back to this
+  #      for the RTSP-port hint (`go2rtc.rtsp.listen`) and as a stream
+  #      source when /api/go2rtc/streams isn't proxied for some reason
+  #      (very old Frigate, non-default reverse-proxy).
+  #   3. <url>/api/streams — go2rtc's own endpoint. Used when the user
+  #      points the discoverer at a standalone go2rtc instance rather
+  #      than at Frigate.
+  # Declared together so `cfg_body` is always bound under `set -u`,
+  # even when the frigate-proxy branch below doesn't assign to it.
   local body kind
-  body=$(curl -fsSL -m 5 "$url/api/config" 2>/dev/null) || body=""
+  local cfg_body=""
+  body=$(curl -fsSL -m 5 "$url/api/go2rtc/streams" 2>/dev/null) || body=""
   if [ -n "$body" ] && printf '%s' "$body" | python3 -c 'import json,sys; json.loads(sys.stdin.read())' >/dev/null 2>&1; then
-    kind=frigate
+    kind=frigate-proxy
   else
-    body=$(curl -fsSL -m 5 "$url/api/streams" 2>/dev/null) || body=""
+    body=$(curl -fsSL -m 5 "$url/api/config" 2>/dev/null) || body=""
     if [ -n "$body" ] && printf '%s' "$body" | python3 -c 'import json,sys; json.loads(sys.stdin.read())' >/dev/null 2>&1; then
-      kind=go2rtc
+      kind=frigate
     else
-      printf 'Error: neither %s/api/config (Frigate) nor %s/api/streams (go2rtc) responded with JSON.\n' "$url" "$url" >&2
-      printf '       Check the host, port, and that the service is running.\n' >&2
-      return 1
+      body=$(curl -fsSL -m 5 "$url/api/streams" 2>/dev/null) || body=""
+      if [ -n "$body" ] && printf '%s' "$body" | python3 -c 'import json,sys; json.loads(sys.stdin.read())' >/dev/null 2>&1; then
+        kind=go2rtc
+      else
+        printf 'Error: none of these probes returned JSON at %s:\n' "$url" >&2
+        printf '  - %s/api/go2rtc/streams  (Frigate-proxied go2rtc — usually richest)\n' "$url" >&2
+        printf '  - %s/api/config          (Frigate config)\n' "$url" >&2
+        printf '  - %s/api/streams         (standalone go2rtc)\n' "$url" >&2
+        printf '       Check the host, port, and that Frigate / go2rtc is running.\n' >&2
+        return 1
+      fi
     fi
   fi
 
-  # Body goes via stdin; URL + kind via env. The Python is wrapped in a
-  # quoted-delimiter heredoc fed into `python3 -c "$(cat <<'PY' … PY)"`
-  # rather than a single-quoted -c '…' so the script can use its own
-  # mix of single and double quotes (e.g. `MODE="vlc"`) without
-  # collisions with the bash quoting layer.
-  KM_DISCOVER_URL=$url KM_DISCOVER_KIND=$kind python3 -c "$(cat <<'PY'
+  # When we landed on /api/go2rtc/streams (kind=frigate-proxy) the body
+  # is just the streams dict — no rtsp-port hint. Try /api/config in
+  # the background to harvest the port, but don't fail if it's missing.
+  if [ "$kind" = "frigate-proxy" ]; then
+    cfg_body=$(curl -fsSL -m 5 "$url/api/config" 2>/dev/null) || cfg_body=""
+  fi
+
+  KM_DISCOVER_URL=$url KM_DISCOVER_KIND=$kind \
+  KM_DISCOVER_RTSP_OVERRIDE=$rtsp_port_override \
+  KM_DISCOVER_CFG_BODY=$cfg_body \
+  python3 -c "$(cat <<'PY'
 import json, os, sys
 from urllib.parse import urlparse
 
-url    = os.environ["KM_DISCOVER_URL"]
-kind   = os.environ["KM_DISCOVER_KIND"]
-parsed = urlparse(url)
-host   = parsed.hostname or url
+url       = os.environ["KM_DISCOVER_URL"]
+kind      = os.environ["KM_DISCOVER_KIND"]
+override  = os.environ.get("KM_DISCOVER_RTSP_OVERRIDE", "") or ""
+cfg_body  = os.environ.get("KM_DISCOVER_CFG_BODY", "")
+body      = sys.stdin.read()
+parsed    = urlparse(url)
+host      = parsed.hostname or url
 
 streams   = []
 rtsp_port = "8554"   # go2rtc default
+rtsp_port_source = "default (go2rtc)"
 
-if kind == "frigate":
-    cfg = json.loads(sys.stdin.read())
+def parse_listen(listen_str):
+    if ":" in listen_str:
+        cand = listen_str.rsplit(":", 1)[1].split("/")[0]
+        if cand.isdigit():
+            return cand
+    return None
+
+if kind == "frigate-proxy":
+    data    = json.loads(body)
+    streams = sorted(data.keys())
+    if cfg_body:
+        try:
+            cfg = json.loads(cfg_body)
+            listen = ((cfg.get("go2rtc") or {}).get("rtsp") or {}).get("listen", "") or ""
+            p = parse_listen(listen)
+            if p:
+                rtsp_port = p
+                rtsp_port_source = "go2rtc.rtsp.listen in Frigate config (internal)"
+        except Exception:
+            pass
+    print("Frigate detected at " + host + ":" + str(parsed.port or 5000) + " (via /api/go2rtc/streams)")
+elif kind == "frigate":
+    cfg = json.loads(body)
     g2 = cfg.get("go2rtc") or {}
     streams = sorted((g2.get("streams") or {}).keys())
-    # rtsp.listen forms seen in the wild: ":8554", "tcp://:8554",
-    # "0.0.0.0:8554". Pull the trailing port digits if present.
     listen = (g2.get("rtsp") or {}).get("listen", "") or ""
-    if ":" in listen:
-        cand = listen.rsplit(":", 1)[1].split("/")[0]
-        if cand.isdigit():
-            rtsp_port = cand
-    print("Frigate detected at " + host + ":" + str(parsed.port or 5000))
+    p = parse_listen(listen)
+    if p:
+        rtsp_port = p
+        rtsp_port_source = "go2rtc.rtsp.listen in Frigate config (internal)"
+    print("Frigate detected at " + host + ":" + str(parsed.port or 5000) + " (via /api/config; /api/go2rtc/streams unavailable)")
 else:  # go2rtc
-    data    = json.loads(sys.stdin.read())
+    data    = json.loads(body)
     streams = sorted(data.keys())
     print("go2rtc detected at " + host + ":" + str(parsed.port or 1984))
 
+if override:
+    rtsp_port = override
+    rtsp_port_source = "--rtsp-port override"
+
 if not streams:
     print("  no streams configured.")
-    if kind == "frigate":
-        print("  Add streams under go2rtc.streams in Frigate config.yml.")
+    if kind in ("frigate", "frigate-proxy"):
+        print("  Add streams under go2rtc.streams in Frigate config.yml, or")
+        print("  enable birdseye.restream: true if you want Birdseye exposed.")
     sys.exit(1)
 
-print("RTSP port: " + rtsp_port)
+print("RTSP port: " + rtsp_port + "  [" + rtsp_port_source + "]")
+
+# Docker port-mapping note: if Frigate's web URL is on a high non-default
+# port (anything but 5000) AND the RTSP port we'll suggest is go2rtc's
+# default internal :8554, the user is almost certainly running a
+# Dockerised Frigate where the external RTSP port is mapped to something
+# else. Tell them so they don't try an unreachable rtsp://host:8554 URL.
+web_port = parsed.port or 5000
+if (kind in ("frigate", "frigate-proxy")
+        and not override
+        and rtsp_port == "8554"
+        and web_port not in (5000,)):
+    print()
+    print("NOTE: Frigate web is on " + host + ":" + str(web_port) + " (non-default), which usually")
+    print("      means Docker port-mapping. The RTSP port reported above (" + rtsp_port + ") is")
+    print("      go2rtc's INTERNAL listen port — your externally-reachable RTSP")
+    print("      port is whatever you mapped it to. Find it with e.g.")
+    print("        docker compose port frigate 8554")
+    print("      and re-run with --rtsp-port N to confirm:")
+    print("        kiosk-monitor --discover-streams " + url + " --rtsp-port N")
+
 print()
 print("Available streams:")
 for name in streams:
@@ -3934,7 +4043,7 @@ _doctor_check_runtime_config() {
   # warnings still print (because we re-emit them), but the doctor's
   # final `Doctor summary: N error(s), M warning(s)` reports 0/0 even
   # when validate found real issues. Surfaced by issue #1 reporter on
-  # v6.10.0 when v6.9.0's MODE=vlc + HTTP-URL guard fired correctly but
+  # v6.10.1 when v6.9.0's MODE=vlc + HTTP-URL guard fired correctly but
   # didn't get counted.
   local val_stderr val_rc
   val_stderr=$(validate_runtime_config 2>&1 >/dev/null)

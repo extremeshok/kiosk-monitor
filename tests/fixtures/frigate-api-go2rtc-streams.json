@@ -1,0 +1,5 @@
+{
+  "birdseye": {"producers": [{"url": "exec:ffmpeg ... -f rtsp {output}"}], "consumers": []},
+  "front_door": {"producers": [], "consumers": []},
+  "back_yard": {"producers": [], "consumers": []}
+}

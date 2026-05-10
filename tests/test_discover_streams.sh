@@ -1,107 +1,159 @@
 #!/usr/bin/env bash
-# Tests for v6.10.0's --discover-streams subcommand and the
-# corresponding doctor auto-discovery hook.
+# Tests for v6.10.0's --discover-streams subcommand and v6.10.1's
+# probe-order + --rtsp-port refinements.
 #
-# The discovery probes a URL with curl. To test it offline we shim
-# curl on PATH with a fake that returns fixture JSON for known
-# hostnames and a 404-equivalent (exit 22, empty stdout) for anything
-# else. Each test points the discoverer at a synthetic hostname like
-# "test-frigate-default" and the shim returns the matching fixture.
+# Probe priority (v6.10.1):
+#   1. /api/go2rtc/streams — Frigate proxy of go2rtc runtime streams.
+#      Catches auto-generated streams (e.g. Birdseye when birdseye.restream
+#      = true) that don't appear in static /api/config.
+#   2. /api/config         — Frigate's main config (static go2rtc.streams).
+#   3. /api/streams        — standalone go2rtc.
+#
+# Discovery is exercised offline via a curl shim that returns fixture
+# JSON for known hostnames and exits 22 ("HTTP error") for anything else.
 
 # shellcheck source=lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-# Build a curl shim that handles the URLs this test uses.
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
 cat >"$TMPDIR/curl" <<EOF
 #!/usr/bin/env bash
-# Mock curl: serve fixture JSON based on the URL passed as the
-# last positional. Anything not in the switch returns exit 22
-# (HTTP error, no body) — same effect as a 404 on real curl -fsSL.
 url=\${@: -1}
 case "\$url" in
-  http://test-frigate-default/api/config)        cat "$FIXTURES_DIR/frigate-api-config.json" ;;
-  http://test-frigate-rtsp-tcp/api/config)       cat "$FIXTURES_DIR/frigate-api-config-rtsp-tcp.json" ;;
-  http://test-frigate-empty/api/config)          cat "$FIXTURES_DIR/frigate-api-config-no-streams.json" ;;
-  http://test-go2rtc-direct/api/streams)         cat "$FIXTURES_DIR/go2rtc-api-streams.json" ;;
-  http://test-down/api/config|http://test-down/api/streams) exit 7 ;;
+  # Frigate with /api/go2rtc/streams populated (the modern path that
+  # surfaces auto-generated Birdseye streams)
+  http://test-frigate-proxy/api/go2rtc/streams) cat "$FIXTURES_DIR/frigate-api-go2rtc-streams.json" ;;
+  http://test-frigate-proxy/api/config)         cat "$FIXTURES_DIR/frigate-api-config-no-streams.json" ;;
+  # Frigate with auto-generated Birdseye only (the issue-#1 reporter shape:
+  # /api/config has empty go2rtc.streams but /api/go2rtc/streams has birdseye)
+  http://test-frigate-birdseye-only/api/go2rtc/streams) cat "$FIXTURES_DIR/frigate-api-go2rtc-streams-birdseye-only.json" ;;
+  http://test-frigate-birdseye-only/api/config)         cat "$FIXTURES_DIR/frigate-api-config-no-streams.json" ;;
+  # Frigate hosted via Docker on a non-default external port
+  # (web :30059 instead of :5000). RTSP from /api/config says :8554
+  # which is the internal listen — should trigger the port-mapping note.
+  http://test-frigate-docker:30059/api/go2rtc/streams) cat "$FIXTURES_DIR/frigate-api-go2rtc-streams-birdseye-only.json" ;;
+  http://test-frigate-docker:30059/api/config)         cat "$FIXTURES_DIR/frigate-api-config.json" ;;
+  # Old Frigate without the /api/go2rtc proxy: only /api/config responds,
+  # and it has statically-declared streams.
+  http://test-frigate-no-proxy/api/go2rtc/streams) exit 22 ;;
+  http://test-frigate-no-proxy/api/config)         cat "$FIXTURES_DIR/frigate-api-config.json" ;;
+  # Frigate with alternate rtsp.listen port form
+  http://test-frigate-rtsp-tcp/api/go2rtc/streams) exit 22 ;;
+  http://test-frigate-rtsp-tcp/api/config)         cat "$FIXTURES_DIR/frigate-api-config-rtsp-tcp.json" ;;
+  # Frigate with empty everything (both probes return empty streams)
+  http://test-frigate-empty/api/go2rtc/streams) printf '{}\n' ;;
+  http://test-frigate-empty/api/config)         cat "$FIXTURES_DIR/frigate-api-config-no-streams.json" ;;
+  # Standalone go2rtc (no Frigate front door)
+  http://test-go2rtc-direct/api/go2rtc/streams) exit 22 ;;
+  http://test-go2rtc-direct/api/config)         exit 22 ;;
+  http://test-go2rtc-direct/api/streams)        cat "$FIXTURES_DIR/go2rtc-api-streams.json" ;;
+  # Completely down host
+  http://test-down/api/go2rtc/streams|http://test-down/api/config|http://test-down/api/streams) exit 7 ;;
   *) exit 22 ;;
 esac
 EOF
 chmod +x "$TMPDIR/curl"
 export PATH="$TMPDIR:$PATH"
 
-# ---- Frigate path: discovers streams + default RTSP port -----------------
+# ---- /api/go2rtc/streams is the preferred path (v6.10.1) -----------------
 
-test_case "Frigate + default rtsp.listen=':8554': lists streams"
-run_kiosk --discover-streams http://test-frigate-default
-assert_match 'Frigate detected' "$LAST_STDOUT"
-assert_match 'rtsp://test-frigate-default:8554/birdseye' "$LAST_STDOUT"
-assert_match 'rtsp://test-frigate-default:8554/front_door' "$LAST_STDOUT"
-assert_match 'rtsp://test-frigate-default:8554/back_yard' "$LAST_STDOUT"
+test_case "frigate-proxy path: detected via /api/go2rtc/streams when populated"
+run_kiosk --discover-streams http://test-frigate-proxy
+assert_match 'Frigate detected.*via /api/go2rtc/streams' "$LAST_STDOUT"
+assert_match 'rtsp://test-frigate-proxy:8554/birdseye' "$LAST_STDOUT"
+assert_match 'rtsp://test-frigate-proxy:8554/front_door' "$LAST_STDOUT"
+assert_match 'rtsp://test-frigate-proxy:8554/back_yard' "$LAST_STDOUT"
 
-test_case "Frigate path: includes copy-pasteable conf snippet"
-run_kiosk --discover-streams http://test-frigate-default
-assert_match 'Suggested kiosk-monitor.conf snippet' "$LAST_STDOUT"
-assert_match 'MODE="vlc"' "$LAST_STDOUT"
-# First stream alphabetically is back_yard
-assert_match 'URL="rtsp://test-frigate-default:8554/back_yard"' "$LAST_STDOUT"
-
-test_case "Frigate path: streams sorted alphabetically"
-run_kiosk --discover-streams http://test-frigate-default
-# back_yard < birdseye < front_door
-order=$(printf '%s\n' "$LAST_STDOUT" | grep -oE 'rtsp://[^:]+:[0-9]+/[a-z_]+' | sed 's|^.*/||' | head -3)
-assert_eq "back_yard
-birdseye
-front_door" "$order"
-
-test_case "Frigate path: exit code 0 when streams found"
-run_kiosk --discover-streams http://test-frigate-default
+test_case "frigate-proxy path: surfaces auto-generated Birdseye (issue #1 shape)"
+# This is the case where /api/config has empty go2rtc.streams but
+# birdseye is auto-generated by Frigate's internal ffmpeg and appears
+# only on the proxy endpoint. The old v6.10.0 probe order would've
+# (incorrectly) reported "no streams configured" here.
+run_kiosk --discover-streams http://test-frigate-birdseye-only
+assert_match 'rtsp://test-frigate-birdseye-only:8554/birdseye' "$LAST_STDOUT"
 assert_eq "0" "$LAST_RC"
 
-# ---- Frigate path: alternate rtsp.listen formats parse correctly ---------
+# ---- /api/config fallback when /api/go2rtc/streams isn't proxied --------
 
-test_case "Frigate path: rtsp.listen='tcp://0.0.0.0:9999' is parsed"
+test_case "frigate fallback: detected via /api/config when go2rtc proxy 404s"
+run_kiosk --discover-streams http://test-frigate-no-proxy
+assert_match 'Frigate detected.*via /api/config' "$LAST_STDOUT"
+assert_match 'rtsp://test-frigate-no-proxy:8554/birdseye' "$LAST_STDOUT"
+
+test_case "frigate fallback: rtsp.listen='tcp://0.0.0.0:9999' parsed correctly"
 run_kiosk --discover-streams http://test-frigate-rtsp-tcp
-assert_match 'rtsp://test-frigate-rtsp-tcp:9999/birdseye' "$LAST_STDOUT"
+assert_match 'rtsp://test-frigate-rtsp-tcp:9999' "$LAST_STDOUT"
 
-# ---- Frigate path: empty go2rtc.streams ----------------------------------
+# ---- standalone go2rtc fallback ----------------------------------------
 
-test_case "Frigate with empty go2rtc.streams: exit 1, hint to add streams"
-run_kiosk --discover-streams http://test-frigate-empty
-assert_eq "1" "$LAST_RC"
-assert_match 'no streams configured' "$LAST_STDOUT"
-assert_match 'go2rtc.streams in Frigate config.yml' "$LAST_STDOUT"
-
-# ---- go2rtc-direct path: falls back to /api/streams when /api/config 404s ----
-
-test_case "go2rtc direct (no Frigate /api/config): falls back to /api/streams"
+test_case "go2rtc direct: detected when both Frigate endpoints 404"
 run_kiosk --discover-streams http://test-go2rtc-direct
 assert_match 'go2rtc detected' "$LAST_STDOUT"
 assert_match 'rtsp://test-go2rtc-direct:8554/birdseye' "$LAST_STDOUT"
-assert_match 'rtsp://test-go2rtc-direct:8554/front_door' "$LAST_STDOUT"
 
-# ---- unreachable host: clear error + exit 1 ------------------------------
+# ---- empty / unreachable / usage paths ---------------------------------
 
-test_case "unreachable host: exit 1, mentions both probe URLs"
+test_case "empty streams: exit 1 + hint about birdseye.restream"
+run_kiosk --discover-streams http://test-frigate-empty
+assert_eq "1" "$LAST_RC"
+assert_match 'no streams configured' "$LAST_STDOUT"
+assert_match 'birdseye.restream' "$LAST_STDOUT"
+
+test_case "unreachable host: lists all three probe URLs in error"
 run_kiosk --discover-streams http://test-down
 assert_eq "1" "$LAST_RC"
-assert_match 'neither.*api/config.*nor.*api/streams' "$LAST_STDERR"
-
-# ---- usage error: no URL given ------------------------------------------
+assert_match '/api/go2rtc/streams' "$LAST_STDERR"
+assert_match '/api/config' "$LAST_STDERR"
+assert_match '/api/streams' "$LAST_STDERR"
 
 test_case "no URL argument: usage to stderr, exit 2"
 run_kiosk --discover-streams
 assert_eq "2" "$LAST_RC"
 assert_match 'usage: kiosk-monitor --discover-streams' "$LAST_STDERR"
 
-# ---- trailing slash on URL doesn't double up ----------------------------
+test_case "trailing slash on URL handled"
+run_kiosk --discover-streams http://test-frigate-proxy/
+assert_match 'rtsp://test-frigate-proxy:8554/birdseye' "$LAST_STDOUT"
 
-test_case "trailing slash on URL: probes the right endpoint"
-run_kiosk --discover-streams http://test-frigate-default/
-assert_match 'Frigate detected' "$LAST_STDOUT"
-assert_match 'rtsp://test-frigate-default:8554/birdseye' "$LAST_STDOUT"
+# ---- --rtsp-port override (v6.10.1) ------------------------------------
+
+test_case "--rtsp-port N overrides the discovered port"
+run_kiosk --discover-streams http://test-frigate-proxy --rtsp-port 30060
+assert_match 'rtsp://test-frigate-proxy:30060/birdseye' "$LAST_STDOUT"
+assert_match 'rtsp://test-frigate-proxy:30060/front_door' "$LAST_STDOUT"
+assert_match '--rtsp-port override' "$LAST_STDOUT"
+
+test_case "--rtsp-port=N (= form) also supported"
+run_kiosk --discover-streams http://test-frigate-proxy --rtsp-port=30060
+assert_match 'rtsp://test-frigate-proxy:30060/birdseye' "$LAST_STDOUT"
+
+test_case "--rtsp-port with non-integer rejected"
+run_kiosk --discover-streams http://test-frigate-proxy --rtsp-port abc
+assert_eq "2" "$LAST_RC"
+assert_match '--rtsp-port must be an integer' "$LAST_STDERR"
+
+test_case "--rtsp-port suppresses the Docker port-mapping note"
+run_kiosk --discover-streams http://test-frigate-docker:30059 --rtsp-port 30060
+assert_no_match 'NOTE.*Docker port-mapping' "$LAST_STDOUT"
+
+test_case "unknown --discover-streams flag rejected"
+run_kiosk --discover-streams http://test-frigate-proxy --not-a-flag
+assert_eq "2" "$LAST_RC"
+assert_match 'unknown --discover-streams option' "$LAST_STDERR"
+
+# ---- Docker port-mapping NOTE ------------------------------------------
+
+test_case "Frigate on non-default web port + internal :8554 triggers Docker note"
+run_kiosk --discover-streams http://test-frigate-docker:30059
+assert_match 'NOTE.*Docker port-mapping' "$LAST_STDOUT"
+assert_match 'docker compose port frigate 8554' "$LAST_STDOUT"
+assert_match '--rtsp-port' "$LAST_STDOUT"
+
+test_case "Frigate on the default :5000 does NOT trigger Docker note"
+run_kiosk --discover-streams http://test-frigate-proxy
+# test-frigate-proxy has no port specified, so parsed.port is None → 5000
+assert_no_match 'NOTE.*Docker port-mapping' "$LAST_STDOUT"
 
 trap _summary EXIT

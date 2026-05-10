@@ -4,6 +4,61 @@ All notable changes to kiosk-monitor are recorded here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.10.1] — 2026-05-10
+
+Surfaced by live-testing v6.10.0 against the production Frigate
+served by the Pi 5 viewport3 fleet — and the production setup the
+issue #1 reporter is on.
+
+### Added
+- `--discover-streams` now probes `<url>/api/go2rtc/streams` *first*
+  (before `/api/config` and `/api/streams`). This is the
+  Frigate-proxied go2rtc runtime-streams endpoint. It surfaces
+  streams that Frigate auto-generates from its config but never
+  writes to the static `go2rtc.streams` block — most importantly,
+  Birdseye when `birdseye.restream: true` triggers an internal
+  ffmpeg pipeline. v6.10.0 against a real Frigate reported
+  "no streams configured" even though `rtsp://host/birdseye` was a
+  working stream; v6.10.1 reports `rtsp://host:8554/birdseye`
+  correctly.
+- `--discover-streams URL --rtsp-port N` flag override. For
+  Dockerised Frigate the externally-reachable RTSP port is typically
+  mapped (e.g. `:30060` external → `:8554` internal) and differs
+  from the `go2rtc.rtsp.listen` value reported by Frigate's
+  `/api/config`. The override lets operators paste the correct
+  external port without editing Frigate's config.
+- Docker port-mapping NOTE in the discovery output. Fires when:
+  Frigate web is on a non-default port (i.e. not `:5000` —
+  signalling Docker port-mapping is in play), AND the RTSP port we
+  found via `go2rtc.rtsp.listen` is the default `:8554`, AND
+  `--rtsp-port` wasn't passed. Tells the operator how to find the
+  external mapped port (`docker compose port frigate 8554`) so they
+  don't try a `rtsp://host:8554` URL that the host firewall rejects.
+
+### Changed
+- Discovery output now annotates the RTSP port with its source —
+  one of `--rtsp-port override`, `go2rtc.rtsp.listen in Frigate
+  config (internal)`, or `default (go2rtc)` — so the operator can
+  tell at a glance whether the suggested URL is likely to work
+  externally.
+- Detection banner specifies which probe matched, e.g.
+  `Frigate detected at host:5000 (via /api/go2rtc/streams)` vs
+  `Frigate detected at host:5000 (via /api/config; /api/go2rtc/streams unavailable)`.
+- Empty-streams hint adds a pointer to `birdseye.restream: true`
+  for users who want Birdseye exposed.
+
+### Fixed
+- `set -u` gotcha: `cfg_body` was only assigned in the
+  frigate-proxy branch but referenced unconditionally afterwards.
+  Now declared with an explicit `=""` default.
+
+### Tests
+- `tests/test_discover_streams.sh` expanded from 10 to 15 cases.
+  New fixtures `frigate-api-go2rtc-streams.json` and
+  `frigate-api-go2rtc-streams-birdseye-only.json` cover the
+  frigate-proxy probe path including the issue-#1 "auto-generated
+  Birdseye only" shape. Total harness: 95 cases.
+
 ## [6.10.0] — 2026-05-10
 
 Minor bump because of the new user-facing subcommand. No breaking
