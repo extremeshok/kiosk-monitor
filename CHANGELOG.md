@@ -4,6 +4,26 @@ All notable changes to kiosk-monitor are recorded here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.9.3] — 2026-05-10
+
+### Fixed
+- `--doctor` summary line now reflects warnings + errors emitted by
+  `validate_runtime_config`. Before this fix, `Config warning:` /
+  `Config error:` lines from the validator printed straight to stderr
+  without ever touching the doctor's `$warnings` / `$errors`
+  counters, so the final `Doctor summary: N error(s), M warning(s)`
+  reported 0 / 0 even when validate had flagged real issues. Surfaced
+  by [issue #1](https://github.com/extremeshok/kiosk-monitor/issues/1)
+  reporter on v6.9.2: their `--doctor` correctly printed two
+  `Config warning:` lines from v6.9.0's MODE=vlc + HTTP-URL guard but
+  the summary said "0 error(s), 0 warning(s)". `_doctor_check_runtime_config`
+  now captures validate's stderr, re-emits each `Config warning:` /
+  `Config error:` line through `doctor_warn` / `doctor_error` (which
+  count toward the summary), and passes non-classified lines through
+  verbatim. New `tests/test_doctor_accounting.sh` (4 cases) replays
+  the reporter's exact misconfig from a fixture and asserts the
+  summary line now counts the validator's findings.
+
 ## [6.9.2] — 2026-05-10
 
 ### Added

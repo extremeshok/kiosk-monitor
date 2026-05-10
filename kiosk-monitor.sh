@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 6.9.2
+# kiosk-monitor.sh :: version 6.9.3
 # ======================================================================
 # Kiosk watchdog for Raspberry Pi OS trixie 64-bit (or newer Debian/RPi).
 # Supports Chromium fullscreen kiosk and VLC fullscreen video playback,
@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.9.2"
+SCRIPT_VERSION="6.9.3"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -3788,7 +3788,29 @@ _doctor_check_config_file() {
 }
 
 _doctor_check_runtime_config() {
-  if validate_runtime_config; then
+  # validate_runtime_config emits "Config warning:" and "Config error:"
+  # lines straight to stderr — they need to flow through doctor_warn /
+  # doctor_error so the summary line counts them. Without this hook the
+  # warnings still print (because we re-emit them), but the doctor's
+  # final `Doctor summary: N error(s), M warning(s)` reports 0/0 even
+  # when validate found real issues. Surfaced by issue #1 reporter on
+  # v6.9.3 when v6.9.0's MODE=vlc + HTTP-URL guard fired correctly but
+  # didn't get counted.
+  local val_stderr val_rc
+  val_stderr=$(validate_runtime_config 2>&1 >/dev/null)
+  val_rc=$?
+  if [ -n "$val_stderr" ]; then
+    local line
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      case "$line" in
+        "Config error: "*)   doctor_error  "${line#Config error: }" ;;
+        "Config warning: "*) doctor_warn   "${line#Config warning: }" ;;
+        *)                   printf '%s\n' "$line" ;;
+      esac
+    done <<<"$val_stderr"
+  fi
+  if [ "$val_rc" -eq 0 ]; then
     doctor_ok "runtime config validates"
   else
     doctor_error "runtime config has errors"
