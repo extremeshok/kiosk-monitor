@@ -25,3 +25,16 @@ jobs:
         run: |
           shellcheck -x -S warning kiosk-monitor.sh
           shellcheck -x -S warning kiosk-monitor.bash-completion docs/media/record-tui.sh
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install python3 (used by one js_escape test for JSON round-trip)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3
+
+      - name: Run bash test harness
+        run: tests/run.sh
