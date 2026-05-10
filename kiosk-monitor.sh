@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 6.9.0
+# kiosk-monitor.sh :: version 6.9.1
 # ======================================================================
 # Kiosk watchdog for Raspberry Pi OS trixie 64-bit (or newer Debian/RPi).
 # Supports Chromium fullscreen kiosk and VLC fullscreen video playback,
@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.9.0"
+SCRIPT_VERSION="6.9.1"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -220,11 +220,6 @@ apply_frigate_smart_defaults() {
   return 0
 }
 
-apply_frigate_smart_defaults
-
-# Ensure autofill has a concrete value once smart defaults have run.
-FRIGATE_BIRDSEYE_AUTO_FILL="${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
-
 normalize_config_values() {
   local _var val _theme_lc
   for _var in MODE MODE2 VLC_LOOP VLC_NO_AUDIO PROFILE_TMPFS PROFILE_SYNC_BACK PROFILE_TMPFS_PURGE \
@@ -257,16 +252,33 @@ normalize_config_values() {
   fi
 }
 
-normalize_config_values
-
-if [ "$MODE" != "chrome" ] && [ "$MODE" != "vlc" ]; then
-  echo "Error: unsupported MODE='$MODE' (expected chrome or vlc)" >&2
-  exit 1
-fi
-if [ -n "$MODE2" ] && [ "$MODE2" != "chrome" ] && [ "$MODE2" != "vlc" ]; then
-  echo "Error: unsupported MODE2='$MODE2' (expected chrome, vlc, or empty)" >&2
-  exit 1
-fi
+# main_init: orchestrates the post-config-load setup that used to live as
+# scattered top-level statements interleaved with the early function defs
+# (apply_frigate_smart_defaults invocation, FRIGATE_BIRDSEYE_AUTO_FILL
+# fixup, normalize_config_values invocation, MODE/MODE2 sanity checks).
+# Defined here for locality; *called* near the bottom of the script,
+# after every helper has been declared. That single move buys two
+# things:
+#   1. Safe forward references — any of these init steps can now
+#      consult a helper like chromium_vaapi_uses_legacy_i965 without
+#      hitting the function-ordering trap that bit v6.8.8.
+#   2. The early-exit MODE checks no longer fire before --version /
+#      --help can run, since main_init is invoked just before the
+#      action dispatcher.
+main_init() {
+  apply_frigate_smart_defaults
+  # Ensure autofill has a concrete value once smart defaults have run.
+  FRIGATE_BIRDSEYE_AUTO_FILL="${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
+  normalize_config_values
+  if [ "$MODE" != "chrome" ] && [ "$MODE" != "vlc" ]; then
+    echo "Error: unsupported MODE='$MODE' (expected chrome or vlc)" >&2
+    exit 1
+  fi
+  if [ -n "$MODE2" ] && [ "$MODE2" != "chrome" ] && [ "$MODE2" != "vlc" ]; then
+    echo "Error: unsupported MODE2='$MODE2' (expected chrome, vlc, or empty)" >&2
+    exit 1
+  fi
+}
 
 SHUTDOWN_REQUESTED=false
 RELOAD_REQUESTED=false
@@ -1382,30 +1394,20 @@ HTML
 # ======================================================================
 # Per-instance launch / stop
 # ======================================================================
-launch_chrome_instance() {
+# build_chrome_flags: populate a caller-supplied bash array (passed by
+# nameref, requires bash 4.3+) with the Chromium command-line flags for
+# an instance, including the merged --enable-features / --disable-features
+# switches and the kiosk-mode triplet. Does NOT include the trailing URL
+# — the caller appends that after deciding between real URL and waiting
+# page. Reads INSTANCE_CLASS, SESSION_TYPE, DEVTOOLS_*, and the legacy
+# i965 detector for feature-disable gating.
+#
+# Args: id, nameref-to-output-array, profile_root, x, y, w, h
+build_chrome_flags() {
   local id=$1
-  need_cmd curl
-  local chrome
-  chrome=$(chromium_binary)
-  [ -x "$chrome" ] || { log_instance "$id" "Chromium not found at $chrome"; return 1; }
-  need_cmd "$chrome" 2>/dev/null || true
-  maybe_defer_launch
+  local -n _flags_dst=$2
+  local profile_root=$3 x=$4 y=$5 w=$6 h=$7
 
-  local profile_root=${INSTANCE_PROFILE_DIR[$id]}
-  mkdir -p "$profile_root"
-  if [ "${EUID:-$(id -u)}" -eq 0 ]; then
-    chown -R "$GUI_USER":"$GUI_USER" "$profile_root" 2>/dev/null || true
-  fi
-  patch_chromium_prefs "$id"
-
-  # resolve placement
-  local geo name x y w h
-  geo=$(resolve_output_geometry "$id" || true)
-  IFS=$'\t' read -r name x y w h <<< "$geo"
-
-  cleanup_stray_processes "$id"
-
-  local url="${INSTANCE_URL[$id]}"
   # Merge our feature toggles with whatever the distro chromium wrapper
   # already sets (in /etc/chromium.d/*, /etc/chromium-browser/default,
   # ~/.config/chromium-flags.conf, or hardcoded inside the wrapper
@@ -1449,7 +1451,8 @@ launch_chrome_instance() {
     OverlayScrollbar UseOzonePlatform \
     VaapiVideoDecoder VaapiVideoEncoder \
     VaapiVideoDecodeLinuxGL)
-  local -a flags=(
+
+  _flags_dst=(
     --kiosk
     --start-fullscreen
     --no-first-run
@@ -1488,38 +1491,77 @@ launch_chrome_instance() {
     "--class=${INSTANCE_CLASS[$id]}"
     --new-window
   )
-  [ -n "$merged_disable" ] && flags+=( "--disable-features=$merged_disable" )
-  [ -n "$merged_enable" ]  && flags+=( "--enable-features=$merged_enable" )
+  [ -n "$merged_disable" ] && _flags_dst+=( "--disable-features=$merged_disable" )
+  [ -n "$merged_enable" ]  && _flags_dst+=( "--enable-features=$merged_enable" )
   if [ "${SESSION_TYPE:-}" = "x11" ]; then
-    flags+=( --ozone-platform=x11 )
+    _flags_dst+=( --ozone-platform=x11 )
   else
-    flags+=( --ozone-platform=wayland )
+    _flags_dst+=( --ozone-platform=wayland )
   fi
   local ext_path
   if ext_path=$(ensure_frigate_extension "$id"); then
-    flags+=( "--load-extension=$ext_path" "--disable-extensions-except=$ext_path" )
+    _flags_dst+=( "--load-extension=$ext_path" "--disable-extensions-except=$ext_path" )
   fi
-  [ "$DEVTOOLS_AUTO_OPEN" = "true" ] && flags+=( --auto-open-devtools-for-tabs )
-  [ -n "$DEVTOOLS_REMOTE_PORT" ] && flags+=( "--remote-debugging-port=$DEVTOOLS_REMOTE_PORT" )
+  [ "$DEVTOOLS_AUTO_OPEN" = "true" ] && _flags_dst+=( --auto-open-devtools-for-tabs )
+  [ -n "$DEVTOOLS_REMOTE_PORT" ] && _flags_dst+=( "--remote-debugging-port=$DEVTOOLS_REMOTE_PORT" )
+}
 
-  # Pick the URL we hand to Chromium. When the real target isn't reachable
-  # yet, point Chromium at a local "Waiting for target" page; its JS polls
-  # the target and navigates to it as soon as it responds — so the kiosk
-  # never shows a bare error page and operators see something useful on
-  # the display while the upstream is coming up.
-  local launch_url="$url"
+# resolve_chrome_launch_url: pick what URL to hand Chromium. When the
+# real target isn't reachable yet AND WAIT_FOR_URL=true, point Chromium
+# at a local "Waiting for target" file:// page whose JS polls the
+# target and navigates to it as soon as it responds — so the kiosk
+# never shows a bare ERR_CONNECTION_REFUSED page. Updates
+# INSTANCE_ON_WAITING_PAGE[id] so the watchdog knows to suppress
+# stall + health checks while the placeholder is up. Echoes the URL.
+resolve_chrome_launch_url() {
+  local id=$1
+  local url="${INSTANCE_URL[$id]}"
   INSTANCE_ON_WAITING_PAGE[$id]="no"
   if [ "$WAIT_FOR_URL" = "true" ]; then
     case "$url" in
       http://*|https://*)
         if ! health_check_instance "$id" >/dev/null 2>&1; then
-          launch_url=$(write_waiting_page "$id")
+          local waiting_url
+          waiting_url=$(write_waiting_page "$id")
           INSTANCE_ON_WAITING_PAGE[$id]="yes"
           log_instance "$id" "Target not reachable yet — launching with waiting page, JS will redirect when $url responds."
+          printf '%s\n' "$waiting_url"
+          return 0
         fi
         ;;
     esac
   fi
+  printf '%s\n' "$url"
+}
+
+launch_chrome_instance() {
+  local id=$1
+  need_cmd curl
+  local chrome
+  chrome=$(chromium_binary)
+  [ -x "$chrome" ] || { log_instance "$id" "Chromium not found at $chrome"; return 1; }
+  need_cmd "$chrome" 2>/dev/null || true
+  maybe_defer_launch
+
+  local profile_root=${INSTANCE_PROFILE_DIR[$id]}
+  mkdir -p "$profile_root"
+  if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+    chown -R "$GUI_USER":"$GUI_USER" "$profile_root" 2>/dev/null || true
+  fi
+  patch_chromium_prefs "$id"
+
+  # resolve placement
+  local geo name x y w h
+  geo=$(resolve_output_geometry "$id" || true)
+  IFS=$'\t' read -r name x y w h <<< "$geo"
+
+  cleanup_stray_processes "$id"
+
+  local launch_url
+  launch_url=$(resolve_chrome_launch_url "$id")
+
+  local -a flags=()
+  build_chrome_flags "$id" flags "$profile_root" "$x" "$y" "$w" "$h"
   flags+=( "$launch_url" )
 
   log_instance "$id" "Launching Chromium on $name (${w}x${h}+${x}+${y}) → $launch_url"
@@ -3719,29 +3761,23 @@ status_self() {
   fi
 }
 
-doctor_self() {
-  local errors=0 warnings=0
-
-  doctor_ok() { printf '[ok] %s\n' "$*"; }
-  doctor_warn() { warnings=$((warnings + 1)); printf '[warn] %s\n' "$*"; }
-  doctor_error() { errors=$((errors + 1)); printf '[error] %s\n' "$*"; }
-
-  printf 'kiosk-monitor doctor\n'
-  printf 'Version: %s\n' "$SCRIPT_VERSION"
-  printf 'Config : %s\n\n' "$CONFIG_FILE"
-
+_doctor_check_config_file() {
   if [ -f "$CONFIG_FILE" ]; then
     doctor_ok "config file exists"
   else
     doctor_warn "config file does not exist yet"
   fi
+}
 
+_doctor_check_runtime_config() {
   if validate_runtime_config; then
     doctor_ok "runtime config validates"
   else
     doctor_error "runtime config has errors"
   fi
+}
 
+_doctor_check_required_commands() {
   local cmd
   for cmd in curl flock sha256sum python3 grim wlr-randr; do
     if command -v "$cmd" >/dev/null 2>&1; then
@@ -3750,7 +3786,9 @@ doctor_self() {
       doctor_error "missing command: $cmd"
     fi
   done
+}
 
+_doctor_check_chromium_binary() {
   if [ "$MODE" = "chrome" ] || { [ -n "${MODE2:-}" ] && [ "${MODE2:-}" = "chrome" ]; }; then
     local chrome
     chrome=$(chromium_binary)
@@ -3760,7 +3798,9 @@ doctor_self() {
       doctor_error "Chromium binary is not executable: $chrome"
     fi
   fi
+}
 
+_doctor_check_vlc_binary() {
   if [ "$MODE" = "vlc" ] || { [ -n "${MODE2:-}" ] && [ "${MODE2:-}" = "vlc" ]; }; then
     local vlc
     vlc=$(vlc_binary)
@@ -3770,7 +3810,9 @@ doctor_self() {
       doctor_error "VLC binary is not executable: $vlc"
     fi
   fi
+}
 
+_doctor_check_desktop_user() {
   if [ -z "${GUI_USER:-}" ] || [ "$GUI_USER" = "root" ]; then
     auto_detect_gui_user >/dev/null 2>&1 || true
   fi
@@ -3781,70 +3823,108 @@ doctor_self() {
   else
     doctor_error "desktop user could not be detected; set GUI_USER"
   fi
+}
 
-  if [ -n "${GUI_UID:-}" ]; then
-    if _detect_wayland "$GUI_UID"; then
-      doctor_ok "Wayland session reachable: $WAYLAND_DISPLAY ($SESSION_COMPOSITOR)"
-      case "$SESSION_COMPOSITOR" in
-        labwc|labwc-pi) ;;
-        *) doctor_warn "Wayland compositor is $SESSION_COMPOSITOR; labwc window rules may not apply" ;;
-      esac
-    elif _detect_x11 "$GUI_UID"; then
-      doctor_ok "X11 fallback session reachable: DISPLAY=$DISPLAY ($SESSION_COMPOSITOR)"
-    else
-      doctor_warn "no reachable Wayland or X11 graphical session detected"
-    fi
+_doctor_check_graphical_session() {
+  [ -n "${GUI_UID:-}" ] || return 0
+  if _detect_wayland "$GUI_UID"; then
+    doctor_ok "Wayland session reachable: $WAYLAND_DISPLAY ($SESSION_COMPOSITOR)"
+    case "$SESSION_COMPOSITOR" in
+      labwc|labwc-pi) ;;
+      *) doctor_warn "Wayland compositor is $SESSION_COMPOSITOR; labwc window rules may not apply" ;;
+    esac
+  elif _detect_x11 "$GUI_UID"; then
+    doctor_ok "X11 fallback session reachable: DISPLAY=$DISPLAY ($SESSION_COMPOSITOR)"
+  else
+    doctor_warn "no reachable Wayland or X11 graphical session detected"
   fi
+}
 
-  PROFILE_RUNTIME_ROOT="${PROFILE_ROOT:-/home/${GUI_USER:-${USER:-pi}}/.local/share/kiosk-monitor}"
-  setup_instances
-  if refresh_outputs; then
+# Caller must have run setup_instances + refresh_outputs first, since
+# this consults INSTANCES + OUTPUTS_NAMES + INSTANCE_OUTPUT[].
+_doctor_check_outputs_and_mapping() {
+  if [ "${#OUTPUTS_NAMES[@]}" -gt 0 ]; then
     doctor_ok "outputs detected: ${OUTPUTS_NAMES[*]}"
-    local id req found name
-    for id in "${INSTANCES[@]}"; do
-      req=""
-      case "$id" in
-        1) req="${OUTPUT:-}" ;;
-        2) req="${OUTPUT2:-}" ;;
-      esac
-      [ -n "$req" ] || continue
-      found="no"
-      for name in "${OUTPUTS_NAMES[@]}"; do
-        [ "$name" = "$req" ] && { found="yes"; break; }
-      done
-      if [ "$found" = "yes" ]; then
-        doctor_ok "instance $id output is connected: $req"
-      else
-        doctor_warn "instance $id output is not currently connected: $req"
-      fi
-    done
   else
     doctor_warn "could not query outputs"
+    return 0
   fi
-
-  # Chromium-on-i965 + Frigate Birdseye is a known footgun (issue #1):
-  # Chromium 147's MSE pipeline freezes a Birdseye stream after a few
-  # minutes on Sandy Bridge through Coffee Lake Intel iGPUs while the
-  # rest of the page keeps rendering normally. The root cause is
-  # upstream Chromium and there's no clean kiosk-monitor-side fix
-  # because Birdseye's player choice is decided server-side from
-  # Frigate's `birdseye.restream` config and isn't user-overridable
-  # via localStorage. Doctor the box and recommend a route that
-  # doesn't touch MSE.
-  if chromium_vaapi_uses_legacy_i965; then
-    local id mode url is_birdseye_chrome="no"
-    for id in "${INSTANCES[@]}"; do
-      mode="${INSTANCE_MODE[$id]:-}"
-      url="${INSTANCE_URL[$id]:-}"
-      if [ "$mode" = "chrome" ] && is_frigate_birdseye_url "$url"; then
-        is_birdseye_chrome="yes"
-        break
-      fi
+  local id req found name
+  for id in "${INSTANCES[@]}"; do
+    req=""
+    case "$id" in
+      1) req="${OUTPUT:-}" ;;
+      2) req="${OUTPUT2:-}" ;;
+    esac
+    [ -n "$req" ] || continue
+    found="no"
+    for name in "${OUTPUTS_NAMES[@]}"; do
+      [ "$name" = "$req" ] && { found="yes"; break; }
     done
-    if [ "$is_birdseye_chrome" = "yes" ]; then
-      doctor_warn "Chromium + Frigate Birdseye detected on legacy i965 VAAPI hardware. Issue #1: the MSE-backed Birdseye stream freezes after a few minutes on this hardware combo. Recommended: switch the affected instance to MODE=vlc with the go2rtc RTSP stream — e.g. URL=\"rtsp://<frigate-host>:8554/birdseye\" — which sidesteps Chromium's MSE pipeline entirely. Trade-off: loses Frigate's web-UI chrome (camera labels, sidebar), but the kiosk stays up."
+    if [ "$found" = "yes" ]; then
+      doctor_ok "instance $id output is connected: $req"
+    else
+      doctor_warn "instance $id output is not currently connected: $req"
     fi
-  fi
+  done
+}
+
+# Chromium-on-i965 + Frigate Birdseye is a known footgun (issue #1):
+# Chromium 147's MSE pipeline freezes a Birdseye stream after a few
+# minutes on Sandy Bridge through Coffee Lake Intel iGPUs while the
+# rest of the page keeps rendering normally. The root cause is upstream
+# Chromium and there's no clean kiosk-monitor-side fix because
+# Birdseye's player choice is decided server-side from Frigate's
+# `birdseye.restream` config and isn't user-overridable via
+# localStorage. Doctor the box and recommend a route that doesn't
+# touch MSE.
+_doctor_check_i965_birdseye_footgun() {
+  chromium_vaapi_uses_legacy_i965 || return 0
+  local id mode url is_birdseye_chrome="no"
+  for id in "${INSTANCES[@]}"; do
+    mode="${INSTANCE_MODE[$id]:-}"
+    url="${INSTANCE_URL[$id]:-}"
+    if [ "$mode" = "chrome" ] && is_frigate_birdseye_url "$url"; then
+      is_birdseye_chrome="yes"
+      break
+    fi
+  done
+  [ "$is_birdseye_chrome" = "yes" ] || return 0
+  doctor_warn "Chromium + Frigate Birdseye detected on legacy i965 VAAPI hardware. Issue #1: the MSE-backed Birdseye stream freezes after a few minutes on this hardware combo. Recommended: switch the affected instance to MODE=vlc with the go2rtc RTSP stream — e.g. URL=\"rtsp://<frigate-host>:8554/birdseye\" — which sidesteps Chromium's MSE pipeline entirely. Trade-off: loses Frigate's web-UI chrome (camera labels, sidebar), but the kiosk stays up."
+}
+
+# doctor_self orchestrates the read-only checks in the order they need
+# to run (each later check may depend on state set up by earlier ones —
+# e.g. desktop-user → session → outputs → instance/output mapping).
+# Every check uses doctor_ok/doctor_warn/doctor_error which are defined
+# locally below; bash dynamic scoping lets the global _doctor_check_*
+# functions call them and have $errors/$warnings resolve to this
+# function's locals.
+doctor_self() {
+  local errors=0 warnings=0
+  doctor_ok()    { printf '[ok] %s\n' "$*"; }
+  doctor_warn()  { warnings=$((warnings + 1)); printf '[warn] %s\n' "$*"; }
+  doctor_error() { errors=$((errors + 1));    printf '[error] %s\n' "$*"; }
+
+  printf 'kiosk-monitor doctor\n'
+  printf 'Version: %s\n' "$SCRIPT_VERSION"
+  printf 'Config : %s\n\n' "$CONFIG_FILE"
+
+  _doctor_check_config_file
+  _doctor_check_runtime_config
+  _doctor_check_required_commands
+  _doctor_check_chromium_binary
+  _doctor_check_vlc_binary
+  _doctor_check_desktop_user
+  _doctor_check_graphical_session
+
+  # outputs + i965 footgun checks both consult INSTANCES/INSTANCE_*,
+  # so populate the instance metadata + output discovery once here.
+  PROFILE_RUNTIME_ROOT="${PROFILE_ROOT:-/home/${GUI_USER:-${USER:-pi}}/.local/share/kiosk-monitor}"
+  setup_instances
+  refresh_outputs >/dev/null 2>&1 || true
+  _doctor_check_outputs_and_mapping
+  _doctor_check_i965_birdseye_footgun
 
   printf '\nDoctor summary: %s error(s), %s warning(s)\n' "$errors" "$warnings"
   [ "$errors" -eq 0 ]
@@ -3919,6 +3999,11 @@ EOF
   fi
 fi
 ACTION_ARGS=("$@")
+
+# Kick off the deferred startup setup (smart defaults, normalize, MODE
+# sanity checks). Now that every helper has been defined this can call
+# anything it needs without function-ordering surprises.
+main_init
 
 case "$ACTION" in
   install)   install_self "${ACTION_ARGS[@]}"; exit 0 ;;
@@ -4037,27 +4122,9 @@ if [ -n "${BIRDSEYE_AUTO_FILL:-}${BIRDSEYE_MATCH_PATTERN:-}${BIRDSEYE_EXTENSION_
   log "Notice: BIRDSEYE_* config names are deprecated — rename to FRIGATE_BIRDSEYE_*."
 fi
 
-# --- config validation ---
-validate_runtime_config || exit 1
-
-# --- instance configuration ---
-setup_instances
-
-# --- outputs ---
-if ! refresh_outputs; then
-  log "Warning: wlr-randr output discovery failed; window placement will use defaults"
-  OUTPUTS_NAMES=( "HDMI-A-1" )
-  OUTPUT_GEOMETRY["HDMI-A-1"]="0 0 1920 1080"
-fi
-for id in "${INSTANCES[@]}"; do
-  # rc=1 means the requested output isn't connected yet — we still store the
-  # name so the main loop can pause until it returns.
-  resolve_output_geometry "$id" >/dev/null || true
-  log_instance "$id" "resolved output=${INSTANCE_OUTPUT[$id]}"
-  apply_display_overrides "$id"
-done
-# Install labwc window rules so each instance lands on the right output.
-ensure_labwc_window_rules
+# --- config validation + instance setup + output discovery + labwc rules ---
+# Same sequence the SIGHUP reload runs; see prepare_runtime_state.
+prepare_runtime_state || exit 1
 
 # --- exit cleanup (INT/TERM/HUP traps were installed earlier so they're
 #     active during the Wayland / GUI wait) ---
@@ -4097,13 +4164,53 @@ if [ "$WAIT_FOR_URL" = "true" ]; then
 fi
 
 # --- initial launch ---
-for id in "${INSTANCES[@]}"; do
-  launch_instance "$id" || log_instance "$id" "initial launch failed; watchdog will retry"
-  INSTANCE_LAST_GOOD[$id]=$(date +%s)
-  INSTANCE_LAST_HASH[$id]=$(capture_output_hash "$id" || true)
-done
+relaunch_all_instances
 
 # --- main watchdog loop ---
+
+# prepare_runtime_state: the post-config-load setup that both initial
+# startup and SIGHUP reload need. Applies smart defaults, normalizes,
+# validates, builds per-instance metadata, refreshes output geometry,
+# pushes per-instance display overrides, and writes labwc window rules.
+# Returns 0 on success, 1 if validate_runtime_config rejects the config
+# (caller decides whether to exit or just refuse to relaunch).
+#
+# Idempotent — re-running smart-defaults and normalize against an
+# already-normalised env is a no-op, so this is safe to call from
+# multiple lifecycle phases without double-counting.
+prepare_runtime_state() {
+  apply_frigate_smart_defaults
+  FRIGATE_BIRDSEYE_AUTO_FILL="${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
+  normalize_config_values
+  validate_runtime_config || return 1
+  setup_instances
+  if ! refresh_outputs; then
+    log "Warning: output discovery failed; window placement will use defaults"
+    OUTPUTS_NAMES=( "HDMI-A-1" )
+    OUTPUT_GEOMETRY["HDMI-A-1"]="0 0 1920 1080"
+  fi
+  local id
+  for id in "${INSTANCES[@]}"; do
+    # rc=1 means the requested output isn't connected yet — we still
+    # store the name so the main loop can pause until it returns.
+    resolve_output_geometry "$id" >/dev/null || true
+    log_instance "$id" "resolved output=${INSTANCE_OUTPUT[$id]:-(auto)}"
+    apply_display_overrides "$id"
+  done
+  ensure_labwc_window_rules
+}
+
+# relaunch_all_instances: spawn every configured instance and seed its
+# watchdog state arrays. Used by the initial launch and by SIGHUP reload.
+relaunch_all_instances() {
+  local id
+  for id in "${INSTANCES[@]}"; do
+    launch_instance "$id" || log_instance "$id" "launch failed; watchdog will retry"
+    INSTANCE_LAST_GOOD[$id]=$(date +%s)
+    INSTANCE_LAST_HASH[$id]=$(capture_output_hash "$id" || true)
+  done
+}
+
 reload_instances() {
   log "SIGHUP received — reloading configuration from $CONFIG_FILE."
   local id
@@ -4112,23 +4219,8 @@ reload_instances() {
     # shellcheck disable=SC1090
     . "$CONFIG_FILE"
   fi
-  apply_frigate_smart_defaults
-  FRIGATE_BIRDSEYE_AUTO_FILL="${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
-  normalize_config_values
-  validate_runtime_config || { log "Reload aborted: config invalid."; return 1; }
-  setup_instances
-  refresh_outputs || true
-  for id in "${INSTANCES[@]}"; do
-    resolve_output_geometry "$id" >/dev/null || true
-    log_instance "$id" "resolved output=${INSTANCE_OUTPUT[$id]}"
-    apply_display_overrides "$id"
-  done
-  ensure_labwc_window_rules
-  for id in "${INSTANCES[@]}"; do
-    launch_instance "$id" || log_instance "$id" "reload launch failed"
-    INSTANCE_LAST_GOOD[$id]=$(date +%s)
-    INSTANCE_LAST_HASH[$id]=$(capture_output_hash "$id" || true)
-  done
+  prepare_runtime_state || { log "Reload aborted: config invalid."; return 1; }
+  relaunch_all_instances
   log "Configuration reloaded."
 }
 
