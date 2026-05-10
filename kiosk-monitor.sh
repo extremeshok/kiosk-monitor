@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 6.8.7
+# kiosk-monitor.sh :: version 6.8.8
 # ======================================================================
 # Kiosk watchdog for Raspberry Pi OS trixie 64-bit (or newer Debian/RPi).
 # Supports Chromium fullscreen kiosk and VLC fullscreen video playback,
@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.8.7"
+SCRIPT_VERSION="6.8.8"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -135,6 +135,19 @@ FRIGATE_DARK_MODE="${FRIGATE_DARK_MODE:-}"
 FRIGATE_THEME="${FRIGATE_THEME:-}"
 FRIGATE_THEME_STORAGE_KEY="${FRIGATE_THEME_STORAGE_KEY:-frigate-ui-theme}"
 FRIGATE_COLOR_STORAGE_KEY="${FRIGATE_COLOR_STORAGE_KEY:-frigate-ui-color-scheme}"
+# Frigate "Preferred Live Mode" — pre-seeded into Frigate's localStorage by
+# the helper extension at document_start, before Frigate's React app boots.
+# Values:
+#   ""      — leave Frigate's own default alone
+#   "auto"  — same as "", but additionally smart-defaults to "jsmpeg" on
+#             hardware where Chromium MSE is known to be unstable (legacy
+#             i965 VAAPI driver — see extremeshok/kiosk-monitor#1).
+#   "off" / "none" — explicit opt-out (don't write anything to localStorage).
+#   "jsmpeg" — canvas-based player over WebSocket; bypasses MSE entirely.
+#   "mse"    — Frigate's default fmp4-over-WebSocket player.
+#   "webrtc" — peer-connection-based player.
+FRIGATE_LIVE_MODE="${FRIGATE_LIVE_MODE:-}"
+FRIGATE_LIVE_STORAGE_KEY="${FRIGATE_LIVE_STORAGE_KEY:-frigate-live-mode}"
 DEVTOOLS_AUTO_OPEN="${DEVTOOLS_AUTO_OPEN:-false}"
 DEVTOOLS_REMOTE_PORT="${DEVTOOLS_REMOTE_PORT:-}"
 
@@ -217,6 +230,9 @@ apply_frigate_smart_defaults() {
   [ -z "${FRIGATE_BIRDSEYE_AUTO_FILL:-}" ] && FRIGATE_BIRDSEYE_AUTO_FILL="true"
   [ -z "${FRIGATE_DARK_MODE:-}" ]          && FRIGATE_DARK_MODE="Dark"
   [ -z "${FRIGATE_THEME:-}" ]              && FRIGATE_THEME="High Contrast"
+  # FRIGATE_LIVE_MODE's smart-default needs chromium_vaapi_uses_legacy_i965,
+  # which lives further down. Resolved later via apply_frigate_live_mode_default
+  # — called from the run-loop startup path and from reload_instances.
   return 0
 }
 
@@ -249,6 +265,22 @@ normalize_config_values() {
     ""|default|none)                   FRIGATE_THEME="" ;;
     *)  echo "Warning: unrecognized FRIGATE_THEME='$FRIGATE_THEME' (passing through as-is)" >&2
         FRIGATE_THEME="$_theme_lc" ;;
+  esac
+
+  # FRIGATE_LIVE_MODE: three semantic states get distinct sentinels so the
+  # explicit opt-out doesn't get conflated with "user left it blank":
+  #   ""           → "auto"   (smart-default will resolve)
+  #   "auto"       → "auto"   (same)
+  #   "off"/"none" → "none"   (explicit don't-seed, suppresses smart-default)
+  #   "jsmpeg"/"mse"/"webrtc" → kept lower-case
+  # Unknown values pass through with a warning so user-supplied keys don't
+  # get silently dropped if Frigate adds a new mode in a future version.
+  case "$(printf '%s' "${FRIGATE_LIVE_MODE:-}" | tr '[:upper:]' '[:lower:]')" in
+    ""|auto)                FRIGATE_LIVE_MODE="auto" ;;
+    off|none)               FRIGATE_LIVE_MODE="none" ;;
+    jsmpeg|mse|webrtc)      FRIGATE_LIVE_MODE="$(printf '%s' "$FRIGATE_LIVE_MODE" | tr '[:upper:]' '[:lower:]')" ;;
+    *)  echo "Warning: unrecognized FRIGATE_LIVE_MODE='$FRIGATE_LIVE_MODE' (passing through as-is)" >&2
+        FRIGATE_LIVE_MODE="$(printf '%s' "$FRIGATE_LIVE_MODE" | tr '[:upper:]' '[:lower:]')" ;;
   esac
 
   case "$SCREEN_SAMPLE_MODE" in full|sample) ;; *) SCREEN_SAMPLE_MODE="sample" ;; esac
@@ -993,6 +1025,37 @@ trim_chromium_cache() {
     "$base/Application Cache" 2>/dev/null || true
 }
 
+# Resolve FRIGATE_LIVE_MODE's smart default. When the user left the value
+# blank or set it to "auto", pick "jsmpeg" on hardware where Chromium's
+# MSE pipeline is known to be unstable — currently VAAPI loaded via the
+# legacy i965 driver (Sandy Bridge through Coffee Lake Intel iGPUs,
+# including the Haswell box in extremeshok/kiosk-monitor#1 where
+# Chromium 147 stalls Birdseye after a few minutes while Firefox runs
+# the same MSE stream cleanly). Same detection that gates
+# UseChromeOSDirectVideoDecoder so the two heuristics stay in sync.
+#
+# Lives down here (rather than inside apply_frigate_smart_defaults) so it
+# can call chromium_vaapi_uses_legacy_i965 without bash function-ordering
+# headaches. Invoked once at run-loop startup and from reload_instances.
+apply_frigate_live_mode_default() {
+  local lc
+  lc=$(printf '%s' "${FRIGATE_LIVE_MODE:-}" | tr '[:upper:]' '[:lower:]')
+  case "$lc" in
+    ""|auto)
+      if chromium_vaapi_uses_legacy_i965; then
+        FRIGATE_LIVE_MODE="jsmpeg"
+        log "Frigate smart default: FRIGATE_LIVE_MODE=jsmpeg (legacy i965 VAAPI driver — Chromium MSE unstable, see issue #1)"
+      else
+        FRIGATE_LIVE_MODE=""
+      fi
+      ;;
+    none)
+      # explicit opt-out — collapse to empty so downstream skips the seed
+      FRIGATE_LIVE_MODE=""
+      ;;
+  esac
+}
+
 patch_chromium_prefs() {
   local id=$1
   local profile_root=${INSTANCE_PROFILE_DIR[$id]}
@@ -1057,8 +1120,13 @@ ensure_frigate_extension() {
   local id=$1
   local autofill="$FRIGATE_BIRDSEYE_AUTO_FILL"
   local dark="$FRIGATE_DARK_MODE" theme="$FRIGATE_THEME"
+  local live_mode="$FRIGATE_LIVE_MODE"
+  # "auto" should have been resolved by apply_frigate_live_mode_default,
+  # and "none" is the explicit opt-out; treat both as "no seed" defensively
+  # so a config-load path that bypasses the resolver can't smuggle them through.
+  case "$live_mode" in auto|none) live_mode="" ;; esac
   # Skip entirely when nothing is customised
-  [ "$autofill" = "true" ] || [ -n "$dark" ] || [ -n "$theme" ] || return 1
+  [ "$autofill" = "true" ] || [ -n "$dark" ] || [ -n "$theme" ] || [ -n "$live_mode" ] || return 1
   local profile_root=${INSTANCE_PROFILE_DIR[$id]}
   local url="${INSTANCE_URL[$id]}"
   local -a candidates=()
@@ -1125,13 +1193,15 @@ CSS
 
   # --- JS: theme + dark mode + runtime birdseye sizing -----------------
   local has_helper_js=0
-  if [ -n "$dark" ] || [ -n "$theme" ] || [ "$autofill" = "true" ]; then
+  if [ -n "$dark" ] || [ -n "$theme" ] || [ "$autofill" = "true" ] || [ -n "$live_mode" ]; then
     has_helper_js=1
-    local esc_dark esc_theme esc_tkey esc_ckey
+    local esc_dark esc_theme esc_tkey esc_ckey esc_live esc_lkey
     esc_dark=$(printf '%s' "$dark"  | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
     esc_theme=$(printf '%s' "$theme" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
     esc_tkey=$(printf '%s' "$FRIGATE_THEME_STORAGE_KEY" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
     esc_ckey=$(printf '%s' "$FRIGATE_COLOR_STORAGE_KEY" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+    esc_live=$(printf '%s' "$live_mode" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+    esc_lkey=$(printf '%s' "${FRIGATE_LIVE_STORAGE_KEY:-frigate-live-mode}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
     local js_autofill="false"
     [ "$autofill" = "true" ] && js_autofill="true"
     cat > "$dir/frigate-helper.js" <<JS
@@ -1140,14 +1210,23 @@ CSS
   var THEME     = "$esc_theme";
   var TKEY      = "$esc_tkey";
   var CKEY      = "$esc_ckey";
+  var LIVE_MODE = "$esc_live";
+  var LKEY      = "$esc_lkey";
   var AUTOFILL  = $js_autofill;
   var MARGIN    = $margin;
   var GRID_SEL  = "#pageRoot > div > div > div > div.react-grid-layout.grid-layout";
 
-  // Theme storage keys — write the canonical one plus well-known aliases
-  // so the Frigate UI picks it up across versions.
+  // Storage-key aliases — write the canonical key plus well-known
+  // alternates so the Frigate UI picks the value up across versions
+  // (vite-* are 0.13+, plain ones are older / forks).
   var THEME_ALIASES = [TKEY, "vite-ui-theme", "ui-theme", "theme"];
   var COLOR_ALIASES = [CKEY, "vite-ui-color", "color-scheme", "frigate-color-scheme"];
+  // "Preferred Live Mode" key has been spelled several ways across
+  // Frigate versions and forks. Cover the documented + observed names
+  // so the seed survives version drift.
+  var LIVE_ALIASES  = [LKEY, "frigate-live-mode", "live-mode",
+                       "preferred-live-mode", "frigate-preferred-live-mode",
+                       "vite-ui-live-mode"];
   function setAll(keys, value) {
     if (!value) return;
     for (var i = 0; i < keys.length; i++) {
@@ -1201,6 +1280,7 @@ CSS
   }
   setAll(THEME_ALIASES, THEME);
   setAll(COLOR_ALIASES, DARK);
+  setAll(LIVE_ALIASES, LIVE_MODE);
   applyAll();
   document.addEventListener("DOMContentLoaded", applyAll);
   window.addEventListener("resize", resizeBirdseye);
@@ -2485,6 +2565,8 @@ EOF
     emit_config_line FRIGATE_THEME "${FRIGATE_THEME:-}"
     emit_config_line FRIGATE_THEME_STORAGE_KEY "${FRIGATE_THEME_STORAGE_KEY:-frigate-ui-theme}"
     emit_config_line FRIGATE_COLOR_STORAGE_KEY "${FRIGATE_COLOR_STORAGE_KEY:-frigate-ui-color-scheme}"
+    emit_config_line FRIGATE_LIVE_MODE         "${FRIGATE_LIVE_MODE:-}"
+    emit_config_line FRIGATE_LIVE_STORAGE_KEY  "${FRIGATE_LIVE_STORAGE_KEY:-frigate-live-mode}"
     emit_config_line DEVTOOLS_AUTO_OPEN "${DEVTOOLS_AUTO_OPEN:-false}"
     emit_config_line DEVTOOLS_REMOTE_PORT "${DEVTOOLS_REMOTE_PORT:-}"
     emit_config_line LOCK_FILE "${LOCK_FILE:-/var/lock/kiosk-monitor.lock}"
@@ -3651,6 +3733,7 @@ status_self() {
     printf '  dark-mode         : %s\n' "${FRIGATE_DARK_MODE:-(none)}"
     printf '  theme             : %s\n' "${FRIGATE_THEME:-(none)}"
     printf '  birdseye autofill : %s\n' "${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
+    printf '  live mode         : %s\n' "${FRIGATE_LIVE_MODE:-(frigate default)}"
     if [ -n "${FRIGATE_BIRDSEYE_WIDTH:-}" ] || [ -n "${FRIGATE_BIRDSEYE_HEIGHT:-}" ]; then
       printf '  birdseye size     : %sx%s (fixed)\n' "${FRIGATE_BIRDSEYE_WIDTH:-auto}" "${FRIGATE_BIRDSEYE_HEIGHT:-auto}"
     else
@@ -4007,6 +4090,7 @@ log "==== START kiosk-monitor v$SCRIPT_VERSION at $(date -Is) ===="
 log "Desktop user: $GUI_USER (uid=$GUI_UID), WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-?}"
 log "Outputs: ${OUTPUTS_NAMES[*]:-none}"
 log "Instances: ${INSTANCES[*]}"
+apply_frigate_live_mode_default
 
 # --- health-gate for VLC instances (chrome shows a waiting page instead) ---
 # Chromium launches immediately with a local "Waiting for target" page
@@ -4038,6 +4122,7 @@ reload_instances() {
     . "$CONFIG_FILE"
   fi
   apply_frigate_smart_defaults
+  apply_frigate_live_mode_default
   FRIGATE_BIRDSEYE_AUTO_FILL="${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
   normalize_config_values
   validate_runtime_config || { log "Reload aborted: config invalid."; return 1; }
