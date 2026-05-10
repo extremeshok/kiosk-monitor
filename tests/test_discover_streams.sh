@@ -39,6 +39,9 @@ case "\$url" in
   # and it has statically-declared streams.
   http://test-frigate-no-proxy/api/go2rtc/streams) exit 22 ;;
   http://test-frigate-no-proxy/api/config)         cat "$FIXTURES_DIR/frigate-api-config.json" ;;
+  # Frigate with RTSP auth (go2rtc.rtsp.username / .password set)
+  http://test-frigate-auth/api/go2rtc/streams)     cat "$FIXTURES_DIR/frigate-api-go2rtc-streams-birdseye-only.json" ;;
+  http://test-frigate-auth/api/config)             cat "$FIXTURES_DIR/frigate-api-config-with-rtsp-auth.json" ;;
   # Frigate with alternate rtsp.listen port form
   http://test-frigate-rtsp-tcp/api/go2rtc/streams) exit 22 ;;
   http://test-frigate-rtsp-tcp/api/config)         cat "$FIXTURES_DIR/frigate-api-config-rtsp-tcp.json" ;;
@@ -155,5 +158,22 @@ test_case "Frigate on the default :5000 does NOT trigger Docker note"
 run_kiosk --discover-streams http://test-frigate-proxy
 # test-frigate-proxy has no port specified, so parsed.port is None → 5000
 assert_no_match 'NOTE.*Docker port-mapping' "$LAST_STDOUT"
+
+# ---- credential extraction (v6.10.2) ------------------------------------
+
+test_case "RTSP credentials in Frigate config are embedded in suggested URLs"
+run_kiosk --discover-streams http://test-frigate-auth
+# admin / s3cr@t! → admin:s3cr%40t%21 after percent-encoding
+assert_match 'rtsp://admin:s3cr%40t%21@test-frigate-auth:8554/birdseye' "$LAST_STDOUT"
+
+test_case "RTSP credentials trigger a NOTE about config sensitivity"
+run_kiosk --discover-streams http://test-frigate-auth
+assert_match 'NOTE.*RTSP credentials' "$LAST_STDOUT"
+assert_match 'go2rtc.rtsp.username' "$LAST_STDOUT"
+
+test_case "no RTSP credentials = no userinfo prefix on URLs"
+run_kiosk --discover-streams http://test-frigate-proxy
+# Make sure rtsp://userinfo@ pattern is absent
+assert_no_match 'rtsp://[^/]+@test-frigate-proxy' "$LAST_STDOUT"
 
 trap _summary EXIT

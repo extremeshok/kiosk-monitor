@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 6.10.1
+# kiosk-monitor.sh :: version 6.10.2
 # ======================================================================
 # Kiosk watchdog for Raspberry Pi OS trixie 64-bit (or newer Debian/RPi).
 # Supports Chromium fullscreen kiosk and VLC fullscreen video playback,
@@ -28,7 +28,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.10.1"
+SCRIPT_VERSION="6.10.2"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -3807,7 +3807,7 @@ _doctor_check_config_file() {
 #   1 = endpoint unreachable, no streams configured, or parse error
 #   2 = usage error (no URL provided)
 #
-# Surfaced by issue #1 reporter on v6.10.1: the doctor's VLC+HTTP guard
+# Surfaced by issue #1 reporter on v6.10.2: the doctor's VLC+HTTP guard
 # was telling them to "point at the go2rtc RTSP stream — e.g.
 # rtsp://<frigate>:8554/birdseye", but discovering the actual stream
 # names and port required curl+jq archaeology. This function turns
@@ -3929,6 +3929,8 @@ host      = parsed.hostname or url
 streams   = []
 rtsp_port = "8554"   # go2rtc default
 rtsp_port_source = "default (go2rtc)"
+rtsp_user = ""
+rtsp_pass = ""
 
 def parse_listen(listen_str):
     if ":" in listen_str:
@@ -3937,13 +3939,25 @@ def parse_listen(listen_str):
             return cand
     return None
 
+def harvest_rtsp_meta(cfg):
+    """Pull rtsp.listen / username / password out of a parsed Frigate
+    /api/config response. Each may be absent."""
+    g2 = cfg.get("go2rtc") or {}
+    rtsp = g2.get("rtsp") or {}
+    return (
+        rtsp.get("listen", "") or "",
+        rtsp.get("username", "") or "",
+        rtsp.get("password", "") or "",
+        sorted((g2.get("streams") or {}).keys()),
+    )
+
 if kind == "frigate-proxy":
     data    = json.loads(body)
     streams = sorted(data.keys())
     if cfg_body:
         try:
             cfg = json.loads(cfg_body)
-            listen = ((cfg.get("go2rtc") or {}).get("rtsp") or {}).get("listen", "") or ""
+            listen, rtsp_user, rtsp_pass, _ = harvest_rtsp_meta(cfg)
             p = parse_listen(listen)
             if p:
                 rtsp_port = p
@@ -3953,9 +3967,7 @@ if kind == "frigate-proxy":
     print("Frigate detected at " + host + ":" + str(parsed.port or 5000) + " (via /api/go2rtc/streams)")
 elif kind == "frigate":
     cfg = json.loads(body)
-    g2 = cfg.get("go2rtc") or {}
-    streams = sorted((g2.get("streams") or {}).keys())
-    listen = (g2.get("rtsp") or {}).get("listen", "") or ""
+    listen, rtsp_user, rtsp_pass, streams = harvest_rtsp_meta(cfg)
     p = parse_listen(listen)
     if p:
         rtsp_port = p
@@ -3998,14 +4010,33 @@ if (kind in ("frigate", "frigate-proxy")
     print("      and re-run with --rtsp-port N to confirm:")
     print("        kiosk-monitor --discover-streams " + url + " --rtsp-port N")
 
+# Credentials embedded in the RTSP URL. Frigate's go2rtc.rtsp.username
+# / .password are what VLC needs to authenticate when Frigate has set
+# them. URL-encoded conservatively in case the password contains
+# reserved characters.
+from urllib.parse import quote
+def _userinfo():
+    if not (rtsp_user and rtsp_pass):
+        return ""
+    return quote(rtsp_user, safe="") + ":" + quote(rtsp_pass, safe="") + "@"
+ui = _userinfo()
+
+if rtsp_user or rtsp_pass:
+    print()
+    print("NOTE: Frigate config reports RTSP credentials (go2rtc.rtsp.username /")
+    print("      .password). The suggested URLs below embed them so kiosk-monitor")
+    print("      can connect without modification. Treat the kiosk-monitor.conf")
+    print("      copy as sensitive (it's root-owned, but still — credentials live")
+    print("      in it).")
+
 print()
 print("Available streams:")
 for name in streams:
-    print("  rtsp://" + host + ":" + rtsp_port + "/" + name)
+    print("  rtsp://" + ui + host + ":" + rtsp_port + "/" + name)
 print()
 print("Suggested kiosk-monitor.conf snippet:")
 print('  MODE="vlc"')
-print('  URL="rtsp://' + host + ":" + rtsp_port + "/" + streams[0] + '"')
+print('  URL="rtsp://' + ui + host + ":" + rtsp_port + "/" + streams[0] + '"')
 PY
 )" <<<"$body"
 }
@@ -4043,7 +4074,7 @@ _doctor_check_runtime_config() {
   # warnings still print (because we re-emit them), but the doctor's
   # final `Doctor summary: N error(s), M warning(s)` reports 0/0 even
   # when validate found real issues. Surfaced by issue #1 reporter on
-  # v6.10.1 when v6.9.0's MODE=vlc + HTTP-URL guard fired correctly but
+  # v6.10.2 when v6.9.0's MODE=vlc + HTTP-URL guard fired correctly but
   # didn't get counted.
   local val_stderr val_rc
   val_stderr=$(validate_runtime_config 2>&1 >/dev/null)

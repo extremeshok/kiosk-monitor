@@ -4,6 +4,24 @@ All notable changes to kiosk-monitor are recorded here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.10.2] — 2026-05-10
+
+### Added
+- `--discover-streams` now extracts `go2rtc.rtsp.username` and
+  `go2rtc.rtsp.password` from Frigate's `/api/config` and embeds
+  them (percent-encoded) in the suggested RTSP URLs. Without this,
+  the operator copies a stream URL that fails to authenticate
+  against Frigate's go2rtc when auth is configured. Live-tested
+  against the viewport3 fleet's production Frigate where
+  `URL2="rtsp://admin:123456@.../birdseye"` was the working URL —
+  v6.10.2 now produces that shape automatically.
+- New NOTE in the discovery output when credentials are embedded,
+  reminding the operator that `kiosk-monitor.conf` is sensitive
+  (root-owned but stores credentials in plaintext).
+- `tests/fixtures/frigate-api-config-with-rtsp-auth.json` +
+  three new test cases (credentials embedded, NOTE printed,
+  no-creds output unchanged). 99 cases total in the harness.
+
 ## [6.10.1] — 2026-05-10
 
 Surfaced by live-testing v6.10.0 against the production Frigate
