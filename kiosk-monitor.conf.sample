@@ -50,19 +50,6 @@ FRIGATE_THEME=""                  # "", "None", "Default", "Blue", "Green", "Nor
 #FRIGATE_THEME_STORAGE_KEY="frigate-ui-theme"           # override if your Frigate version uses a different key
 #FRIGATE_COLOR_STORAGE_KEY="frigate-ui-color-scheme"    # ditto
 
-# Pre-seed Frigate's "Preferred Live Mode" via localStorage at page load.
-# Useful when Chromium's MSE pipeline is unstable on your hardware (e.g.
-# Haswell + i965 — issue #1: Birdseye freezes after a few minutes while
-# Firefox runs the same MSE stream cleanly).
-#   ""        — leave Frigate's own default alone
-#   "auto"    — same as "" but smart-defaults to "jsmpeg" on legacy i965
-#   "off" / "none" — explicit opt-out (don't seed)
-#   "jsmpeg"  — canvas-over-WebSocket player; bypasses MSE entirely
-#   "mse"     — Frigate's default fmp4-over-WebSocket player
-#   "webrtc"  — peer-connection-based player
-FRIGATE_LIVE_MODE=""
-#FRIGATE_LIVE_STORAGE_KEY="frigate-live-mode"           # override if your Frigate version uses a different key
-
 # ---- VLC-specific (MODE=vlc) --------------------------------------------
 #VLC_BIN="/usr/bin/vlc"
 VLC_LOOP=true
