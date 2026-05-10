@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 6.10.2
+# kiosk-monitor.sh :: version 6.10.3
 # ======================================================================
 # Kiosk watchdog for Raspberry Pi OS trixie 64-bit (or newer Debian/RPi).
 # Supports Chromium fullscreen kiosk and VLC fullscreen video playback,
@@ -28,7 +28,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.10.2"
+SCRIPT_VERSION="6.10.3"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -3650,6 +3650,134 @@ Install it now (enable at boot + start)?"; then
   fi
 }
 
+# Interactive wrapper around discover_frigate_streams. Walks the
+# operator through: pick a Frigate / go2rtc URL → optional RTSP port
+# override → run the discovery → show the full output in a msgbox →
+# if streams were found, offer a radiolist to pick one → assign it to
+# instance 1 or 2 with MODE=vlc. Single-step flows for everything that
+# doesn't need a sub-prompt; nothing irreversible without
+# confirmation. Surfaced from the main menu entry "discover".
+_tui_discover_streams() {
+  # Default URL: peel http(s)://host:port off whatever the operator has
+  # already typed for either instance — that's usually a Frigate web
+  # URL waiting to be replaced with an RTSP URL.
+  local default_url=""
+  case "${TUI_URL:-}" in
+    http://*|https://*) default_url=$TUI_URL ;;
+    *) case "${TUI_URL2:-}" in
+         http://*|https://*) default_url=$TUI_URL2 ;;
+       esac ;;
+  esac
+  default_url=$(printf '%s' "$default_url" | sed -E 's|^(https?://[^/]+).*|\1|')
+
+  local frigate_url rtsp_port
+  frigate_url=$(_wt_input "Discover streams — server URL" \
+    "Frigate web URL or standalone go2rtc URL (probes /api/go2rtc/streams → /api/config → /api/streams in that order):" \
+    "$default_url") || return 0
+  if [ -z "$frigate_url" ]; then
+    whiptail --title "Discover streams" --msgbox "URL required — cancelled." 8 60
+    return 0
+  fi
+
+  rtsp_port=$(_wt_input "Discover streams — RTSP port override (optional)" \
+    "External RTSP port. Leave blank to use whatever Frigate reports in its config — but for Dockerised Frigate the external port is often mapped (e.g. :30060 → internal :8554), so you may need to override here." \
+    "") || return 0
+
+  # Probe. Capture stdout + stderr together so the user sees the full
+  # context (banner, port source, NOTEs, stream list) in one msgbox.
+  local out rc
+  set +e
+  if [ -n "$rtsp_port" ]; then
+    out=$(discover_frigate_streams "$frigate_url" --rtsp-port "$rtsp_port" 2>&1)
+  else
+    out=$(discover_frigate_streams "$frigate_url" 2>&1)
+  fi
+  rc=$?
+  set -e
+
+  # Always show the full output. Lets the operator see the diagnostic
+  # context (Docker port-mapping NOTE, credentials NOTE, source of the
+  # RTSP port) — and on failure, the multi-probe error explanation.
+  local box_title="Discovery result"
+  [ "$rc" -ne 0 ] && box_title="Discovery failed (exit $rc)"
+  whiptail --title "$box_title" --msgbox "$out" 24 100 || true
+
+  [ "$rc" -eq 0 ] || return 0
+
+  # Pull rtsp:// URLs out of the captured output so we can offer them in
+  # a radiolist. Lines we want look like `  rtsp://host:port/streamname`
+  # (two-space indent matches what the python emitter prints).
+  local -a stream_urls=()
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      "  rtsp://"*) stream_urls+=("${line#  }") ;;
+    esac
+  done <<<"$out"
+  # Discovery succeeded but no streams parsed (e.g. an empty-streams
+  # path that exited 0 — defensive): nothing to assign, just bail.
+  if [ "${#stream_urls[@]}" -eq 0 ]; then
+    return 0
+  fi
+  # The python emitter prints each stream once in the "Available streams"
+  # block AND once in the "Suggested kiosk-monitor.conf snippet" block.
+  # Dedup so the radiolist isn't doubled.
+  local -A seen=()
+  local -a unique_urls=()
+  for line in "${stream_urls[@]}"; do
+    [ -n "${seen[$line]:-}" ] && continue
+    seen[$line]=1
+    unique_urls+=("$line")
+  done
+  if [ "${#unique_urls[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  # Build the radiolist; pre-select the first stream.
+  local -a radio_items=()
+  local i=1 select_state
+  for line in "${unique_urls[@]}"; do
+    if [ "$i" -eq 1 ]; then select_state="on"; else select_state="off"; fi
+    radio_items+=("url-$i" "$line" "$select_state")
+    i=$((i + 1))
+  done
+
+  local picked
+  picked=$(_wt_run whiptail --title "Pick a stream" --radiolist \
+    "Select an RTSP URL to assign to an instance (or Cancel to leave config unchanged):" \
+    20 110 "${#unique_urls[@]}" "${radio_items[@]}") || return 0
+  [ -n "$picked" ] || return 0
+  local picked_idx="${picked#url-}"
+  local picked_url="${unique_urls[$((picked_idx - 1))]}"
+
+  # Which instance? Show the current URL in each option so the operator
+  # can see what they're overwriting.
+  local target
+  target=$(_wt_menu "Apply to which instance?" \
+    "Set MODE=vlc + URL on the chosen instance. The URL above will be embedded into kiosk-monitor.conf when you Save or Apply." \
+    14 80 3 \
+    "1"      "Instance 1 — current: $(_tui_preview_value "$TUI_URL" "(unset)")" \
+    "2"      "Instance 2 — current: $(_tui_preview_value "$TUI_URL2" "(unset)")" \
+    "cancel" "Don't apply — just close") || return 0
+  case "$target" in
+    1)
+      TUI_MODE="vlc"
+      TUI_URL="$picked_url"
+      TUI_DIRTY="yes"
+      whiptail --title "Applied" --msgbox \
+        "Instance 1 set to:\n  MODE=vlc\n  URL=$picked_url\n\nUse 'Apply' or 'Save' from the main menu to write it to $CONFIG_FILE." 14 80 || true
+      ;;
+    2)
+      TUI_MODE2="vlc"
+      TUI_URL2="$picked_url"
+      TUI_DIRTY="yes"
+      whiptail --title "Applied" --msgbox \
+        "Instance 2 set to:\n  MODE2=vlc\n  URL2=$picked_url\n\nUse 'Apply' or 'Save' from the main menu to write it to $CONFIG_FILE." 14 80 || true
+      ;;
+    cancel|*) ;;
+  esac
+}
+
 _tui_main_menu() {
   local inst1_label inst2_label frig_label adv_label svc_label
   while true; do
@@ -3667,13 +3795,14 @@ _tui_main_menu() {
     [ "$TUI_DIRTY" = "yes" ] && dirty_marker=" *"
     local choice
     choice=$(_wt_menu "kiosk-monitor ${SCRIPT_VERSION}${dirty_marker}" \
-      "Main menu — pick an area to edit, or save and apply." 22 78 12 \
+      "Main menu — pick an area to edit, or save and apply." 23 78 13 \
       "instance1"  "Instance 1:  $inst1_label" \
       "instance2"  "Instance 2:  $inst2_label" \
       "frigate"    "Frigate helper:  $frig_label" \
       "timing"     "Timing & restart thresholds:  $adv_label" \
       "profile"    "Profile / logging / VLC options" \
       "service"    "Service:  $svc_label" \
+      "discover"   "Discover Frigate / go2rtc RTSP streams" \
       "editor"     "Open $CONFIG_FILE in \$EDITOR" \
       "reload"     "Reload config file (discard in-memory edits)" \
       "apply"      "Save and restart the service (stay in menu)" \
@@ -3686,6 +3815,7 @@ _tui_main_menu() {
       timing)    _tui_edit_timing ;;
       profile)   _tui_edit_profile_logs ;;
       service)   _tui_service_menu ;;
+      discover)  _tui_discover_streams ;;
       editor)    _tui_edit_in_editor ;;
       reload)
         _tui_load_config
@@ -3807,7 +3937,7 @@ _doctor_check_config_file() {
 #   1 = endpoint unreachable, no streams configured, or parse error
 #   2 = usage error (no URL provided)
 #
-# Surfaced by issue #1 reporter on v6.10.2: the doctor's VLC+HTTP guard
+# Surfaced by issue #1 reporter on v6.10.3: the doctor's VLC+HTTP guard
 # was telling them to "point at the go2rtc RTSP stream — e.g.
 # rtsp://<frigate>:8554/birdseye", but discovering the actual stream
 # names and port required curl+jq archaeology. This function turns
@@ -4074,7 +4204,7 @@ _doctor_check_runtime_config() {
   # warnings still print (because we re-emit them), but the doctor's
   # final `Doctor summary: N error(s), M warning(s)` reports 0/0 even
   # when validate found real issues. Surfaced by issue #1 reporter on
-  # v6.10.2 when v6.9.0's MODE=vlc + HTTP-URL guard fired correctly but
+  # v6.10.3 when v6.9.0's MODE=vlc + HTTP-URL guard fired correctly but
   # didn't get counted.
   local val_stderr val_rc
   val_stderr=$(validate_runtime_config 2>&1 >/dev/null)

@@ -4,6 +4,32 @@ All notable changes to kiosk-monitor are recorded here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.10.3] — 2026-05-10
+
+### Added
+- TUI integration for `--discover-streams`. Main menu gains a
+  "Discover Frigate / go2rtc RTSP streams" entry; choosing it walks
+  the operator through:
+    1. Frigate (or go2rtc) URL prompt — defaulting to whatever HTTP
+       URL is already configured on either instance.
+    2. Optional RTSP port override (for Dockerised Frigate where
+       external port ≠ go2rtc internal `:8554`).
+    3. Probe via `discover_frigate_streams`. Full output (banner,
+       port source, Docker port-mapping NOTE, credentials NOTE,
+       stream list) is shown in a whiptail msgbox so the operator
+       sees the same diagnostic context they'd see at the command
+       line.
+    4. On success, radiolist of discovered RTSP URLs.
+    5. Instance picker (1 / 2 / cancel) that sets `MODE=vlc` + URL
+       on the chosen instance and marks the TUI dirty so the
+       standard Apply / Save flows write the change to
+       `kiosk-monitor.conf`.
+  Nothing irreversible without confirmation; cancel paths return
+  to the main menu without mutating state. Surfaced via four new
+  structural tests (function declared, menu entry present,
+  dispatch case branch, delegation to `discover_frigate_streams`).
+  Total harness: 103 cases.
+
 ## [6.10.2] — 2026-05-10
 
 ### Added

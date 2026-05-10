@@ -176,4 +176,22 @@ run_kiosk --discover-streams http://test-frigate-proxy
 # Make sure rtsp://userinfo@ pattern is absent
 assert_no_match 'rtsp://[^/]+@test-frigate-proxy' "$LAST_STDOUT"
 
+# ---- TUI integration (v6.10.3) ------------------------------------------
+# whiptail-based menus are awkward to drive headless. These are
+# structural tests: the function exists, the main menu lists the entry,
+# both helpers it depends on are in place. Black-box behaviour gets
+# verified by ssh demo on the Pi 5 viewport on each release.
+
+test_case "TUI: _tui_discover_streams function exists"
+assert_succeeds "function declared" grep -q '^_tui_discover_streams() {$' "$SCRIPT"
+
+test_case "TUI: main menu lists 'discover' entry"
+assert_succeeds "menu entry present" grep -q '"discover"   "Discover Frigate / go2rtc RTSP streams"' "$SCRIPT"
+
+test_case "TUI: main-menu case statement dispatches to _tui_discover_streams"
+assert_succeeds "case branch present" grep -q 'discover)  _tui_discover_streams' "$SCRIPT"
+
+test_case "TUI: _tui_discover_streams uses discover_frigate_streams"
+assert_succeeds "delegation present" bash -c "sed -n '/^_tui_discover_streams() {\$/,/^}\$/p' \"$SCRIPT\" | grep -q discover_frigate_streams"
+
 trap _summary EXIT
