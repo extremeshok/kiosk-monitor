@@ -1,0 +1,11 @@
+{
+  "version": "0.14.1",
+  "go2rtc": {
+    "streams": {
+      "birdseye": ["ffmpeg:birdseye"]
+    },
+    "rtsp": {
+      "listen": "tcp://0.0.0.0:9999"
+    }
+  }
+}

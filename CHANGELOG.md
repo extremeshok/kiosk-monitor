@@ -4,6 +4,46 @@ All notable changes to kiosk-monitor are recorded here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.10.0] — 2026-05-10
+
+Minor bump because of the new user-facing subcommand. No breaking
+changes; all existing flags / behaviour preserved.
+
+### Added
+- `kiosk-monitor --discover-streams URL` subcommand: probes a Frigate
+  or go2rtc HTTP endpoint and prints the actual RTSP stream URLs
+  available, plus a copy-pasteable `MODE=vlc` / `URL=…` snippet for
+  `kiosk-monitor.conf`. Probes `<url>/api/config` first (Frigate's
+  config endpoint — yields `go2rtc.streams` + `go2rtc.rtsp.listen`
+  for the port); falls back to `<url>/api/streams` (standalone
+  go2rtc). RTSP port is parsed from `go2rtc.rtsp.listen` (handles
+  `:8554`, `tcp://:8554`, `0.0.0.0:8554`); defaults to `8554` when
+  unset. Exit codes: 0 = streams found, 1 = endpoint unreachable or
+  empty, 2 = usage error.
+- `--doctor` auto-discovery: when the VLC + HTTP-URL guard fires
+  (instance with `MODE=vlc` pointed at an HTTP web page that doesn't
+  look like a media stream), the doctor now follows up by running
+  `discover_frigate_streams` against the URL inline. Operator sees
+  the actual RTSP candidates underneath the warning, not a generic
+  `rtsp://<frigate>:8554/birdseye` placeholder. Each unique URL is
+  probed at most once per `--doctor` invocation. `validate_runtime_config`
+  itself stays synchronous so script startup doesn't hang on a slow
+  Frigate.
+- `tests/test_discover_streams.sh` with 10 cases driven by a curl
+  shim and four JSON fixtures (`frigate-api-config.json` default,
+  `…-rtsp-tcp` for the `tcp://0.0.0.0:9999` listen form,
+  `…-no-streams` for empty go2rtc.streams, `go2rtc-api-streams.json`
+  for the standalone-go2rtc path). Covers: Frigate path with
+  default + alternate RTSP port, sorted output, copy-paste snippet
+  shape, empty-streams hint, go2rtc-direct fallback, unreachable
+  host error, missing-URL usage error, trailing-slash robustness.
+  Total harness: 83 cases.
+
+### Changed
+- `--help` text and the top-of-file usage block document the new
+  subcommand. `kiosk-monitor.bash-completion` includes
+  `--discover-streams` in the action list.
+
 ## [6.9.3] — 2026-05-10
 
 ### Fixed

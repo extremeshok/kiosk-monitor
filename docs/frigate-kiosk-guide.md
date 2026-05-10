@@ -169,6 +169,22 @@ Frigate web-UI chrome (camera labels, the event-thumbnails sidebar,
 click-to-zoom), and gain a kiosk that stays up. For a wall display
 showing live cameras only, that's almost always the right swap.
 
+**Find the right RTSP URLs with `--discover-streams`:**
+
+```bash
+# Point it at your Frigate web URL (whatever was in URL=…):
+sudo kiosk-monitor --discover-streams http://192.168.1.194:30059
+# or at standalone go2rtc:
+sudo kiosk-monitor --discover-streams http://192.168.1.194:30060
+```
+
+Output is a copy-pasteable list of the actual stream names + ports
+configured on your Frigate, plus a one-line `MODE=vlc` / `URL=…`
+snippet for `kiosk-monitor.conf`. `kiosk-monitor --doctor` also
+runs this automatically when the VLC + HTTP-URL guard fires, so a
+single `--doctor` pass shows both the diagnosis and the concrete
+fix.
+
 `kiosk-monitor --doctor` flags this hardware combination and prints
 the same recommendation, so any future user who hits it can self-
 serve from the diagnostic output.

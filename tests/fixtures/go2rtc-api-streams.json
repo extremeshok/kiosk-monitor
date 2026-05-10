@@ -1,0 +1,5 @@
+{
+  "birdseye": {"producers": [], "consumers": []},
+  "front_door": {"producers": [], "consumers": []},
+  "back_yard": {"producers": [], "consumers": []}
+}

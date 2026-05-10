@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 6.9.3
+# kiosk-monitor.sh :: version 6.10.0
 # ======================================================================
 # Kiosk watchdog for Raspberry Pi OS trixie 64-bit (or newer Debian/RPi).
 # Supports Chromium fullscreen kiosk and VLC fullscreen video playback,
@@ -21,12 +21,14 @@
 #   sudo kiosk-monitor --remove        [--purge]
 #   sudo kiosk-monitor --reconfig
 #        kiosk-monitor --status
+#        kiosk-monitor --doctor
+#        kiosk-monitor --discover-streams URL
 #        kiosk-monitor --help | --version
 # ======================================================================
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.9.3"
+SCRIPT_VERSION="6.10.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -3787,6 +3789,144 @@ _doctor_check_config_file() {
   fi
 }
 
+# discover_frigate_streams: take a Frigate web URL or a go2rtc HTTP API
+# URL and print the RTSP stream URLs the operator can paste into
+# kiosk-monitor.conf. Probes the URL in two ways:
+#
+#   1. <url>/api/config — Frigate's config endpoint. Yields the
+#      `go2rtc.streams` block (stream names) and `go2rtc.rtsp.listen`
+#      (RTSP port). This is the preferred probe because every Frigate
+#      install exposes its config at the same URL as the web UI.
+#   2. <url>/api/streams — go2rtc's own streams endpoint. Tried as a
+#      fallback when Frigate's config didn't respond — for users
+#      pointing the discoverer at a standalone go2rtc instance rather
+#      than at Frigate.
+#
+# Exit codes:
+#   0 = at least one stream discovered + printed
+#   1 = endpoint unreachable, no streams configured, or parse error
+#   2 = usage error (no URL provided)
+#
+# Surfaced by issue #1 reporter on v6.10.0: the doctor's VLC+HTTP guard
+# was telling them to "point at the go2rtc RTSP stream — e.g.
+# rtsp://<frigate>:8554/birdseye", but discovering the actual stream
+# names and port required curl+jq archaeology. This function turns
+# the doctor warning into a copy-pasteable answer.
+discover_frigate_streams() {
+  # `${1:-}` not `$1` — under `set -u` the latter blows up when no arg
+  # is given (which is exactly the path the usage-error branch below
+  # is supposed to handle).
+  local url=${1:-}
+  if [ -z "$url" ]; then
+    printf 'usage: kiosk-monitor --discover-streams <frigate-or-go2rtc-url>\n' >&2
+    printf 'examples:\n' >&2
+    printf '  kiosk-monitor --discover-streams http://192.168.1.194:30059   # Frigate web UI\n' >&2
+    printf '  kiosk-monitor --discover-streams http://192.168.1.194:30060   # standalone go2rtc\n' >&2
+    return 2
+  fi
+  need_cmd curl
+  need_cmd python3
+  url=${url%/}
+
+  # The `|| body=""` on each probe swallows curl's non-zero exit
+  # (status 22 = HTTP 4xx/5xx, status 7 = couldn't resolve, etc.) so
+  # `set -e` doesn't abort the function before we get a chance to try
+  # the fallback endpoint. Empty body then drives the if/elif chain
+  # below to the next probe or the final error branch.
+  local body kind
+  body=$(curl -fsSL -m 5 "$url/api/config" 2>/dev/null) || body=""
+  if [ -n "$body" ] && printf '%s' "$body" | python3 -c 'import json,sys; json.loads(sys.stdin.read())' >/dev/null 2>&1; then
+    kind=frigate
+  else
+    body=$(curl -fsSL -m 5 "$url/api/streams" 2>/dev/null) || body=""
+    if [ -n "$body" ] && printf '%s' "$body" | python3 -c 'import json,sys; json.loads(sys.stdin.read())' >/dev/null 2>&1; then
+      kind=go2rtc
+    else
+      printf 'Error: neither %s/api/config (Frigate) nor %s/api/streams (go2rtc) responded with JSON.\n' "$url" "$url" >&2
+      printf '       Check the host, port, and that the service is running.\n' >&2
+      return 1
+    fi
+  fi
+
+  # Body goes via stdin; URL + kind via env. The Python is wrapped in a
+  # quoted-delimiter heredoc fed into `python3 -c "$(cat <<'PY' … PY)"`
+  # rather than a single-quoted -c '…' so the script can use its own
+  # mix of single and double quotes (e.g. `MODE="vlc"`) without
+  # collisions with the bash quoting layer.
+  KM_DISCOVER_URL=$url KM_DISCOVER_KIND=$kind python3 -c "$(cat <<'PY'
+import json, os, sys
+from urllib.parse import urlparse
+
+url    = os.environ["KM_DISCOVER_URL"]
+kind   = os.environ["KM_DISCOVER_KIND"]
+parsed = urlparse(url)
+host   = parsed.hostname or url
+
+streams   = []
+rtsp_port = "8554"   # go2rtc default
+
+if kind == "frigate":
+    cfg = json.loads(sys.stdin.read())
+    g2 = cfg.get("go2rtc") or {}
+    streams = sorted((g2.get("streams") or {}).keys())
+    # rtsp.listen forms seen in the wild: ":8554", "tcp://:8554",
+    # "0.0.0.0:8554". Pull the trailing port digits if present.
+    listen = (g2.get("rtsp") or {}).get("listen", "") or ""
+    if ":" in listen:
+        cand = listen.rsplit(":", 1)[1].split("/")[0]
+        if cand.isdigit():
+            rtsp_port = cand
+    print("Frigate detected at " + host + ":" + str(parsed.port or 5000))
+else:  # go2rtc
+    data    = json.loads(sys.stdin.read())
+    streams = sorted(data.keys())
+    print("go2rtc detected at " + host + ":" + str(parsed.port or 1984))
+
+if not streams:
+    print("  no streams configured.")
+    if kind == "frigate":
+        print("  Add streams under go2rtc.streams in Frigate config.yml.")
+    sys.exit(1)
+
+print("RTSP port: " + rtsp_port)
+print()
+print("Available streams:")
+for name in streams:
+    print("  rtsp://" + host + ":" + rtsp_port + "/" + name)
+print()
+print("Suggested kiosk-monitor.conf snippet:")
+print('  MODE="vlc"')
+print('  URL="rtsp://' + host + ":" + rtsp_port + "/" + streams[0] + '"')
+PY
+)" <<<"$body"
+}
+
+# When the VLC+HTTP-URL guard fires for an instance, run the live
+# discovery against that URL so the operator sees the actual RTSP
+# candidates inline with the warning. Each unique HTTP-shaped VLC URL
+# is probed at most once per --doctor invocation. Only used in the
+# doctor flow; validate_runtime_config itself stays synchronous so
+# startup doesn't hang on a slow Frigate.
+_doctor_discover_for_vlc_urls() {
+  local id mode url
+  local -A seen=()
+  for id in 1 2; do
+    case "$id" in
+      1) mode=$MODE;       url=$URL          ;;
+      2) mode=${MODE2:-};  url=${URL2:-}     ;;
+    esac
+    [ "$mode" = "vlc" ] || continue
+    case "$url" in http://*|https://*) ;; *) continue ;; esac
+    _url_looks_like_media_for_vlc "$url" && continue
+    [ -n "${seen[$url]:-}" ] && continue
+    seen[$url]=1
+    printf '\nDiscovering go2rtc streams at %s …\n' "$url"
+    if ! discover_frigate_streams "$url"; then
+      printf '  (could not auto-discover — open %s in a browser to confirm Frigate / go2rtc is reachable)\n' "$url"
+    fi
+  done
+}
+
 _doctor_check_runtime_config() {
   # validate_runtime_config emits "Config warning:" and "Config error:"
   # lines straight to stderr — they need to flow through doctor_warn /
@@ -3794,18 +3934,22 @@ _doctor_check_runtime_config() {
   # warnings still print (because we re-emit them), but the doctor's
   # final `Doctor summary: N error(s), M warning(s)` reports 0/0 even
   # when validate found real issues. Surfaced by issue #1 reporter on
-  # v6.9.3 when v6.9.0's MODE=vlc + HTTP-URL guard fired correctly but
+  # v6.10.0 when v6.9.0's MODE=vlc + HTTP-URL guard fired correctly but
   # didn't get counted.
   local val_stderr val_rc
   val_stderr=$(validate_runtime_config 2>&1 >/dev/null)
   val_rc=$?
+  local saw_vlc_http_misconfig="no"
   if [ -n "$val_stderr" ]; then
     local line
     while IFS= read -r line; do
       [ -z "$line" ] && continue
       case "$line" in
         "Config error: "*)   doctor_error  "${line#Config error: }" ;;
-        "Config warning: "*) doctor_warn   "${line#Config warning: }" ;;
+        "Config warning: "*)
+          doctor_warn "${line#Config warning: }"
+          case "$line" in *"looks like an HTTP web page"*) saw_vlc_http_misconfig="yes" ;; esac
+          ;;
         *)                   printf '%s\n' "$line" ;;
       esac
     done <<<"$val_stderr"
@@ -3814,6 +3958,12 @@ _doctor_check_runtime_config() {
     doctor_ok "runtime config validates"
   else
     doctor_error "runtime config has errors"
+  fi
+  # When the VLC+HTTP guard fired, follow up with live discovery so the
+  # operator sees actual RTSP candidates instead of the generic
+  # "<frigate>:8554/birdseye" placeholder in the warning text.
+  if [ "$saw_vlc_http_misconfig" = "yes" ]; then
+    _doctor_discover_for_vlc_urls
   fi
 }
 
@@ -3987,6 +4137,9 @@ Usage:
   kiosk-monitor --reconfig | --reconfigure [--config PATH]
   kiosk-monitor --status
   kiosk-monitor --doctor
+  kiosk-monitor --discover-streams URL    Probe Frigate or go2rtc and print
+                                          RTSP stream URLs ready for
+                                          kiosk-monitor.conf
   kiosk-monitor --logs [--no-follow] [--lines N|all]
   kiosk-monitor --help | --version
 
@@ -4015,6 +4168,7 @@ case "${1:-}" in
   --run)     ACTION="run";     shift ;;
   --status)  ACTION="status";  shift ;;
   --doctor)  ACTION="doctor";  shift ;;
+  --discover-streams) ACTION="discover-streams"; shift ;;
   --logs)    ACTION="logs";    shift ;;
   --help|-h) ACTION="help";    shift ;;
   --version) ACTION="version"; shift ;;
@@ -4053,6 +4207,7 @@ case "$ACTION" in
   reconfig)  reconfigure_self;                  exit 0 ;;
   status)    status_self;                       exit 0 ;;
   doctor)    doctor_self;                       exit $? ;;
+  discover-streams) discover_frigate_streams "${ACTION_ARGS[@]}"; exit $? ;;
   logs)      logs_self    "${ACTION_ARGS[@]}"; exit 0 ;;
   help)      usage;                             exit 0 ;;
   version)   printf '%s\n' "$SCRIPT_VERSION";   exit 0 ;;

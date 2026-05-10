@@ -38,6 +38,7 @@ screenshots and the demo GIF are regenerated.
 - **Autoplay-policy override** — `--autoplay-policy=no-user-gesture-required`. Without this, Chromium leaves an MSE-backed `<video>` paused after a buffer underrun until a user click "activates" the document, which on Frigate Birdseye showed up as the video grid freezing while the rest of the page kept rendering normally. Also disables `MediaSessionService` and `HardwareMediaKeyHandling` so two kiosks pointed at the same stream URL don't fight each other for the active media session.
 - **Legacy i965 video-decoder workaround** — the watchdog detects whether libva is using the legacy `i965` driver (parsed from `vainfo`, with a DRI-driver-SO fallback when libva-utils isn't installed) and only on those boxes adds `UseChromeOSDirectVideoDecoder` to the disable-features list. Newer iHD / Mesa-VAAPI installs keep Chromium's preferred direct decoder path. The override is logged at launch (`VAAPI loaded via legacy i965 driver — disabling UseChromeOSDirectVideoDecoder`) so it's clear which path the kiosk took.
 - **Doctor warning for the Chromium-on-i965 + Frigate Birdseye footgun** — `--doctor` flags the combination because Chromium 147's MSE pipeline freezes Birdseye after a few minutes on legacy-i965 hardware ([issue #1](https://github.com/extremeshok/kiosk-monitor/issues/1)) and the root cause is upstream Chromium, not anything kiosk-monitor's bash can patch. The warning recommends switching the affected instance to `MODE=vlc` with the go2rtc RTSP stream — `URL=rtsp://<frigate>:8554/birdseye` — which sidesteps Chromium's MSE pipeline entirely. Trade-off: loses Frigate's web-UI chrome, but the kiosk stays up.
+- **`--discover-streams URL` subcommand + doctor auto-discovery** — probes a Frigate or go2rtc HTTP endpoint and prints the actual RTSP stream URLs available, ready to paste into `kiosk-monitor.conf`. Doctor also runs it inline when the VLC + HTTP-URL guard fires, so the operator sees concrete RTSP candidates instead of a generic `rtsp://<frigate>:8554/birdseye` placeholder.
 - **URL health checks** for http/https targets, independent per instance.
 - **Automatic restart** on frozen screens, dead processes, or repeated health failures, with per-instance storm-protection backoff.
 - **Auto-detects the default desktop user** (active seat0 session → systemd autologin → lightdm autologin → SUDO_USER → first non-system UID).
@@ -92,6 +93,7 @@ sudo kiosk-monitor --remove [--purge]          # remove binaries; --purge also d
 sudo kiosk-monitor --reconfig                  # re-write kiosk-monitor.conf with every supported option (alias: --reconfigure)
 kiosk-monitor --status                         # show instance config + service status
 kiosk-monitor --doctor                         # read-only environment/config diagnostics
+kiosk-monitor --discover-streams URL           # probe Frigate or go2rtc, print RTSP stream URLs
 kiosk-monitor --version
 ```
 `--update` fetches `kiosk-monitor.sh` + `kiosk-monitor.conf.sample` from `$BASE_URL` (default `https://raw.githubusercontent.com/extremeshok/kiosk-monitor/HEAD`). Override with `--base-url URL` for forks or staging branches.

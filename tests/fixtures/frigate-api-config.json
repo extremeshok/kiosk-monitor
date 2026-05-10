@@ -1,0 +1,21 @@
+{
+  "version": "0.14.1",
+  "go2rtc": {
+    "streams": {
+      "birdseye": ["ffmpeg:birdseye"],
+      "front_door": ["rtsp://cam1.local:554/stream"],
+      "back_yard": ["rtsp://cam2.local:554/stream"]
+    },
+    "rtsp": {
+      "listen": ":8554"
+    }
+  },
+  "cameras": {
+    "front_door": {"enabled": true},
+    "back_yard": {"enabled": true}
+  },
+  "birdseye": {
+    "enabled": true,
+    "restream": true
+  }
+}
