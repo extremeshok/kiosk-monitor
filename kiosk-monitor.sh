@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 6.9.1
+# kiosk-monitor.sh :: version 6.9.2
 # ======================================================================
 # Kiosk watchdog for Raspberry Pi OS trixie 64-bit (or newer Debian/RPi).
 # Supports Chromium fullscreen kiosk and VLC fullscreen video playback,
@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.9.1"
+SCRIPT_VERSION="6.9.2"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -301,6 +301,13 @@ declare -A INSTANCE_PROFILE_DIR=()
 declare -A INSTANCE_MATCH=()
 declare -A INSTANCE_STALL_THRESHOLD=()
 declare -A INSTANCE_PAUSED=()
+# INSTANCE_FIRST_FRAME_SEEN[id]: "yes" once the watchdog has observed a
+# capture_output_hash transition (i.e. evidence the player rendered at
+# least one different frame). Connect-grace gate for stall detection —
+# without this, a VLC instance pointed at an unreachable stream sits on
+# a uniform black window forever, the screen-hash watchdog calls it
+# frozen, and the kiosk restart-loops. See the watchdog block below.
+declare -A INSTANCE_FIRST_FRAME_SEEN=()
 declare -A INSTANCE_FORCE_RESOLUTION=()
 declare -A INSTANCE_FORCE_ROTATION=()
 declare -A INSTANCE_CLASS=()
@@ -839,6 +846,9 @@ resolve_output_geometry() {
     printf '%s\t0\t0\t1920\t1080\n' "$name"
     return 1
   fi
+  # geo is a single space-separated "X Y W H" string written by
+  # _refresh_outputs_x11 / refresh_outputs — intentional word-split.
+  # shellcheck disable=SC2086
   set -- $geo
   printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$1" "$2" "$3" "$4"
   return 0
@@ -1883,6 +1893,10 @@ record_restart_instance() {
   INSTANCE_LAST_HASH[$id]=""
   INSTANCE_STALL_COUNT[$id]=0
   INSTANCE_FAIL_COUNT[$id]=0
+  # Re-arm the connect-grace gate so the freshly-relaunched instance
+  # gets the same "wait for first rendered frame" treatment as a
+  # cold-boot launch.
+  INSTANCE_FIRST_FRAME_SEEN[$id]="no"
   INSTANCE_LAST_GOOD[$id]=$(date +%s)
   if health_check_instance "$id"; then
     INSTANCE_FAIL_COUNT[$id]=0
@@ -1913,6 +1927,7 @@ setup_instances() {
     INSTANCE_LAST_HASH[$id]=""
     INSTANCE_STALL_COUNT[$id]=0
     INSTANCE_FAIL_COUNT[$id]=0
+    INSTANCE_FIRST_FRAME_SEEN[$id]="no"
     INSTANCE_LAST_GOOD[$id]=$(date +%s)
     INSTANCE_RESTART_LOG[$id]=""
     INSTANCE_PAUSED[$id]="no"
@@ -3680,8 +3695,11 @@ _tui_main_menu() {
         return 0 ;;
       quit)
         if [ "$TUI_DIRTY" = "yes" ]; then
-          _wt_yesno "Discard changes?" "You have unsaved changes. Discard them and exit?" no \
-            && return 0 || continue
+          if _wt_yesno "Discard changes?" "You have unsaved changes. Discard them and exit?" no; then
+            return 0
+          else
+            continue
+          fi
         fi
         return 0 ;;
     esac
@@ -4122,51 +4140,11 @@ if [ -n "${BIRDSEYE_AUTO_FILL:-}${BIRDSEYE_MATCH_PATTERN:-}${BIRDSEYE_EXTENSION_
   log "Notice: BIRDSEYE_* config names are deprecated — rename to FRIGATE_BIRDSEYE_*."
 fi
 
-# --- config validation + instance setup + output discovery + labwc rules ---
-# Same sequence the SIGHUP reload runs; see prepare_runtime_state.
-prepare_runtime_state || exit 1
-
-# --- exit cleanup (INT/TERM/HUP traps were installed earlier so they're
-#     active during the Wayland / GUI wait) ---
-cleanup() {
-  local status=$?
-  trap - EXIT
-  local id
-  for id in "${INSTANCES[@]:-}"; do stop_instance "$id" 2>/dev/null || true; done
-  if [ -n "$PROFILE_SYNC_PID" ] && kill -0 "$PROFILE_SYNC_PID" 2>/dev/null; then
-    kill "$PROFILE_SYNC_PID" 2>/dev/null || true
-    wait "$PROFILE_SYNC_PID" 2>/dev/null || true
-  fi
-  sync_profile_persist true
-  flock -u 200 2>/dev/null || true
-  exec 200>&- 2>/dev/null || true
-  log "==== STOP kiosk-monitor ===="
-  exit "$status"
-}
-trap cleanup EXIT
-
-log "==== START kiosk-monitor v$SCRIPT_VERSION at $(date -Is) ===="
-log "Desktop user: $GUI_USER (uid=$GUI_UID), WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-?}"
-log "Outputs: ${OUTPUTS_NAMES[*]:-none}"
-log "Instances: ${INSTANCES[*]}"
-
-# --- health-gate for VLC instances (chrome shows a waiting page instead) ---
-# Chromium launches immediately with a local "Waiting for target" page
-# (launch_chrome_instance → write_waiting_page) that redirects itself when
-# the real URL responds. VLC has no such fallback so we still block here.
-if [ "$WAIT_FOR_URL" = "true" ]; then
-  for id in "${INSTANCES[@]}"; do
-    if [ "${INSTANCE_MODE[$id]}" = "vlc" ]; then
-      log_instance "$id" "waiting for ${INSTANCE_URL[$id]} …"
-      wait_for_url_ready_instance "$id" || true
-    fi
-  done
-fi
-
-# --- initial launch ---
-relaunch_all_instances
-
-# --- main watchdog loop ---
+# --- runtime helpers used by both initial startup and SIGHUP reload ---
+# Defined here (rather than further down with the watchdog loop) so the
+# inline startup block below can call them — bash function-ordering
+# rules require definition before use, even within a single script,
+# and shellcheck SC2218 catches forward references.
 
 # prepare_runtime_state: the post-config-load setup that both initial
 # startup and SIGHUP reload need. Applies smart defaults, normalizes,
@@ -4223,6 +4201,52 @@ reload_instances() {
   relaunch_all_instances
   log "Configuration reloaded."
 }
+
+# --- config validation + instance setup + output discovery + labwc rules ---
+# Same sequence the SIGHUP reload runs; see prepare_runtime_state.
+prepare_runtime_state || exit 1
+
+# --- exit cleanup (INT/TERM/HUP traps were installed earlier so they're
+#     active during the Wayland / GUI wait) ---
+cleanup() {
+  local status=$?
+  trap - EXIT
+  local id
+  for id in "${INSTANCES[@]:-}"; do stop_instance "$id" 2>/dev/null || true; done
+  if [ -n "$PROFILE_SYNC_PID" ] && kill -0 "$PROFILE_SYNC_PID" 2>/dev/null; then
+    kill "$PROFILE_SYNC_PID" 2>/dev/null || true
+    wait "$PROFILE_SYNC_PID" 2>/dev/null || true
+  fi
+  sync_profile_persist true
+  flock -u 200 2>/dev/null || true
+  exec 200>&- 2>/dev/null || true
+  log "==== STOP kiosk-monitor ===="
+  exit "$status"
+}
+trap cleanup EXIT
+
+log "==== START kiosk-monitor v$SCRIPT_VERSION at $(date -Is) ===="
+log "Desktop user: $GUI_USER (uid=$GUI_UID), WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-?}"
+log "Outputs: ${OUTPUTS_NAMES[*]:-none}"
+log "Instances: ${INSTANCES[*]}"
+
+# --- health-gate for VLC instances (chrome shows a waiting page instead) ---
+# Chromium launches immediately with a local "Waiting for target" page
+# (launch_chrome_instance → write_waiting_page) that redirects itself when
+# the real URL responds. VLC has no such fallback so we still block here.
+if [ "$WAIT_FOR_URL" = "true" ]; then
+  for id in "${INSTANCES[@]}"; do
+    if [ "${INSTANCE_MODE[$id]}" = "vlc" ]; then
+      log_instance "$id" "waiting for ${INSTANCE_URL[$id]} …"
+      wait_for_url_ready_instance "$id" || true
+    fi
+  done
+fi
+
+# --- initial launch ---
+relaunch_all_instances
+
+# --- main watchdog loop ---
 
 while true; do
   if [ "$RELOAD_REQUESTED" = "true" ]; then
@@ -4320,10 +4344,31 @@ while true; do
       curr_hash=$(capture_output_hash "$id" || true)
       if [ -n "$curr_hash" ]; then
         if [ -n "${INSTANCE_LAST_HASH[$id]}" ] && [ "$curr_hash" = "${INSTANCE_LAST_HASH[$id]}" ]; then
-          INSTANCE_STALL_COUNT[$id]=$((INSTANCE_STALL_COUNT[$id] + 1))
-          threshold="${INSTANCE_STALL_THRESHOLD[$id]:-$STALL_RETRIES}"
-          log_instance "$id" "screen unchanged ${INSTANCE_STALL_COUNT[$id]}/${threshold}"
+          # Same hash as last tick. Only count toward the stall threshold
+          # if the watchdog has previously observed this instance render
+          # something (i.e. seen a hash *change*). Without that gate, an
+          # instance whose stream never connects sits on a uniform black
+          # window forever — the hash is constant from the start, the
+          # stall counter ticks up to threshold, and we restart-loop.
+          # See log signature `screen unchanged 1/3` flirting with the
+          # threshold on the Pi 5 viewport at idle.
+          if [ "${INSTANCE_FIRST_FRAME_SEEN[$id]:-no}" = "yes" ]; then
+            INSTANCE_STALL_COUNT[$id]=$((INSTANCE_STALL_COUNT[$id] + 1))
+            threshold="${INSTANCE_STALL_THRESHOLD[$id]:-$STALL_RETRIES}"
+            log_instance "$id" "screen unchanged ${INSTANCE_STALL_COUNT[$id]}/${threshold}"
+          else
+            debug_instance "$id" "screen unchanged but no first frame yet — stall counter held at 0"
+          fi
         else
+          # Hash differs from last tick. If we had a previous hash, that's
+          # the first observed transition — flip the connect-grace gate
+          # and from now on stall ticks count. The first capture after
+          # launch sets LAST_HASH but doesn't flip the gate, since one
+          # capture isn't evidence of rendering progress.
+          if [ -n "${INSTANCE_LAST_HASH[$id]}" ] && [ "${INSTANCE_FIRST_FRAME_SEEN[$id]:-no}" != "yes" ]; then
+            INSTANCE_FIRST_FRAME_SEEN[$id]="yes"
+            debug_instance "$id" "first rendered frame observed — stall detection engaged"
+          fi
           INSTANCE_STALL_COUNT[$id]=0
           INSTANCE_LAST_HASH[$id]=$curr_hash
         fi
