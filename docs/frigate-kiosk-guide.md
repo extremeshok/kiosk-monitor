@@ -128,11 +128,10 @@ automatically:
 | `FRIGATE_THEME`                    | `High Contrast`        | High-contrast palette — great for wall displays at a distance. |
 | `FRIGATE_BIRDSEYE_WIDTH/HEIGHT`    | auto from monitor res  | No manual pixel math per-display.                             |
 | `FRIGATE_BIRDSEYE_MARGIN`          | `80`                   | Leaves room for Frigate's sidebar.                            |
-| `FRIGATE_LIVE_MODE`                | `auto`                 | Pre-seeds Frigate's "Preferred Live Mode" via localStorage. `auto` means "leave Frigate's own default alone, except force `jsmpeg` on legacy-i965 Intel iGPUs where Chromium MSE is unstable" (see below). |
 
 Set any of those to `None` to explicitly opt out, or pin a value.
 
-### When Birdseye freezes after a few minutes on Chromium
+### When Birdseye freezes after a few minutes on Chromium (legacy Intel iGPUs)
 
 Symptom: the camera grid stops updating after 1–2 minutes, but the
 sidebar thumbnails keep animating and the page is otherwise alive.
@@ -140,31 +139,45 @@ Clicking another view in the UI revives the stream for a few tens of
 seconds before it freezes again. Two manual Firefox windows on the
 same URL run cleanly.
 
-This is Chromium's MSE pipeline misbehaving on Intel iGPUs that fall
-back to libva's legacy `i965` driver — Sandy Bridge through Coffee
-Lake (the issue surfaced on a Haswell-era Dell 3020 in
+This is Chromium 147's MSE pipeline misbehaving on Intel iGPUs that
+fall back to libva's legacy `i965` driver — Sandy Bridge through
+Coffee Lake (the issue surfaced on a Haswell-era Dell 3020 in
 [issue #1](https://github.com/extremeshok/kiosk-monitor/issues/1)).
-Hardware decode is engaged (`chrome://gpu` confirms), but the MSE
-state machine stalls after buffer underruns and Chromium's autoplay
-policy refuses to resume without a user gesture.
+Hardware decode is engaged (`chrome://gpu` confirms `Video Decode:
+Hardware accelerated`), but the MSE state machine stalls after
+buffer underruns and Chromium's autoplay policy refuses to resume
+without a user gesture. There's no clean kiosk-monitor-side fix
+because Birdseye's player is decided server-side from Frigate's
+`birdseye.restream` config — there's no localStorage-backed user
+preference to override client-side.
 
-The fix is to switch Frigate's player away from MSE. v6.8.8 onwards
-auto-detects this hardware (via `vainfo` parsing or the i965 DRI
-driver SO file) and pre-seeds `FRIGATE_LIVE_MODE=jsmpeg` for you —
-Frigate then uses its canvas-over-WebSocket player, which doesn't
-touch MSE. You can override explicitly:
+**The recommended workaround is to skip Chromium entirely for the
+Birdseye view and feed VLC the go2rtc RTSP stream:**
 
 ```ini
 # /etc/kiosk-monitor/kiosk-monitor.conf
-FRIGATE_LIVE_MODE="jsmpeg"   # force JSMpeg regardless of hardware
-# or
-FRIGATE_LIVE_MODE=""         # always defer to Frigate's own default
-# or
-FRIGATE_LIVE_MODE="off"      # explicit no-op (don't seed at all)
+MODE="vlc"
+URL="rtsp://<frigate-host>:8554/birdseye"
+# or, if go2rtc is on a non-standard port:
+# URL="rtsp://<frigate-host>:30060/birdseye"
 ```
 
-After changing the value, `sudo systemctl reload kiosk-monitor` to
-re-write the helper extension and re-launch the kiosks.
+VLC's RTSP path doesn't touch Chromium's MSE pipeline at all, runs
+cleanly under software or hardware decode, and is what kiosk-monitor
+already uses for camera-only displays. Trade-off: you lose the
+Frigate web-UI chrome (camera labels, the event-thumbnails sidebar,
+click-to-zoom), and gain a kiosk that stays up. For a wall display
+showing live cameras only, that's almost always the right swap.
+
+`kiosk-monitor --doctor` flags this hardware combination and prints
+the same recommendation, so any future user who hits it can self-
+serve from the diagnostic output.
+
+If you specifically need the Frigate web UI on a wall display, the
+alternative is to set `birdseye.restream: false` in Frigate's
+`config.yml` — that flips Frigate to the JSMpeg canvas-over-WebSocket
+player for Birdseye, which doesn't touch MSE. That change is
+server-side and affects every Frigate client, not just the kiosk.
 
 ## Supervisor details (skip unless you care)
 
