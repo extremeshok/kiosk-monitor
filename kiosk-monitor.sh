@@ -2,7 +2,7 @@
 # ======================================================================
 # Coded by Adrian Jon Kriel :: admin@extremeshok.com
 # ======================================================================
-# kiosk-monitor.sh :: version 6.8.9
+# kiosk-monitor.sh :: version 6.9.0
 # ======================================================================
 # Kiosk watchdog for Raspberry Pi OS trixie 64-bit (or newer Debian/RPi).
 # Supports Chromium fullscreen kiosk and VLC fullscreen video playback,
@@ -26,7 +26,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.8.9"
+SCRIPT_VERSION="6.9.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -376,6 +376,16 @@ open_lock_file() {
 
 regex_escape() {
   printf '%s' "$1" | sed -e 's/[][(){}.^$+*?|\\]/\\&/g'
+}
+
+# Escape a value for safe interpolation inside a JavaScript double-quoted
+# string literal — backslash first, then double-quote. Used when we
+# render content scripts and waiting pages from heredocs and need to
+# splice user-supplied values into "..." JS strings without breaking
+# the parse or smuggling code in. If the helper JS ever moves to
+# template literals, also escape the backtick here.
+js_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
 clear_directory() {
@@ -903,9 +913,16 @@ merge_chromium_features() {
   local distro user_added joined
   distro=$(chromium_distro_features "$kind")
   user_added="$*"
-  joined=$(printf '%s\n%s\n' "$distro" "$user_added" \
-    | tr ',[:space:]' '\n\n' \
-    | awk 'NF && !seen[$0]++' \
+  # Split on commas + whitespace, dedup, re-join with commas.
+  # The previous tr-based version had unequal source/destination char-class
+  # lengths (',[:space:]' → '\n\n'), which is implementation-defined: GNU/
+  # BSD tr pads the destination with the last char so all chars map to \n,
+  # but BusyBox tr leaves unmapped chars unchanged — which would leave
+  # spaces inside feature names on Alpine and similar minimal distros and
+  # break the dedup. awk -v RS handles the split unambiguously across all
+  # tr variants.
+  joined=$(printf '%s,%s\n' "$distro" "$user_added" \
+    | awk -v RS='[,[:space:]]+' 'NF && !seen[$0]++' \
     | paste -sd ',' -)
   printf '%s\n' "$joined"
 }
@@ -1128,10 +1145,10 @@ CSS
   if [ -n "$dark" ] || [ -n "$theme" ] || [ "$autofill" = "true" ]; then
     has_helper_js=1
     local esc_dark esc_theme esc_tkey esc_ckey
-    esc_dark=$(printf '%s' "$dark"  | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
-    esc_theme=$(printf '%s' "$theme" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
-    esc_tkey=$(printf '%s' "$FRIGATE_THEME_STORAGE_KEY" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
-    esc_ckey=$(printf '%s' "$FRIGATE_COLOR_STORAGE_KEY" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+    esc_dark=$(js_escape "$dark")
+    esc_theme=$(js_escape "$theme")
+    esc_tkey=$(js_escape "$FRIGATE_THEME_STORAGE_KEY")
+    esc_ckey=$(js_escape "$FRIGATE_COLOR_STORAGE_KEY")
     local js_autofill="false"
     [ "$autofill" = "true" ] && js_autofill="true"
     cat > "$dir/frigate-helper.js" <<JS
@@ -1296,7 +1313,7 @@ write_waiting_page() {
   local url="${INSTANCE_URL[$id]}"
   local path="/tmp/kiosk-monitor-waiting-${id}.html"
   local esc_js esc_html
-  esc_js=$(printf '%s' "$url" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+  esc_js=$(js_escape "$url")
   esc_html=$(printf '%s' "$url" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
   cat > "$path" <<HTML
 <!DOCTYPE html>
@@ -1875,6 +1892,46 @@ setup_instances() {
   done
 }
 
+# Heuristic for "this http(s) URL probably points at an HTML page rather
+# than a media stream". VLC happily opens an HTTP URL but if the body is
+# HTML it has no decodable container, sits with an empty/black window,
+# and the kiosk-monitor screen-hash watchdog declares it frozen and
+# restart-loops it. Issue #1's reporter hit this when they swapped
+# MODE=vlc but left URL pointed at the Frigate web UI. Recognise the
+# common media file extensions and stream-y query/path tokens; everything
+# else triggers a warning (not an error — VLC users with a bare host:port
+# RTMP-over-HTTP server are still allowed, they just see a heads-up).
+_url_looks_like_media_for_vlc() {
+  local u=$1 lc
+  lc=$(printf '%s' "$u" | tr '[:upper:]' '[:lower:]')
+  case "$lc" in
+    *.mp4|*.mp4\?*|*.m4v|*.m4v\?*|*.mkv|*.mkv\?*|*.webm|*.webm\?*) return 0 ;;
+    *.mov|*.mov\?*|*.avi|*.avi\?*|*.ts|*.ts\?*|*.mts|*.mts\?*) return 0 ;;
+    *.mp3|*.mp3\?*|*.aac|*.aac\?*|*.flac|*.flac\?*|*.opus|*.opus\?*|*.ogg|*.ogg\?*|*.wav|*.wav\?*) return 0 ;;
+    *.m3u|*.m3u\?*|*.m3u8|*.m3u8\?*|*.mpd|*.mpd\?*) return 0 ;;
+    *\?*format=mp4*|*\&format=mp4*|*\?live=*|*\&live=*) return 0 ;;
+    *\?stream=*|*\&stream=*|*/stream|*/stream/*|*/live|*/live/*) return 0 ;;
+  esac
+  return 1
+}
+
+_validate_instance_url() {
+  local label=$1 mode=$2 url=$3
+  case "$url" in
+    http://*|https://*|rtsp://*|rtsps://*|rtmp://*|rtmps://*|udp://*|file://*|/*) ;;
+    *) echo "Config warning: $label='$url' has no recognised scheme." >&2; return 0 ;;
+  esac
+  if [ "$mode" = "vlc" ]; then
+    case "$url" in
+      http://*|https://*)
+        if ! _url_looks_like_media_for_vlc "$url"; then
+          echo "Config warning: $label='$url' looks like an HTTP web page rather than a media stream — VLC needs a media container (mp4/m3u8/etc) or RTSP/RTMP/UDP. Issue #1 reporter hit this exact mis-config: VLC stayed running but never decoded a frame, the screen-hash watchdog called it frozen, and the kiosk restart-looped. If you're trying to display Frigate Birdseye via VLC, point this at the go2rtc RTSP stream — e.g. rtsp://<frigate>:8554/birdseye." >&2
+        fi
+        ;;
+    esac
+  fi
+}
+
 validate_runtime_config() {
   local errors=0
   # instance 1
@@ -1886,10 +1943,7 @@ validate_runtime_config() {
     echo "Config error: URL is required for instance 1." >&2
     errors=$((errors+1))
   else
-    case "$URL" in
-      http://*|https://*|rtsp://*|rtsps://*|rtmp://*|rtmps://*|udp://*|file://*|/*) ;;
-      *) echo "Config warning: URL='$URL' has no recognised scheme." >&2 ;;
-    esac
+    _validate_instance_url URL "$MODE" "$URL"
   fi
   # instance 2
   if [ -n "${MODE2:-}" ]; then
@@ -1901,10 +1955,7 @@ validate_runtime_config() {
       echo "Config error: URL2 is required when MODE2 is set." >&2
       errors=$((errors+1))
     else
-      case "$URL2" in
-        http://*|https://*|rtsp://*|rtsps://*|rtmp://*|rtmps://*|udp://*|file://*|/*) ;;
-        *) echo "Config warning: URL2='$URL2' has no recognised scheme." >&2 ;;
-      esac
+      _validate_instance_url URL2 "$MODE2" "$URL2"
     fi
     if [ -n "${OUTPUT:-}" ] && [ -n "${OUTPUT2:-}" ] && [ "$OUTPUT" = "$OUTPUT2" ]; then
       echo "Config warning: OUTPUT and OUTPUT2 are both '$OUTPUT'; the two instances will overlap on the same display." >&2
