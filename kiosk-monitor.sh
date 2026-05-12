@@ -28,7 +28,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.11.0"
+SCRIPT_VERSION="6.11.1"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -1782,7 +1782,28 @@ launch_vlc_instance() {
   INSTANCE_PID[$id]="$pid"
   log_instance "$id" "VLC PID=$pid (launcher=$launcher_pid)"
   route_window_to_output_x11 "$id"
+  # Race-mitigation for labwc title-rule timing (Wayland only).
+  # VLC's xdg_toplevel sometimes maps before xdg_toplevel.set_title
+  # arrives — labwc evaluates the title rule at map time and the
+  # title="kiosk-monitor-vlc-N" rule misses, leaving VLC on the default
+  # output. Now that we've waited VLC_LAUNCH_DELAY seconds (default 3s)
+  # the title has definitely been set, so SIGHUP labwc to force a
+  # rule re-evaluation. SIGHUP is a no-op for X11 sessions and harmless
+  # when the rule already matched on the first map.
+  reload_labwc_window_rules "$id"
   return 0
+}
+
+# reload_labwc_window_rules: trigger labwc to re-evaluate its rc.xml
+# window rules against currently-mapped surfaces. Used after VLC launch
+# to close the label/map-ordering race documented above. Wayland-only;
+# returns silently on X11 sessions or when labwc isn't running.
+reload_labwc_window_rules() {
+  local id=${1:-}
+  [ "${SESSION_TYPE:-}" = "wayland" ] || return 0
+  if pkill -SIGHUP -u "$GUI_USER" -x labwc 2>/dev/null; then
+    [ -n "$id" ] && debug_instance "$id" "labwc SIGHUP sent (re-evaluate window rules)"
+  fi
 }
 
 launch_instance() {
@@ -2261,10 +2282,15 @@ ensure_labwc_window_rules() {
       local cls="${INSTANCE_CLASS[$id]:-}"
       local mode="${INSTANCE_MODE[$id]}"
       [ -n "$out" ] && [ -n "$cls" ] || continue
-      # Chromium is a Wayland-native client and respects --class=NAME, which
-      # labwc matches via 'identifier'. VLC runs under Xwayland and its
-      # WM_CLASS is fixed to 'vlc' by Qt regardless of argv[0], so we match
-      # the window title instead (set via --video-title).
+      # Chromium is a Wayland-native client and respects --class=NAME,
+      # which labwc matches via 'identifier'. VLC's wayland surface
+      # doesn't expose a per-launch app_id we can pin (Qt sets the
+      # app_id to a fixed 'vlc' regardless of argv[0]), so we route VLC
+      # by its window title (set via --video-title). NOTE: VLC's
+      # xdg_toplevel.set_title may arrive *after* the surface is mapped
+      # in rare cases — labwc evaluates the title rule at map time, so
+      # the rule can miss and VLC stays on the default output. The
+      # post-launch reload in launch_vlc_instance closes that race.
       if [ "$mode" = "vlc" ]; then
         printf '    <windowRule title="%s" serverDecoration="no" skipTaskbar="yes" skipWindowSwitcher="yes">\n' "$cls"
       else

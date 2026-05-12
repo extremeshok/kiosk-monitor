@@ -4,6 +4,25 @@ All notable changes to kiosk-monitor are recorded here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.11.1] — 2026-05-12
+
+### Fixed
+
+- Dual-display labwc window-routing race. VLC's xdg_toplevel sometimes
+  maps before `xdg_toplevel.set_title("kiosk-monitor-vlc-N")` arrives,
+  so labwc's `<windowRule title="…">` evaluates at map time and misses
+  — leaving VLC on the default output (HDMI-A-1) and covering the
+  Chromium kiosk. Surfaced on the viewport3 Pi 5 after a stress
+  sequence of rapid service restarts: most launches routed correctly,
+  one in ~5 raced and landed VLC on the wrong display.
+- Fix: after `VLC_LAUNCH_DELAY` (default 3 s) elapses — by which time
+  the title is reliably set — `launch_vlc_instance` SIGHUPs labwc to
+  re-evaluate window rules against the now-titled surface. New helper
+  `reload_labwc_window_rules` keeps the SIGHUP behind a Wayland guard
+  so X11 sessions are a no-op. Stale "VLC runs under Xwayland" comment
+  in `ensure_labwc_window_rules` updated to reflect the actual
+  Wayland-native path.
+
 ## [6.11.0] — 2026-05-11
 
 Closes the longest-running issue in this project: the Frigate Birdseye
