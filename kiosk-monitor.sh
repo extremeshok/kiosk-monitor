@@ -28,7 +28,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.11.1"
+SCRIPT_VERSION="6.11.2"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -1795,14 +1795,43 @@ launch_vlc_instance() {
 }
 
 # reload_labwc_window_rules: trigger labwc to re-evaluate its rc.xml
-# window rules against currently-mapped surfaces. Used after VLC launch
-# to close the label/map-ordering race documented above. Wayland-only;
-# returns silently on X11 sessions or when labwc isn't running.
+# window rules against currently-mapped surfaces. Wayland-only; no-op on
+# X11 sessions or when labwc isn't running.
+#
+# IMPORTANT: a bare SIGHUP without rc.xml content change is a no-op for
+# rule re-application in labwc 0.9.x — labwc only walks existing windows
+# and re-applies rules when it detects the file changed. So we bump a
+# timestamp-comment line in rc.xml first, then SIGHUP. This rewrite is
+# safe (idempotent — the rule body is unchanged) and is the trigger that
+# moves VLC windows whose title arrived after their xdg_toplevel was
+# mapped (the labwc-title race documented in ensure_labwc_window_rules).
+# Empirically: without the rewrite, SIGHUP alone left both VLCs stacked
+# on HDMI-A-1; with the rewrite, labwc moved each window to its
+# rule-target output.
 reload_labwc_window_rules() {
   local id=${1:-}
   [ "${SESSION_TYPE:-}" = "wayland" ] || return 0
+  # KIOSK_LABWC_RC_XML overrides the rc.xml path; only set by tests.
+  local rc="${KIOSK_LABWC_RC_XML:-/home/${GUI_USER}/.config/labwc/rc.xml}"
+  local marker="kiosk-monitor: managed rc.xml"
+  if [ -f "$rc" ] && grep -qF "$marker" "$rc" 2>/dev/null; then
+    # Drop any previous relayout-nudge line and insert a fresh one at the
+    # top, then write back. Single grep|prepend pipeline; portable across
+    # BSD and GNU sed (the script targets Linux, but tests run on macOS).
+    # The write goes through as_gui so file ownership matches the initial
+    # write in ensure_labwc_window_rules.
+    local ts new_rc
+    ts=$(date '+%Y-%m-%dT%H:%M:%S.%N')
+    new_rc=$(
+      printf '<!-- kiosk-monitor: relayout-nudge: %s -->\n' "$ts"
+      grep -v '<!-- kiosk-monitor: relayout-nudge:' "$rc" 2>/dev/null
+    )
+    printf '%s\n' "$new_rc" | as_gui tee "$rc" >/dev/null 2>&1 || true
+  fi
   if pkill -SIGHUP -u "$GUI_USER" -x labwc 2>/dev/null; then
-    [ -n "$id" ] && debug_instance "$id" "labwc SIGHUP sent (re-evaluate window rules)"
+    if [ -n "$id" ]; then
+      debug_instance "$id" "labwc rc.xml nudged + SIGHUP (re-evaluate window rules)"
+    fi
   fi
 }
 
@@ -5062,6 +5091,14 @@ relaunch_all_instances() {
     INSTANCE_LAST_GOOD[$id]=$(date +%s)
     INSTANCE_LAST_HASH[$id]=$(capture_output_hash "$id" || true)
   done
+  # After all instances are mapped, nudge labwc to re-apply window rules
+  # against the now-fully-titled surfaces. The per-instance call in
+  # launch_vlc_instance handles single-VLC scenarios; this second call
+  # catches the dual-VLC case where the first VLC's late-arriving title
+  # can land its window on the second VLC's target output (because both
+  # rules match an empty title and labwc picks the first matching rule).
+  # Wayland-only; no-op on X11.
+  reload_labwc_window_rules
 }
 
 reload_instances() {

@@ -4,6 +4,67 @@ All notable changes to kiosk-monitor are recorded here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.11.2] — 2026-05-12
+
+### Fixed
+
+- vlc+vlc dual-display window routing. v6.11.1's `reload_labwc_window_rules`
+  sent a bare SIGHUP to labwc — but labwc 0.9.x only re-evaluates window
+  rules against already-mapped surfaces when it detects rc.xml has
+  *changed*. A bare SIGHUP on unchanged content is a no-op. Result: with
+  two VLC instances on a single Pi 5 (one per HDMI), both VLC windows
+  could end up stacked on HDMI-A-1 with HDMI-A-2 stuck on the desktop
+  wallpaper — vlc-2's late-arriving `xdg_toplevel.set_title` meant the
+  initial-map rule check found an empty title and the window stayed on
+  the default output.
+- Fix: `reload_labwc_window_rules` now rewrites rc.xml with a fresh
+  `<!-- kiosk-monitor: relayout-nudge: TIMESTAMP -->` line *before*
+  SIGHUP, so labwc sees the file as changed and re-applies all
+  `windowRule` actions against currently-mapped surfaces. The rule body
+  is unchanged — only the nudge comment differs — so the rewrite is
+  idempotent. Empirically verified on the viewport3 Pi 5: 5/5
+  consecutive `systemctl restart kiosk-monitor` cycles with vlc+vlc
+  now place each VLC on its target output, with continuous video
+  observed on both displays.
+- Added a second `reload_labwc_window_rules` call at the end of
+  `relaunch_all_instances` — runs after every instance has had its
+  per-launch `VLC_LAUNCH_DELAY` settle, catching the dual-VLC case
+  where the first VLC's late-arriving title can land its window on the
+  second VLC's target output. The per-instance call inside
+  `launch_vlc_instance` continues to handle single-VLC watchdog
+  restarts.
+
+### Changed
+
+- `reload_labwc_window_rules` rewrites rc.xml via a single
+  `printf | grep -v | as_gui tee` pipeline instead of two `sed -i`
+  invocations. The pipeline is portable across BSD and GNU sed (the
+  script targets Linux but the test suite runs on macOS) and avoids a
+  brief window where rc.xml exists without the new marker between the
+  two prior sed-delete-then-sed-insert calls.
+- Added `KIOSK_LABWC_RC_XML` env-var override on `reload_labwc_window_rules`
+  for test-only path injection. Defaults to the production path
+  (`/home/$GUI_USER/.config/labwc/rc.xml`); unused outside tests.
+
+### Added
+
+- `tests/test_labwc_reload.sh` — 11 assertions covering the v6.11.2 fix:
+  X11 short-circuit (no file/SIGHUP touch), missing rc.xml (SIGHUP still
+  fires), unmanaged rc.xml (no marker → file untouched), managed rc.xml
+  (relayout-nudge inserted at top), idempotency (N calls → exactly ONE
+  marker, file size bounded), fresh timestamps across calls, and
+  pkill-invocation shape (SIGHUP, -u GUI_USER, -x labwc). Catches both
+  the v6.11.1 regression (bare SIGHUP) and future marker-accumulation
+  bugs in the dedupe path.
+
+### Validated
+
+- Full 5-config dual-display test matrix on the viewport3 Pi 5 with two
+  physically distinct monitors (Dell S2421HGF + Hisense): chrome+vlc,
+  chrome+chrome, vlc+vlc (3/3 restart stress-test BOTH-LIVE),
+  single-display chrome (HDMI-A-2 wallpaper untouched), single-display
+  vlc (HDMI-A-2 wallpaper untouched). All five PASS.
+
 ## [6.11.1] — 2026-05-12
 
 ### Fixed
