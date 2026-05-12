@@ -131,7 +131,7 @@ automatically:
 
 Set any of those to `None` to explicitly opt out, or pin a value.
 
-### When Birdseye freezes after a few minutes on Chromium (legacy Intel iGPUs)
+### When Birdseye freezes after a few minutes on Chromium
 
 Symptom: the camera grid stops updating after 1–2 minutes, but the
 sidebar thumbnails keep animating and the page is otherwise alive.
@@ -139,61 +139,144 @@ Clicking another view in the UI revives the stream for a few tens of
 seconds before it freezes again. Two manual Firefox windows on the
 same URL run cleanly.
 
-This is Chromium 147's MSE pipeline misbehaving on Intel iGPUs that
-fall back to libva's legacy `i965` driver — Sandy Bridge through
-Coffee Lake (the issue surfaced on a Haswell-era Dell 3020 in
-[issue #1](https://github.com/extremeshok/kiosk-monitor/issues/1)).
-Hardware decode is engaged (`chrome://gpu` confirms `Video Decode:
-Hardware accelerated`), but the MSE state machine stalls after
-buffer underruns and Chromium's autoplay policy refuses to resume
-without a user gesture. There's no clean kiosk-monitor-side fix
-because Birdseye's player is decided server-side from Frigate's
-`birdseye.restream` config — there's no localStorage-backed user
-preference to override client-side.
+This is [issue #1](https://github.com/extremeshok/kiosk-monitor/issues/1).
+v6.11's CDP Media-domain re-diagnosis nailed the root cause:
+Chromium 147's `ChunkDemuxer` reports `DEMUXER_UNDERFLOW` on a ~1 Hz
+loop even while the `SourceBuffer` holds data ahead of `currentTime` —
+the demuxer can't feed the decoder from its own buffered range and
+eventually wedges. Reproduced on a Haswell i965 box (X11) AND on a
+Pi 5 V3D (Wayland, no libva at all), so it isn't a VAAPI driver
+quirk — it's Chromium's MSE pipeline against the fmp4 stream
+Frigate's go2rtc emits when `birdseye.restream: true`. Earlier
+versions of this guide blamed legacy-i965 and steered users at
+VLC+RTSP; that workaround functioned but was a sidestep, not the fix.
 
-**The recommended workaround is to skip Chromium entirely for the
-Birdseye view and feed VLC the go2rtc RTSP stream:**
+You have three viable recipes, depending on which other clients you
+need to keep working.
+
+#### Recipe A — chrome-only kiosks: `birdseye.restream: false`
+
+Simplest path. Edit Frigate's `config.yml`:
+
+```yaml
+birdseye:
+  restream: false
+```
+
+Restart Frigate. Frigate's WebUI auto-selects its JSMpeg
+canvas-over-WebSocket player for Birdseye when `restream` is false,
+which doesn't touch Chromium's MSE pipeline at all. **Trade-off:**
+the RTSP endpoint `rtsp://host:8554/birdseye` disappears. Per-camera
+RTSP streams (`rtsp://host:8554/<camera_name>`) are unaffected.
+
+#### Recipe B — keep RTSP and Chrome both working: `CHROME_VIA_JSMPEG=auto` (default)
+
+This is the recipe v6.11 was built for. Keep Frigate at the canonical
+`birdseye.restream: true` so VLC/HomeKit/etc. can still pull
+`rtsp://host:8554/birdseye`. **Out of the box, kiosk-monitor v6.11
+already does this**: `CHROME_VIA_JSMPEG=auto` (the default) probes each
+chrome+birdseye instance's Frigate at startup, sees `restream: true`,
+and automatically enables the extension's MSE-bypass shim. You can
+verify with `kiosk-monitor --doctor` — it should report
+
+> [ok] Chromium + Frigate Birdseye: extension JSMpeg shim active
+>      (CHROME_VIA_JSMPEG=true) — MSE chunk-demuxer freeze bypassed
+
+To force the shim on regardless of Frigate's setting, set
+`CHROME_VIA_JSMPEG=true` (or `--chrome-via-jsmpeg` at install, or
+toggle from the TUI under *Frigate helper → Chrome → JSMpeg (bypass
+MSE)*.) To opt out of the auto-detect probe entirely (e.g. on networks
+where Frigate isn't reachable from the kiosk), set
+`CHROME_VIA_JSMPEG=false` and reach for Recipe A.
+
+**Belt-and-braces auto-recovery:** the screen-freeze watchdog also
+plays its part. If chrome ever shows the same frame for
+`STALL_RETRIES` ticks on a Frigate Birdseye URL (the classic MSE
+chunk-demuxer freeze symptom), kiosk-monitor re-probes Frigate
+`/api/config`. If `restream:true` is now observed, it flips
+`CHROME_VIA_JSMPEG=true` in-memory and the imminent restart
+regenerates the extension with the shim active. This catches the two
+cases the startup probe can't see: (1) the operator flipped
+`birdseye.restream` to `true` after kiosk-monitor started without
+sending it a SIGHUP, and (2) the startup probe failed (network blip
+or Frigate cold-boot) but Frigate is genuinely at `restream:true`.
+Operator-set `CHROME_VIA_JSMPEG=false` is always respected — the
+freeze still triggers a normal restart but the shim isn't
+auto-enabled against the operator's opt-out. When the
+chrome target URL is a Frigate Birdseye view (`?birdseye` or
+`#birdseye`), the kiosk-monitor Chromium extension drops a
+`world: "MAIN"` content script that intercepts the page's
+`/api/config` fetch + XHR responses and rewrites `birdseye.restream`
+to `false` before Frigate's React app reads them. Frigate's
+`LiveBirdseyeView` then takes its native JSMpeg branch, mounting a
+canvas player against Frigate's already-running
+`/live/jsmpeg/birdseye` WebSocket. Chromium's MSE pipeline is never
+invoked — the freeze can't happen. The operator sees the full Frigate
+WebUI (camera labels, sidebar, click-to-zoom); only the player swaps.
+
+End-to-end verified on the Pi 5 viewport against a real Frigate
+0.17.1-416a9b7 at 192.168.3.222: with `birdseye.restream: true`
+server-side and `CHROME_VIA_JSMPEG=true` on kiosk-monitor, the page
+mounts a single 1920×1080 `<canvas>` painting frames and zero
+`<video>` elements. VLC simultaneously plays `rtsp://.../birdseye`
+without interference.
+
+**Caveat:** every `/api/config` response the WebUI sees has
+`birdseye.restream` rewritten to `false`. Any UI control that toggles
+behaviour on `restream` reads the patched value. For a wall-display
+kiosk with no operator interaction that's invisible; if you also use
+that same browser session as an interactive Frigate console, prefer
+Recipe A.
+
+#### Recipe C — VLC instead of Chrome
+
+If you don't need Frigate's WebUI chrome (camera labels, sidebar,
+click-to-zoom) and just want the camera wall, point VLC at the RTSP
+stream directly:
 
 ```ini
-# /etc/kiosk-monitor/kiosk-monitor.conf
 MODE="vlc"
 URL="rtsp://<frigate-host>:8554/birdseye"
-# or, if go2rtc is on a non-standard port:
+# or, if go2rtc is Docker-mapped to a non-standard port:
 # URL="rtsp://<frigate-host>:30060/birdseye"
 ```
 
-VLC's RTSP path doesn't touch Chromium's MSE pipeline at all, runs
-cleanly under software or hardware decode, and is what kiosk-monitor
-already uses for camera-only displays. Trade-off: you lose the
-Frigate web-UI chrome (camera labels, the event-thumbnails sidebar,
-click-to-zoom), and gain a kiosk that stays up. For a wall display
-showing live cameras only, that's almost always the right swap.
+`sudo kiosk-monitor --discover-streams http://<frigate>:port` prints
+a copy-pasteable list of the actual stream names + ports configured on
+your Frigate, plus a one-line snippet you can paste into
+`kiosk-monitor.conf`. The discover output also flags your current
+`birdseye.restream` setting and recommends the right recipe (A, B,
+or C) for your workflow.
 
-**Find the right RTSP URLs with `--discover-streams`:**
+#### Why the obvious "manual go2rtc.streams entry" doesn't work
 
-```bash
-# Point it at your Frigate web URL (whatever was in URL=…):
-sudo kiosk-monitor --discover-streams http://192.168.1.194:30059
-# or at standalone go2rtc:
-sudo kiosk-monitor --discover-streams http://192.168.1.194:30060
-```
+If you've read Frigate's docs you might be tempted to keep
+`birdseye.restream: false` AND add a manual `go2rtc.streams.birdseye-rtsp`
+entry. This is a dead end, save the next operator the debugging time.
+Frigate's `output/birdseye.py` gates the named pipe `/tmp/cache/birdseye`
+on `birdseye.restream: true` — with `restream: false`, the pipe
+doesn't exist, so any custom RTSP exporter pointed at it produces no
+frames. We tried it, it fails predictably. Recipe B (above) is the
+working "have both" path.
 
-Output is a copy-pasteable list of the actual stream names + ports
-configured on your Frigate, plus a one-line `MODE=vlc` / `URL=…`
-snippet for `kiosk-monitor.conf`. `kiosk-monitor --doctor` also
-runs this automatically when the VLC + HTTP-URL guard fires, so a
-single `--doctor` pass shows both the diagnosis and the concrete
-fix.
+#### Why simply deleting `window.MediaSource` from the extension doesn't help on 0.17.1
 
-`kiosk-monitor --doctor` flags this hardware combination and prints
-the same recommendation, so any future user who hits it can self-
-serve from the diagnostic output.
+The first instinct for the extension-side fix was to delete
+`window.MediaSource` and let Frigate's feature-detection fall back to
+JSMpeg. Frigate 0.17.1 actually falls back to **WebRTC**, not JSMpeg,
+when `MediaSource in window` is false (see
+`web/src/views/live/LiveBirdseyeView.tsx` around line 119). WebRTC
+sidesteps MSE but needs ICE-candidate negotiation that often fails on
+internal-only networks. Recipe B above takes the
+`config.birdseye.restream === false → "jsmpeg"` branch instead, which
+is the only path to JSMpeg in 0.17.1, by patching the WebUI's view of
+the config rather than the global object.
 
-If you specifically need the Frigate web UI on a wall display, the
-alternative is to set `birdseye.restream: false` in Frigate's
-`config.yml` — that flips Frigate to the JSMpeg canvas-over-WebSocket
-player for Birdseye, which doesn't touch MSE. That change is
-server-side and affects every Frigate client, not just the kiosk.
+`kiosk-monitor --doctor` flags chrome + Frigate Birdseye combinations
+and prints the same recommendations, so any future operator who hits
+this can self-serve from the diagnostic output. When
+`CHROME_VIA_JSMPEG=true` is already set on a matching instance, the
+doctor reports OK.
 
 ## Supervisor details (skip unless you care)
 

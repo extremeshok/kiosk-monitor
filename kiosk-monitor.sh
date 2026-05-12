@@ -28,7 +28,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.10.3"
+SCRIPT_VERSION="6.11.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -137,6 +137,25 @@ FRIGATE_DARK_MODE="${FRIGATE_DARK_MODE:-}"
 FRIGATE_THEME="${FRIGATE_THEME:-}"
 FRIGATE_THEME_STORAGE_KEY="${FRIGATE_THEME_STORAGE_KEY:-frigate-ui-theme}"
 FRIGATE_COLOR_STORAGE_KEY="${FRIGATE_COLOR_STORAGE_KEY:-frigate-ui-color-scheme}"
+# CHROME_VIA_JSMPEG: tri-state knob controlling the kiosk-monitor
+# Chromium extension's MSE-bypass shim.
+#   "auto"  (default): probe each Frigate target's /api/config at
+#           startup; if birdseye.restream:true on any chrome+birdseye
+#           instance, enable. If not, disable. If probe fails, disable
+#           (operator can flip explicitly).
+#   "true":  always inject the force-jsmpeg.js shim into the kiosk-
+#           monitor Chromium extension. The shim runs at document_start
+#           in world:MAIN, intercepts the page's /api/config fetch + XHR
+#           responses, and rewrites birdseye.restream to false before
+#           Frigate's React app reads it. Frigate then picks JSMpeg
+#           specifically, bypassing the Chromium 147 ChunkDemuxer
+#           freeze on Birdseye (extremeshok/kiosk-monitor#1). Server-
+#           side restream is untouched — VLC/HomeKit RTSP keeps working.
+#   "false": never inject the shim.
+# Auto-resolution happens in prepare_runtime_state (see
+# _resolve_chrome_via_jsmpeg_auto). The runtime value the rest of the
+# script observes is always either "true" or "false".
+CHROME_VIA_JSMPEG="${CHROME_VIA_JSMPEG:-auto}"
 DEVTOOLS_AUTO_OPEN="${DEVTOOLS_AUTO_OPEN:-false}"
 DEVTOOLS_REMOTE_PORT="${DEVTOOLS_REMOTE_PORT:-}"
 
@@ -198,10 +217,14 @@ is_frigate_birdseye_url() {
   local url=$1 lc
   [ -n "$url" ] || return 1
   lc=$(printf '%s' "$url" | tr '[:upper:]' '[:lower:]')
-  # Matches query strings like "?birdseye", "?birdseye=...", "&birdseye", etc.
+  # Matches query-style ("?birdseye", "?birdseye=…", "&birdseye") AND
+  # the hash-route URL Frigate's React WebUI uses natively
+  # ("…/#birdseye", "…/#birdseye?param", "…/#birdseye/…"). Operators
+  # paste either form into kiosk-monitor.conf; both should trigger the
+  # Frigate-specific helper logic.
   case "$lc" in
-    *\?birdseye|*\?birdseye=*|*\?birdseye\&*|*\&birdseye|*\&birdseye=*|*\&birdseye\&*)
-      return 0 ;;
+    *\?birdseye|*\?birdseye=*|*\?birdseye\&*|*\&birdseye|*\&birdseye=*|*\&birdseye\&*) return 0 ;;
+    *\#birdseye|*\#birdseye/*|*\#birdseye\?*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -230,6 +253,15 @@ normalize_config_values() {
     val="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
     printf -v "$_var" '%s' "$val"
   done
+
+  # CHROME_VIA_JSMPEG is tri-state: "auto" / "true" / "false". Anything
+  # else collapses to "auto" so unknown values don't silently disable
+  # the auto-detect path.
+  case "$(printf '%s' "${CHROME_VIA_JSMPEG:-auto}" | tr '[:upper:]' '[:lower:]')" in
+    true)     CHROME_VIA_JSMPEG="true"  ;;
+    false|0|no|off) CHROME_VIA_JSMPEG="false" ;;
+    *)        CHROME_VIA_JSMPEG="auto"  ;;
+  esac
 
   case "$MODE" in chromium|chrome) MODE="chrome" ;; esac
   case "$MODE2" in chromium|chrome) MODE2="chrome" ;; esac
@@ -262,8 +294,8 @@ normalize_config_values() {
 # after every helper has been declared. That single move buys two
 # things:
 #   1. Safe forward references — any of these init steps can now
-#      consult a helper like chromium_vaapi_uses_legacy_i965 without
-#      hitting the function-ordering trap that bit v6.8.8.
+#      consult a helper defined later in the file without hitting the
+#      function-ordering trap that bit v6.8.8.
 #   2. The early-exit MODE checks no longer fire before --version /
 #      --help can run, since main_init is invoked just before the
 #      action dispatcher.
@@ -964,53 +996,6 @@ chromium_binary() {
   echo /usr/bin/chromium
 }
 
-# Detect whether libva is actually using the legacy i965 driver. The
-# newer iHD driver (intel-media-va-driver) is preferred where the
-# hardware supports it; i965 is the fallback that's still shipped for
-# Sandy Bridge through Coffee Lake (≤ gen9.5) Intel iGPUs — Haswell-
-# class boxes like the Dell 3020 in extremeshok/kiosk-monitor#1 land
-# on i965.
-#
-# Why we care: Chromium's UseChromeOSDirectVideoDecoder feature path
-# (the new ChromeOS-derived direct decoder) is the standard
-# troubleshooting suspect when VAAPI playback stalls on Linux desktop —
-# the official Chromium VA-API doc and the ArchWiki Hardware-video-
-# acceleration page both list --disable-features=UseChromeOSDirectVideoDecoder
-# as the workaround when the new path misbehaves. Reports specific to
-# i965 + long-running MSE/WebRTC streams describe exactly the symptom
-# we see in #1: the page stays alive, only the video pipeline freezes.
-# We don't blanket-disable the feature for everyone (it's the better
-# path on iHD/newer hardware), only when we can see we'd be hitting
-# the legacy driver.
-#
-# Cached on first call so we don't fork vainfo per launch.
-KIOSK_VAAPI_USES_I965=""
-chromium_vaapi_uses_legacy_i965() {
-  if [ -n "$KIOSK_VAAPI_USES_I965" ]; then
-    [ "$KIOSK_VAAPI_USES_I965" = "yes" ]
-    return
-  fi
-  KIOSK_VAAPI_USES_I965="no"
-  # Best signal: ask vainfo what driver actually loaded for the GUI
-  # session. libva-utils ships /usr/bin/vainfo; not always installed.
-  if command -v vainfo >/dev/null 2>&1; then
-    if as_gui vainfo 2>&1 | grep -qi "Intel i965 driver"; then
-      KIOSK_VAAPI_USES_I965="yes"
-    fi
-  else
-    # Fall back to the SO files: if only i965_drv_video.so is present,
-    # libva will load it. If iHD is also there, libva prefers iHD on
-    # supported hardware, so don't tag the box as i965.
-    local d has_i965="no" has_ihd="no"
-    for d in /usr/lib/x86_64-linux-gnu/dri /usr/lib/aarch64-linux-gnu/dri /usr/lib/dri; do
-      [ -f "$d/i965_drv_video.so" ] && has_i965="yes"
-      [ -f "$d/iHD_drv_video.so" ]  && has_ihd="yes"
-    done
-    [ "$has_i965" = "yes" ] && [ "$has_ihd" = "no" ] && KIOSK_VAAPI_USES_I965="yes"
-  fi
-  [ "$KIOSK_VAAPI_USES_I965" = "yes" ]
-}
-
 vlc_binary() {
   if [ -n "$VLC_BIN" ] && [ -x "$VLC_BIN" ]; then
     printf '%s\n' "$VLC_BIN"; return 0
@@ -1098,8 +1083,9 @@ ensure_frigate_extension() {
   local id=$1
   local autofill="$FRIGATE_BIRDSEYE_AUTO_FILL"
   local dark="$FRIGATE_DARK_MODE" theme="$FRIGATE_THEME"
+  local jsmpeg="${CHROME_VIA_JSMPEG:-false}"
   # Skip entirely when nothing is customised
-  [ "$autofill" = "true" ] || [ -n "$dark" ] || [ -n "$theme" ] || return 1
+  [ "$autofill" = "true" ] || [ -n "$dark" ] || [ -n "$theme" ] || [ "$jsmpeg" = "true" ] || return 1
   local profile_root=${INSTANCE_PROFILE_DIR[$id]}
   local url="${INSTANCE_URL[$id]}"
   local -a candidates=()
@@ -1259,28 +1245,153 @@ JS
   # clean up the old file name from previous versions
   [ "$has_helper_js" = "1" ] && rm -f "$dir/frigate-theme.js"
 
+  # --- JS: force-jsmpeg shim (v6.11 CHROME_VIA_JSMPEG path) -------------
+  # Frigate 0.17.1's LiveBirdseyeView.tsx picks the player as:
+  #     if (!config || !config.birdseye.restream) return "jsmpeg";
+  #     if (isSafari || !("MediaSource" in window || ...)) return "webrtc";
+  #     return "mse";
+  # The ONLY path to JSMpeg is via the first branch — restream:false in
+  # the React app's view of /api/config. v6.11's first attempt deleted
+  # window.MediaSource to force the second branch, but that lands on
+  # WebRTC instead of JSMpeg (WebRTC has its own ICE/STUN/TURN setup
+  # requirements that often break on internal-only networks).
+  #
+  # This script intercepts the fetch() and XMLHttpRequest responses for
+  # /api/config and rewrites birdseye.restream → false before Frigate's
+  # React app reads them. The actual server config is untouched — VLC's
+  # rtsp://host/birdseye, HomeKit, etc. keep working — only the
+  # browser-side player-selection input changes. Empirically verified
+  # against Frigate 0.17.1-416a9b7: this drops a single 1920x1080
+  # <canvas> (JSMpeg) instead of <video> (MSE/WebRTC).
+  #
+  # Caveat: every /api/config call sees the patched value, so any other
+  # part of the WebUI that branches on restream sees restream:false too.
+  # For wall-display kiosks (no user interaction) this is invisible.
+  local has_mse_shim=0
+  if [ "$jsmpeg" = "true" ]; then
+    has_mse_shim=1
+    cat > "$dir/force-jsmpeg.js" <<'JS'
+// Run at document_start in MAIN world. Intercepts /api/config responses
+// so Frigate's WebUI sees birdseye.restream=false and picks JSMpeg.
+// Server-side restream config is untouched — RTSP stays available.
+(function () {
+  'use strict';
+  var NEEDLE = '/api/config';
+  function shouldRewrite(url) {
+    return typeof url === 'string'
+      && url.indexOf(NEEDLE) !== -1
+      && url.indexOf('/api/config/save') === -1
+      && url.indexOf('/api/config/raw')  === -1;
+  }
+  function patchBody(body) {
+    try {
+      var cfg = JSON.parse(body);
+      if (cfg && cfg.birdseye) cfg.birdseye.restream = false;
+      return JSON.stringify(cfg);
+    } catch (e) { return body; }
+  }
+  // fetch — primary path used by Frigate's React app
+  var origFetch = window.fetch;
+  if (typeof origFetch === 'function') {
+    window.fetch = function (input, init) {
+      var url = (typeof input === 'string') ? input : (input && input.url) || '';
+      var p = origFetch.apply(this, arguments);
+      if (!shouldRewrite(url)) return p;
+      return p.then(function (res) {
+        return res.clone().text().then(function (body) {
+          return new Response(patchBody(body), {
+            status: res.status,
+            statusText: res.statusText,
+            headers: res.headers
+          });
+        });
+      });
+    };
+  }
+  // XHR — defensive fallback for any legacy path or future change.
+  var OrigXHR = window.XMLHttpRequest;
+  if (typeof OrigXHR === 'function') {
+    function PatchedXHR() {
+      var x = new OrigXHR();
+      var seenUrl = '';
+      var origOpen = x.open;
+      x.open = function (m, u) { seenUrl = u; return origOpen.apply(x, arguments); };
+      try {
+        Object.defineProperty(x, 'responseText', {
+          get: function () {
+            var d = Object.getOwnPropertyDescriptor(OrigXHR.prototype, 'responseText');
+            var orig = d && d.get ? d.get.call(x) : '';
+            return shouldRewrite(seenUrl) ? patchBody(orig) : orig;
+          }
+        });
+        Object.defineProperty(x, 'response', {
+          get: function () {
+            var d = Object.getOwnPropertyDescriptor(OrigXHR.prototype, 'response');
+            var orig = d && d.get ? d.get.call(x) : '';
+            if (!shouldRewrite(seenUrl) || typeof orig !== 'string') return orig;
+            return patchBody(orig);
+          }
+        });
+      } catch (e) { /* property locked — fall through, fetch covers it */ }
+      return x;
+    }
+    PatchedXHR.prototype = OrigXHR.prototype;
+    window.XMLHttpRequest = PatchedXHR;
+  }
+})();
+JS
+    # Clean up previous v6.11-pre filename if upgrading from an in-flight
+    # build.
+    rm -f "$dir/mse-disable.js"
+  else
+    rm -f "$dir/force-jsmpeg.js" "$dir/mse-disable.js"
+  fi
+
   # --- manifest ---
-  local css_field="" js_field=""
-  [ "$autofill" = "true" ] && css_field='      "css": ["fullscreen.css"],'
-  [ "$has_helper_js" = "1" ] && js_field='      "js": ["frigate-helper.js"],'
+  # Build the content_scripts array conditionally. Up to two entries:
+  #   1. Isolated-world helper (CSS for autofill + JS for theme/dark/
+  #      autofill-sizing). Emitted when any of those knobs are active.
+  #      Lives in the default isolated world so it can touch localStorage
+  #      via the page origin without contending with the page's own JS.
+  #   2. MAIN-world MSE-disable shim. Emitted when CHROME_VIA_JSMPEG=true.
+  #      Must run in MAIN world so its `delete window.MediaSource` is
+  #      visible to the page's `"MediaSource" in window` feature check
+  #      (Frigate's player-selection useMemo).
+  # If only one entry applies, the second isn't emitted — keeps the
+  # manifest schema-valid (empty entries are invalid). Build entries as
+  # strings in a bash array, then join with `,\n` to get proper JSON.
+  local -a entries=()
+  if [ "$autofill" = "true" ] || [ "$has_helper_js" = "1" ]; then
+    local entry="    {"$'\n'"      \"matches\": [\"$match_pattern\"],"$'\n'
+    [ "$autofill" = "true" ]   && entry+="      \"css\": [\"fullscreen.css\"],"$'\n'
+    [ "$has_helper_js" = "1" ] && entry+="      \"js\": [\"frigate-helper.js\"],"$'\n'
+    entry+="      \"run_at\": \"document_start\""$'\n'"    }"
+    entries+=( "$entry" )
+  fi
+  if [ "$has_mse_shim" = "1" ]; then
+    local entry="    {"$'\n'"      \"matches\": [\"$match_pattern\"],"$'\n'
+    entry+="      \"js\": [\"force-jsmpeg.js\"],"$'\n'
+    entry+="      \"run_at\": \"document_start\","$'\n'
+    entry+="      \"world\": \"MAIN\""$'\n'"    }"
+    entries+=( "$entry" )
+  fi
+  local entries_joined
+  # Join with ",\n" between entries. printf '%s,\n' "${entries[@]}" gives
+  # trailing comma + newline; $() strips the trailing newline; strip the
+  # remaining comma to get valid JSON.
+  entries_joined=$(printf '%s,\n' "${entries[@]}")
+  entries_joined=${entries_joined%,}
   cat > "$dir/manifest.json" <<MANIFEST
 {
   "name": "Kiosk-Monitor Frigate Helper",
   "version": "1.0",
   "manifest_version": 3,
-  "description": "Inject Frigate kiosk tweaks: birdseye auto-fill, dark-mode and theme.",
+  "description": "Inject Frigate kiosk tweaks: birdseye auto-fill, dark-mode, theme, and MSE-bypass for the Birdseye chunk-demuxer freeze.",
   "content_scripts": [
-    {
-      "matches": ["$match_pattern"],
-$css_field
-$js_field
-      "run_at": "document_start"
-    }
+$entries_joined
   ]
 }
 MANIFEST
-  # Clean up blank lines in the manifest (from skipped css/js fields)
-  sed -i '/^[[:space:]]*$/d' "$dir/manifest.json"
 
   chmod 0755 "$dir"
   find "$dir" -maxdepth 1 -type f -exec chmod 0644 {} +
@@ -1411,8 +1522,7 @@ HTML
 # an instance, including the merged --enable-features / --disable-features
 # switches and the kiosk-mode triplet. Does NOT include the trailing URL
 # — the caller appends that after deciding between real URL and waiting
-# page. Reads INSTANCE_CLASS, SESSION_TYPE, DEVTOOLS_*, and the legacy
-# i965 detector for feature-disable gating.
+# page. Reads INSTANCE_CLASS, SESSION_TYPE, DEVTOOLS_*.
 #
 # Args: id, nameref-to-output-array, profile_root, x, y, w, h
 build_chrome_flags() {
@@ -1443,21 +1553,14 @@ build_chrome_flags() {
     GlobalVaapiLock
     MediaSessionService HardwareMediaKeyHandling
   )
-  # UseChromeOSDirectVideoDecoder: Chromium 147's new ChromeOS-derived
-  # direct video decoder. It's the better path on newer Intel/AMD where
-  # iHD/Mesa-VAAPI is loaded, so we don't blanket-disable it. On boxes
-  # where libva fell back to the legacy i965 driver (Sandy Bridge through
-  # Coffee Lake, including the Haswell box in extremeshok/kiosk-monitor#1)
-  # the new path is the standard suspect for VAAPI playback stalls
-  # (Chromium VA-API doc + ArchWiki hardware-video-acceleration page
-  # both list --disable-features=UseChromeOSDirectVideoDecoder as the
-  # workaround). When a feature is in both --enable-features and
-  # --disable-features, Chromium's parser registers disable second and
-  # disable wins, so we don't have to filter the merged enable list.
-  if chromium_vaapi_uses_legacy_i965; then
-    feature_disable+=( UseChromeOSDirectVideoDecoder )
-    log_instance "$id" "VAAPI loaded via legacy i965 driver — disabling UseChromeOSDirectVideoDecoder"
-  fi
+  # Historical note: v6.8.7 added a conditional
+  # `--disable-features=UseChromeOSDirectVideoDecoder` on legacy-i965
+  # VAAPI hardware, on the hypothesis that the Frigate Birdseye
+  # Chromium freeze was VAAPI-stack-related. v6.11 disproved that via
+  # CDP Media-domain re-diagnosis (the freeze is Chromium's ChunkDemuxer
+  # cycling on DEMUXER_UNDERFLOW in the MSE-via-go2rtc-fmp4 path);
+  # the conditional and the i965 detector were removed in v6.11. The
+  # real fix lives at the MSE-vs-JSMpeg level — see CHROME_VIA_JSMPEG.
   merged_disable=$(merge_chromium_features disable "${feature_disable[@]}")
   merged_enable=$(merge_chromium_features enable \
     OverlayScrollbar UseOzonePlatform \
@@ -1515,7 +1618,15 @@ build_chrome_flags() {
     _flags_dst+=( "--load-extension=$ext_path" "--disable-extensions-except=$ext_path" )
   fi
   [ "$DEVTOOLS_AUTO_OPEN" = "true" ] && _flags_dst+=( --auto-open-devtools-for-tabs )
-  [ -n "$DEVTOOLS_REMOTE_PORT" ] && _flags_dst+=( "--remote-debugging-port=$DEVTOOLS_REMOTE_PORT" )
+  # --remote-debugging-port + --remote-allow-origins go together: since
+  # Chromium 147 the DevTools WebSocket handshake rejects any Origin not
+  # explicitly allowed (including the IPv4-loopback the python clients
+  # send), and you can't attach via CDP at all without the allow-origins
+  # bypass. We pair them so operators can actually use the diagnostic
+  # entry-point they configured.
+  if [ -n "$DEVTOOLS_REMOTE_PORT" ]; then
+    _flags_dst+=( "--remote-debugging-port=$DEVTOOLS_REMOTE_PORT" "--remote-allow-origins=*" )
+  fi
 }
 
 # resolve_chrome_launch_url: pick what URL to hand Chromium. When the
@@ -2595,6 +2706,7 @@ EOF
     emit_config_line FRIGATE_THEME "${FRIGATE_THEME:-}"
     emit_config_line FRIGATE_THEME_STORAGE_KEY "${FRIGATE_THEME_STORAGE_KEY:-frigate-ui-theme}"
     emit_config_line FRIGATE_COLOR_STORAGE_KEY "${FRIGATE_COLOR_STORAGE_KEY:-frigate-ui-color-scheme}"
+    emit_config_line CHROME_VIA_JSMPEG "${CHROME_VIA_JSMPEG:-auto}"
     emit_config_line DEVTOOLS_AUTO_OPEN "${DEVTOOLS_AUTO_OPEN:-false}"
     emit_config_line DEVTOOLS_REMOTE_PORT "${DEVTOOLS_REMOTE_PORT:-}"
     emit_config_line LOCK_FILE "${LOCK_FILE:-/var/lock/kiosk-monitor.lock}"
@@ -2739,7 +2851,7 @@ install_self() {
 
   local url_override="" gui_override="" mode_override=""
   local output_override="" mode2_override="" url2_override="" output2_override=""
-  local autostart="yes" skip_apt="no"
+  local autostart="yes" skip_apt="no" jsmpeg_override=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --url)        shift; url_override="${1:-}";      [ -n "$url_override" ]     || { echo 'Error: --url requires a value' >&2; exit 1; } ;;
@@ -2757,11 +2869,20 @@ install_self() {
       --gui-user|--user) shift; gui_override="${1:-}"; [ -n "$gui_override" ]     || { echo 'Error: --gui-user requires a value' >&2; exit 1; } ;;
       --no-start)   autostart="no" ;;
       --skip-apt)   skip_apt="yes" ;;
+      --chrome-via-jsmpeg)      jsmpeg_override="true"  ;;
+      --no-chrome-via-jsmpeg)   jsmpeg_override="false" ;;
+      --auto-chrome-via-jsmpeg) jsmpeg_override="auto"  ;;
       --base-url)   shift; BASE_URL="${1:-}";          [ -n "$BASE_URL" ]         || { echo 'Error: --base-url requires a value' >&2; exit 1; } ;;
       *) printf 'Error: unknown install option %s\n' "$1" >&2; usage; exit 1 ;;
     esac
     shift
   done
+  # Surface the override before ensure_config_file writes the conf so the
+  # value lands in the on-disk config (the function also reads CHROME_VIA_JSMPEG
+  # from env if present and re-emits it).
+  if [ -n "$jsmpeg_override" ]; then
+    CHROME_VIA_JSMPEG="$jsmpeg_override"
+  fi
 
   if [ "$skip_apt" = "no" ]; then
     ensure_apt_dependencies || exit 1
@@ -3092,6 +3213,7 @@ TUI_MODE=""; TUI_URL=""; TUI_OUTPUT=""; TUI_RES=""; TUI_ROT=""
 TUI_MODE2=""; TUI_URL2=""; TUI_OUTPUT2=""; TUI_RES2=""; TUI_ROT2=""
 TUI_FRIGATE_DARK=""; TUI_FRIGATE_THEME=""; TUI_FRIGATE_AUTOFILL=""
 TUI_FRIGATE_WIDTH=""; TUI_FRIGATE_HEIGHT=""; TUI_FRIGATE_MARGIN=""
+TUI_CHROME_VIA_JSMPEG=""
 TUI_GUI_USER=""
 TUI_HEALTH_INTERVAL=""; TUI_SCREEN_DELAY=""; TUI_STALL_RETRIES=""
 TUI_VLC_STALL_RETRIES=""; TUI_HEALTH_RETRIES=""
@@ -3117,6 +3239,7 @@ _tui_load_config() {
   TUI_FRIGATE_WIDTH="${FRIGATE_BIRDSEYE_WIDTH:-}"
   TUI_FRIGATE_HEIGHT="${FRIGATE_BIRDSEYE_HEIGHT:-}"
   TUI_FRIGATE_MARGIN="${FRIGATE_BIRDSEYE_MARGIN:-80}"
+  TUI_CHROME_VIA_JSMPEG="${CHROME_VIA_JSMPEG:-auto}"
   TUI_GUI_USER="${GUI_USER:-}"
   TUI_HEALTH_INTERVAL="${HEALTH_INTERVAL:-30}"
   TUI_SCREEN_DELAY="${SCREEN_DELAY:-120}"
@@ -3310,10 +3433,11 @@ _tui_edit_frigate() {
     fi
     local choice
     choice=$(_wt_menu "Frigate helper" \
-"Tweaks applied by the injected Chrome extension when the URL points at Frigate." 18 72 7 \
+"Tweaks applied by the injected Chrome extension when the URL points at Frigate." 20 72 8 \
       "dark"     "Dark mode: $(_tui_preview_value "$TUI_FRIGATE_DARK" smart-default)" \
       "theme"    "Colour theme: $(_tui_preview_value "$TUI_FRIGATE_THEME" smart-default)" \
       "autofill" "Birdseye auto-fill: $TUI_FRIGATE_AUTOFILL" \
+      "jsmpeg"   "Chrome → JSMpeg (bypass MSE): $(_tui_preview_value "$TUI_CHROME_VIA_JSMPEG" auto)" \
       "size"     "Birdseye grid size: $size_disp" \
       "margin"   "Auto-size margin: ${TUI_FRIGATE_MARGIN}px" \
       "back"     "Return to the main menu") || return 0
@@ -3339,6 +3463,16 @@ _tui_edit_frigate() {
       autofill)
         TUI_FRIGATE_AUTOFILL=$(_tui_bool_toggle "$TUI_FRIGATE_AUTOFILL")
         TUI_DIRTY="yes" ;;
+      jsmpeg)
+        # Tri-state picker. "auto" probes Frigate at startup for
+        # birdseye.restream:true; "true"/"false" force the shim on/off.
+        local v
+        v=$(_wt_menu "Chrome → JSMpeg" \
+"Inject the kiosk-monitor extension's MAIN-world shim that makes Frigate's React WebUI pick JSMpeg instead of MSE — bypasses the Chromium 147 chunk-demuxer freeze on Birdseye (issue #1). Leaves Frigate's birdseye.restream config untouched, so VLC/HomeKit RTSP keeps working." 16 72 4 \
+          "auto"  "Auto: probe Frigate; enable if birdseye.restream=true (default)" \
+          "true"  "Force on:  always inject the shim" \
+          "false" "Force off: never inject the shim") || continue
+        TUI_CHROME_VIA_JSMPEG="$v"; TUI_DIRTY="yes" ;;
       size)
         local w h
         w=$(_wt_input "Birdseye width" "Grid width in pixels (blank = auto from viewport):" "$TUI_FRIGATE_WIDTH") || continue
@@ -3438,6 +3572,7 @@ _tui_write_all() {
   set_or_append_conf_value FRIGATE_BIRDSEYE_WIDTH      "$TUI_FRIGATE_WIDTH"        "$cf"
   set_or_append_conf_value FRIGATE_BIRDSEYE_HEIGHT     "$TUI_FRIGATE_HEIGHT"       "$cf"
   set_or_append_conf_value FRIGATE_BIRDSEYE_MARGIN     "$TUI_FRIGATE_MARGIN"       "$cf"
+  set_or_append_conf_value CHROME_VIA_JSMPEG           "$TUI_CHROME_VIA_JSMPEG"    "$cf"
   set_or_append_conf_value GUI_USER                    "$TUI_GUI_USER"             "$cf"
   set_or_append_conf_value HEALTH_INTERVAL             "$TUI_HEALTH_INTERVAL"      "$cf"
   set_or_append_conf_value SCREEN_DELAY                "$TUI_SCREEN_DELAY"         "$cf"
@@ -3778,6 +3913,37 @@ _tui_discover_streams() {
   esac
 }
 
+# _tui_doctor: run the same read-only diagnostic the `kiosk-monitor
+# --doctor` CLI runs, capture its output, and show it in a whiptail
+# msgbox. Forked as a subprocess so the doctor's setup_instances /
+# refresh_outputs / _resolve_chrome_via_jsmpeg_auto calls don't
+# clobber any TUI in-memory state. Doctor reads the on-disk config —
+# if the operator has unsaved edits, we offer to Save first so the
+# probe reflects what would actually run.
+_tui_doctor() {
+  if [ "$TUI_DIRTY" = "yes" ]; then
+    if _wt_yesno "Unsaved changes" \
+      "Doctor reads the on-disk config — your in-memory TUI edits won't be probed. Save them now and continue?" \
+      yes; then
+      _tui_write_all
+      TUI_DIRTY="no"
+    fi
+  fi
+  local self out rc
+  self=$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]:-$0}")
+  whiptail --title "Doctor" --infobox "Running diagnostic checks…" 7 60
+  set +e
+  out=$("$self" --config "$CONFIG_FILE" --doctor 2>&1)
+  rc=$?
+  set -e
+  local box_title="Doctor"
+  [ "$rc" -ne 0 ] && box_title="Doctor (exit $rc — issues found)"
+  # Pad to a roomy box so the operator can scan the summary line and
+  # the per-check breadcrumbs side-by-side; msgbox auto-scrolls long
+  # output via PageUp/PageDown.
+  whiptail --title "$box_title" --msgbox "$out" 28 110 || true
+}
+
 _tui_main_menu() {
   local inst1_label inst2_label frig_label adv_label svc_label
   while true; do
@@ -3787,7 +3953,7 @@ _tui_main_menu() {
     else
       inst2_label="disabled"
     fi
-    frig_label="dark=$(_tui_preview_value "$TUI_FRIGATE_DARK" auto), theme=$(_tui_preview_value "$TUI_FRIGATE_THEME" auto), autofill=$TUI_FRIGATE_AUTOFILL"
+    frig_label="dark=$(_tui_preview_value "$TUI_FRIGATE_DARK" auto), theme=$(_tui_preview_value "$TUI_FRIGATE_THEME" auto), autofill=$TUI_FRIGATE_AUTOFILL, jsmpeg=$TUI_CHROME_VIA_JSMPEG"
     adv_label="interval=${TUI_HEALTH_INTERVAL}s, stall=${TUI_STALL_RETRIES}/${TUI_VLC_STALL_RETRIES}"
     svc_label=$(_tui_service_state_label)
 
@@ -3795,7 +3961,7 @@ _tui_main_menu() {
     [ "$TUI_DIRTY" = "yes" ] && dirty_marker=" *"
     local choice
     choice=$(_wt_menu "kiosk-monitor ${SCRIPT_VERSION}${dirty_marker}" \
-      "Main menu — pick an area to edit, or save and apply." 23 78 13 \
+      "Main menu — pick an area to edit, or save and apply." 24 78 14 \
       "instance1"  "Instance 1:  $inst1_label" \
       "instance2"  "Instance 2:  $inst2_label" \
       "frigate"    "Frigate helper:  $frig_label" \
@@ -3803,6 +3969,7 @@ _tui_main_menu() {
       "profile"    "Profile / logging / VLC options" \
       "service"    "Service:  $svc_label" \
       "discover"   "Discover Frigate / go2rtc RTSP streams" \
+      "doctor"     "Run read-only diagnostic checks (--doctor)" \
       "editor"     "Open $CONFIG_FILE in \$EDITOR" \
       "reload"     "Reload config file (discard in-memory edits)" \
       "apply"      "Save and restart the service (stay in menu)" \
@@ -3816,6 +3983,7 @@ _tui_main_menu() {
       profile)   _tui_edit_profile_logs ;;
       service)   _tui_service_menu ;;
       discover)  _tui_discover_streams ;;
+      doctor)    _tui_doctor ;;
       editor)    _tui_edit_in_editor ;;
       reload)
         _tui_load_config
@@ -3894,6 +4062,7 @@ status_self() {
     printf '  dark-mode         : %s\n' "${FRIGATE_DARK_MODE:-(none)}"
     printf '  theme             : %s\n' "${FRIGATE_THEME:-(none)}"
     printf '  birdseye autofill : %s\n' "${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
+    printf '  chrome-via-jsmpeg : %s\n' "${CHROME_VIA_JSMPEG:-auto}"
     if [ -n "${FRIGATE_BIRDSEYE_WIDTH:-}" ] || [ -n "${FRIGATE_BIRDSEYE_HEIGHT:-}" ]; then
       printf '  birdseye size     : %sx%s (fixed)\n' "${FRIGATE_BIRDSEYE_WIDTH:-auto}" "${FRIGATE_BIRDSEYE_HEIGHT:-auto}"
     else
@@ -4070,16 +4239,22 @@ def parse_listen(listen_str):
     return None
 
 def harvest_rtsp_meta(cfg):
-    """Pull rtsp.listen / username / password out of a parsed Frigate
-    /api/config response. Each may be absent."""
+    """Pull rtsp.listen / username / password + birdseye state out of a
+    parsed Frigate /api/config response. Each may be absent."""
     g2 = cfg.get("go2rtc") or {}
     rtsp = g2.get("rtsp") or {}
+    bs = cfg.get("birdseye") or {}
     return (
         rtsp.get("listen", "") or "",
         rtsp.get("username", "") or "",
         rtsp.get("password", "") or "",
         sorted((g2.get("streams") or {}).keys()),
+        bool(bs.get("enabled")),
+        bool(bs.get("restream")),
     )
+
+birdseye_enabled = False
+birdseye_restream = False
 
 if kind == "frigate-proxy":
     data    = json.loads(body)
@@ -4087,7 +4262,7 @@ if kind == "frigate-proxy":
     if cfg_body:
         try:
             cfg = json.loads(cfg_body)
-            listen, rtsp_user, rtsp_pass, _ = harvest_rtsp_meta(cfg)
+            listen, rtsp_user, rtsp_pass, _, birdseye_enabled, birdseye_restream = harvest_rtsp_meta(cfg)
             p = parse_listen(listen)
             if p:
                 rtsp_port = p
@@ -4097,7 +4272,7 @@ if kind == "frigate-proxy":
     print("Frigate detected at " + host + ":" + str(parsed.port or 5000) + " (via /api/go2rtc/streams)")
 elif kind == "frigate":
     cfg = json.loads(body)
-    listen, rtsp_user, rtsp_pass, streams = harvest_rtsp_meta(cfg)
+    listen, rtsp_user, rtsp_pass, streams, birdseye_enabled, birdseye_restream = harvest_rtsp_meta(cfg)
     p = parse_listen(listen)
     if p:
         rtsp_port = p
@@ -4167,6 +4342,33 @@ print()
 print("Suggested kiosk-monitor.conf snippet:")
 print('  MODE="vlc"')
 print('  URL="rtsp://' + ui + host + ":" + rtsp_port + "/" + streams[0] + '"')
+
+# Birdseye + chrome strategy advisory. The MSE chunk-demuxer freeze
+# documented in extremeshok/kiosk-monitor#1 is purely a function of
+# birdseye.restream:true + chromium-MSE on every hardware combo so far
+# tested. Surface the two viable paths so the operator picks based on
+# whether RTSP-for-VLC is needed alongside the chrome kiosk.
+if kind in ("frigate", "frigate-proxy") and birdseye_enabled:
+    print()
+    if birdseye_restream:
+        print("NOTE: birdseye.restream is currently `true` on this Frigate.")
+        print("      Chromium kiosks pointed at " + parsed.scheme + "://" + host + ":" + str(web_port) + "/#birdseye")
+        print("      will hit the MSE chunk-demuxer freeze after a few minutes.")
+        print("      Two viable fixes (pick one):")
+        print("        (a) set `birdseye.restream: false` on Frigate — Chromium then")
+        print("            uses Frigate's JSMpeg path (freeze-free); trade-off is")
+        print("            rtsp://" + host + ":" + rtsp_port + "/birdseye disappears (per-camera RTSP unaffected).")
+        print("        (b) keep restream: true and run kiosk-monitor with")
+        print("            CHROME_VIA_JSMPEG=true (or --chrome-via-jsmpeg at install)")
+        print("            — kiosk-monitor opens a local jsmpeg.js viewer of")
+        print("            ws://" + host + ":" + str(web_port) + "/live/jsmpeg/birdseye directly. VLC's")
+        print("            rtsp://" + host + ":" + rtsp_port + "/birdseye keeps working in parallel.")
+    else:
+        print("NOTE: birdseye.restream is currently `false` on this Frigate. Chromium")
+        print("      kiosks pointed at " + parsed.scheme + "://" + host + ":" + str(web_port) + "/#birdseye get the freeze-free")
+        print("      JSMpeg path automatically — no kiosk-monitor flag required. If you")
+        print("      also want rtsp://" + host + ":" + rtsp_port + "/birdseye for VLC, flip restream to true")
+        print("      and enable CHROME_VIA_JSMPEG=true for any Chromium instances.")
 PY
 )" <<<"$body"
 }
@@ -4329,17 +4531,186 @@ _doctor_check_outputs_and_mapping() {
   done
 }
 
-# Chromium-on-i965 + Frigate Birdseye is a known footgun (issue #1):
-# Chromium 147's MSE pipeline freezes a Birdseye stream after a few
-# minutes on Sandy Bridge through Coffee Lake Intel iGPUs while the
-# rest of the page keeps rendering normally. The root cause is upstream
-# Chromium and there's no clean kiosk-monitor-side fix because
-# Birdseye's player choice is decided server-side from Frigate's
-# `birdseye.restream` config and isn't user-overridable via
-# localStorage. Doctor the box and recommend a route that doesn't
-# touch MSE.
-_doctor_check_i965_birdseye_footgun() {
-  chromium_vaapi_uses_legacy_i965 || return 0
+# CHROME_VIA_JSMPEG_RESOLVED_REASON: set by _resolve_chrome_via_jsmpeg_auto
+# (startup) and _maybe_auto_flip_chrome_via_jsmpeg_on_freeze (runtime)
+# so the doctor + status panels can show "why" — not just the resolved
+# boolean. One of: operator-set-true | operator-set-false |
+# invalid-collapsed-to-false | frigate-restream-true |
+# frigate-restream-false | frigate-probe-failed |
+# no-chrome-birdseye-instance | freeze-auto-recover
+CHROME_VIA_JSMPEG_RESOLVED_REASON=""
+
+# _resolve_chrome_via_jsmpeg_auto: when CHROME_VIA_JSMPEG="auto" (the
+# default), inspect each chrome+birdseye instance's Frigate target and
+# probe `<host>/api/config` for `birdseye.restream`. If any matching
+# instance's Frigate reports `restream:true`, the kiosk would otherwise
+# render via Chromium MSE and hit the chunk-demuxer freeze
+# (extremeshok/kiosk-monitor#1), so we flip CHROME_VIA_JSMPEG to "true"
+# and the extension's force-jsmpeg.js shim is injected when the
+# extension is built.
+#
+# Failure modes (Frigate unreachable, missing birdseye key, etc.)
+# resolve to "false" and emit a log line — the doctor warning still
+# fires if the operator should investigate. Always best-effort with a
+# 3-second per-probe timeout so kiosk startup never hangs on a slow
+# Frigate.
+_resolve_chrome_via_jsmpeg_auto() {
+  case "${CHROME_VIA_JSMPEG:-auto}" in
+    true)
+      CHROME_VIA_JSMPEG_RESOLVED_REASON="operator-set-true"
+      log "CHROME_VIA_JSMPEG=true (operator-set) — extension will inject force-jsmpeg.js"
+      return 0 ;;
+    false)
+      CHROME_VIA_JSMPEG_RESOLVED_REASON="operator-set-false"
+      log "CHROME_VIA_JSMPEG=false (operator-set) — extension MSE-bypass shim disabled"
+      return 0 ;;
+    auto) ;;  # fall through
+    *)
+      CHROME_VIA_JSMPEG="false"
+      CHROME_VIA_JSMPEG_RESOLVED_REASON="invalid-collapsed-to-false"
+      return 0 ;;
+  esac
+  local id mode url host_url body restream="" target_count=0 restream_true_count=0 restream_false_count=0 probe_fail_count=0
+  for id in "${INSTANCES[@]}"; do
+    mode="${INSTANCE_MODE[$id]:-}"
+    url="${INSTANCE_URL[$id]:-}"
+    [ "$mode" = "chrome" ] || continue
+    is_frigate_birdseye_url "$url" || continue
+    target_count=$((target_count + 1))
+    host_url=$(printf '%s' "$url" | python3 -c '
+import sys
+from urllib.parse import urlparse
+u = urlparse(sys.stdin.read().strip())
+print(f"{u.scheme}://{u.netloc}" if u.scheme and u.netloc else "")
+' 2>/dev/null)
+    if [ -z "$host_url" ]; then
+      log_instance "$id" "CHROME_VIA_JSMPEG=auto: could not parse Frigate host from URL"
+      probe_fail_count=$((probe_fail_count + 1))
+      continue
+    fi
+    body=$(curl -fsSL --connect-timeout 3 --max-time 5 "$host_url/api/config" 2>/dev/null) || body=""
+    if [ -z "$body" ]; then
+      log_instance "$id" "CHROME_VIA_JSMPEG=auto: /api/config probe failed for $host_url (network or HTTP error)"
+      probe_fail_count=$((probe_fail_count + 1))
+      continue
+    fi
+    restream=$(printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    c = json.loads(sys.stdin.read())
+    bs = c.get("birdseye") or {}
+    print("true" if bs.get("restream") else "false")
+except Exception:
+    print("error")
+' 2>/dev/null) || restream="error"
+    case "$restream" in
+      true)
+        restream_true_count=$((restream_true_count + 1))
+        log_instance "$id" "CHROME_VIA_JSMPEG=auto: Frigate at $host_url has birdseye.restream:true — enabling JSMpeg shim"
+        ;;
+      false)
+        restream_false_count=$((restream_false_count + 1))
+        log_instance "$id" "CHROME_VIA_JSMPEG=auto: Frigate at $host_url has birdseye.restream:false (no freeze risk; shim not needed)"
+        ;;
+      *)
+        probe_fail_count=$((probe_fail_count + 1))
+        log_instance "$id" "CHROME_VIA_JSMPEG=auto: could not read birdseye.restream from $host_url/api/config"
+        ;;
+    esac
+  done
+  if [ "$target_count" -eq 0 ]; then
+    CHROME_VIA_JSMPEG="false"
+    CHROME_VIA_JSMPEG_RESOLVED_REASON="no-chrome-birdseye-instance"
+    log "CHROME_VIA_JSMPEG=auto: no chrome+birdseye instance configured; shim not needed"
+    return 0
+  fi
+  if [ "$restream_true_count" -gt 0 ]; then
+    CHROME_VIA_JSMPEG="true"
+    CHROME_VIA_JSMPEG_RESOLVED_REASON="frigate-restream-true"
+    log "CHROME_VIA_JSMPEG=auto → true ($restream_true_count Frigate target(s) at restream:true)"
+  elif [ "$restream_false_count" -gt 0 ]; then
+    CHROME_VIA_JSMPEG="false"
+    CHROME_VIA_JSMPEG_RESOLVED_REASON="frigate-restream-false"
+    log "CHROME_VIA_JSMPEG=auto → false (Frigate at restream:false; WebUI already picks JSMpeg natively, no freeze risk)"
+  else
+    CHROME_VIA_JSMPEG="false"
+    CHROME_VIA_JSMPEG_RESOLVED_REASON="frigate-probe-failed"
+    log "CHROME_VIA_JSMPEG=auto → false ($probe_fail_count Frigate probe(s) failed; operator should investigate)"
+  fi
+}
+
+# _maybe_auto_flip_chrome_via_jsmpeg_on_freeze: the reactive companion
+# to _resolve_chrome_via_jsmpeg_auto. Called by the watchdog when a
+# chrome+birdseye instance has been on the same screen-hash for
+# STALL_RETRIES ticks (i.e. visibly frozen). Catches the cases where
+# the proactive auto-resolver couldn't see what's happening NOW:
+#   - Operator flipped Frigate to birdseye.restream:true *after*
+#     kiosk-monitor started; the startup probe saw restream:false and
+#     left the shim off.
+#   - Startup probe failed (network blip, Frigate cold-boot) and we
+#     defaulted to off, but Frigate is genuinely at restream:true.
+# Re-probes Frigate /api/config; if restream:true, flips
+# CHROME_VIA_JSMPEG="true" so record_restart_instance regenerates the
+# extension with the force-jsmpeg.js shim active on relaunch.
+# Respects operator-set-false (no auto-flip when operator opted out).
+_maybe_auto_flip_chrome_via_jsmpeg_on_freeze() {
+  local id=$1
+  local mode="${INSTANCE_MODE[$id]:-}"
+  local url="${INSTANCE_URL[$id]:-}"
+  [ "$mode" = "chrome" ] || return 0
+  is_frigate_birdseye_url "$url" || return 0
+  # Shim already active? Nothing to do; the freeze is something else,
+  # let the normal restart path handle it.
+  [ "${CHROME_VIA_JSMPEG:-}" = "true" ] && return 0
+  # Operator explicitly opted out (CHROME_VIA_JSMPEG=false in config)?
+  # Respect that — they may have a reason (intermittent probe failures
+  # on a slow Frigate, deliberate use of restream-false anyway, etc.).
+  if [ "${CHROME_VIA_JSMPEG_RESOLVED_REASON:-}" = "operator-set-false" ]; then
+    log_instance "$id" "screen freeze on chrome+birdseye, but operator set CHROME_VIA_JSMPEG=false — skipping auto-recover"
+    return 0
+  fi
+  local host_url
+  host_url=$(printf '%s' "$url" | python3 -c '
+import sys
+from urllib.parse import urlparse
+u = urlparse(sys.stdin.read().strip())
+print(f"{u.scheme}://{u.netloc}" if u.scheme and u.netloc else "")
+' 2>/dev/null)
+  [ -n "$host_url" ] || return 0
+  local body restream
+  body=$(curl -fsSL --connect-timeout 3 --max-time 5 "$host_url/api/config" 2>/dev/null) || body=""
+  if [ -z "$body" ]; then
+    log_instance "$id" "screen freeze on chrome+birdseye; re-probe of $host_url failed — can't auto-recover"
+    return 0
+  fi
+  restream=$(printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    c = json.loads(sys.stdin.read())
+    bs = c.get("birdseye") or {}
+    print("true" if bs.get("restream") else "false")
+except Exception:
+    print("error")
+' 2>/dev/null) || restream="error"
+  if [ "$restream" = "true" ]; then
+    log_instance "$id" "screen freeze on chrome+birdseye + Frigate now reports restream:true → enabling CHROME_VIA_JSMPEG; the relaunch will pick up the JSMpeg shim"
+    CHROME_VIA_JSMPEG="true"
+    CHROME_VIA_JSMPEG_RESOLVED_REASON="freeze-auto-recover"
+  else
+    log_instance "$id" "screen freeze on chrome+birdseye, but Frigate reports restream:$restream — the MSE shim wouldn't help here"
+  fi
+}
+
+# Chromium + Frigate Birdseye combination is a known freeze trap
+# (extremeshok/kiosk-monitor#1). v6.11 root-cause analysis confirmed the
+# culprit is Chromium 147's ChunkDemuxer cycling on DEMUXER_UNDERFLOW
+# inside the MSE-via-go2rtc-fmp4 path Frigate uses when
+# `birdseye.restream: true`. Reproduced on hardware as different as Pi 5
+# V3D and Haswell i965, so the bug isn't VAAPI- or platform-specific —
+# it's the MSE pipeline itself. Doctor the box and offer both viable
+# recipes so the operator can pick based on whether they need
+# RTSP-for-VLC alongside.
+_doctor_check_chrome_birdseye_strategy() {
   local id mode url is_birdseye_chrome="no"
   for id in "${INSTANCES[@]}"; do
     mode="${INSTANCE_MODE[$id]:-}"
@@ -4350,7 +4721,24 @@ _doctor_check_i965_birdseye_footgun() {
     fi
   done
   [ "$is_birdseye_chrome" = "yes" ] || return 0
-  doctor_warn "Chromium + Frigate Birdseye detected on legacy i965 VAAPI hardware. Issue #1: the MSE-backed Birdseye stream freezes after a few minutes on this hardware combo. Recommended: switch the affected instance to MODE=vlc with the go2rtc RTSP stream — e.g. URL=\"rtsp://<frigate-host>:8554/birdseye\" — which sidesteps Chromium's MSE pipeline entirely. Trade-off: loses Frigate's web-UI chrome (camera labels, sidebar), but the kiosk stays up."
+  case "${CHROME_VIA_JSMPEG_RESOLVED_REASON:-}" in
+    operator-set-true|frigate-restream-true)
+      doctor_ok "Chromium + Frigate Birdseye: extension JSMpeg shim active (CHROME_VIA_JSMPEG=true) — MSE chunk-demuxer freeze bypassed"
+      return 0 ;;
+    freeze-auto-recover)
+      doctor_ok "Chromium + Frigate Birdseye: extension JSMpeg shim enabled by freeze-detection auto-recovery (kiosk-monitor observed a stall, re-probed Frigate, and found restream:true). Next chrome relaunch picked up the shim."
+      return 0 ;;
+    frigate-restream-false)
+      doctor_ok "Chromium + Frigate Birdseye: Frigate reports birdseye.restream:false → WebUI picks JSMpeg natively (no freeze risk; shim not needed)"
+      return 0 ;;
+    frigate-probe-failed)
+      doctor_warn "Chromium + Frigate Birdseye + CHROME_VIA_JSMPEG=auto, but the /api/config probe failed for one or more Frigate hosts. If Frigate has birdseye.restream:true, Chromium 147's MSE chunk-demuxer will freeze the Birdseye stream after a few minutes (extremeshok/kiosk-monitor#1). Either fix the Frigate connectivity so auto-detect can run, or set CHROME_VIA_JSMPEG=true explicitly to force the shim on."
+      return 0 ;;
+    operator-set-false)
+      doctor_warn "Chromium + Frigate Birdseye with CHROME_VIA_JSMPEG=false (operator-set). If Frigate has birdseye.restream:true, Chromium 147's MSE chunk-demuxer will freeze the Birdseye stream after a few minutes (extremeshok/kiosk-monitor#1). Set CHROME_VIA_JSMPEG=auto (probe Frigate) or true (force shim on) to bypass it."
+      return 0 ;;
+  esac
+  doctor_warn "Chromium + Frigate Birdseye detected (extremeshok/kiosk-monitor#1). Chromium 147's MSE pipeline freezes a Birdseye stream after a few minutes whenever Frigate's birdseye.restream is true, on every hardware combo so far tested. Two viable fixes — pick the one that fits your workflow: (a) on Frigate, set 'birdseye.restream: false' — Frigate's WebUI then auto-selects its JSMpeg path which is freeze-free; trade-off is rtsp://<frigate>/birdseye disappears (per-camera RTSP unaffected); (b) on kiosk-monitor, set CHROME_VIA_JSMPEG=true (or pass --chrome-via-jsmpeg at install time) — Chromium's extension drops a MAIN-world shim that intercepts /api/config and forces Frigate to pick its native JSMpeg player; you can keep birdseye.restream: true so VLC/HomeKit can still pull rtsp://<frigate>/birdseye in parallel."
 }
 
 # doctor_self orchestrates the read-only checks in the order they need
@@ -4378,13 +4766,19 @@ doctor_self() {
   _doctor_check_desktop_user
   _doctor_check_graphical_session
 
-  # outputs + i965 footgun checks both consult INSTANCES/INSTANCE_*,
-  # so populate the instance metadata + output discovery once here.
+  # outputs + chrome+birdseye-strategy checks both consult
+  # INSTANCES/INSTANCE_*, so populate the instance metadata + output
+  # discovery once here.
   PROFILE_RUNTIME_ROOT="${PROFILE_ROOT:-/home/${GUI_USER:-${USER:-pi}}/.local/share/kiosk-monitor}"
   setup_instances
+  # If CHROME_VIA_JSMPEG=auto, resolve it now so the doctor check sees
+  # the resolved boolean rather than the literal "auto" string. The
+  # function emits info log lines about probes inline — useful for the
+  # operator running --doctor to see the auto-detect reasoning.
+  _resolve_chrome_via_jsmpeg_auto
   refresh_outputs >/dev/null 2>&1 || true
   _doctor_check_outputs_and_mapping
-  _doctor_check_i965_birdseye_footgun
+  _doctor_check_chrome_birdseye_strategy
 
   printf '\nDoctor summary: %s error(s), %s warning(s)\n' "$errors" "$warnings"
   [ "$errors" -eq 0 ]
@@ -4401,6 +4795,7 @@ Usage:
   kiosk-monitor --install [--url URL] [--mode chrome|vlc] [--output NAME]
                           [--url2 URL] [--mode2 chrome|vlc] [--output2 NAME]
                           [--gui-user USER] [--no-start] [--skip-apt]
+                          [--chrome-via-jsmpeg | --no-chrome-via-jsmpeg | --auto-chrome-via-jsmpeg]
   kiosk-monitor --update  [--check] [--local] [--force] [--base-url URL]
                           [--gui-user USER] [--mode chrome|vlc] [--no-restart] [--skip-apt]
   kiosk-monitor --remove  [--purge]
@@ -4609,6 +5004,12 @@ prepare_runtime_state() {
   normalize_config_values
   validate_runtime_config || return 1
   setup_instances
+  # CHROME_VIA_JSMPEG="auto" is resolved here, AFTER setup_instances
+  # has populated INSTANCE_MODE/INSTANCE_URL, so the probe iterates
+  # over the right targets. Resolves the runtime value to "true" or
+  # "false" — every later consumer (ensure_frigate_extension, doctor,
+  # status) reads it as a boolean.
+  _resolve_chrome_via_jsmpeg_auto
   if ! refresh_outputs; then
     log "Warning: output discovery failed; window placement will use defaults"
     OUTPUTS_NAMES=( "HDMI-A-1" )
@@ -4624,6 +5025,7 @@ prepare_runtime_state() {
   done
   ensure_labwc_window_rules
 }
+
 
 # relaunch_all_instances: spawn every configured instance and seed its
 # watchdog state arrays. Used by the initial launch and by SIGHUP reload.
@@ -4833,6 +5235,13 @@ while true; do
     threshold="${INSTANCE_STALL_THRESHOLD[$id]:-$STALL_RETRIES}"
     if [ "${INSTANCE_STALL_COUNT[$id]}" -ge "$threshold" ]; then
       log_instance "$id" "screen appears frozen — restarting"
+      # Reactive safety net for the chrome+Frigate-Birdseye MSE freeze:
+      # if we're on that instance shape and the shim isn't already
+      # active, re-probe Frigate and flip CHROME_VIA_JSMPEG=true when
+      # restream:true is observed. The relaunch a few lines below picks
+      # up the new extension config automatically. Cheap (one probe per
+      # actual freeze event); skipped entirely when operator opted out.
+      _maybe_auto_flip_chrome_via_jsmpeg_on_freeze "$id"
       INSTANCE_STALL_COUNT[$id]=0
       record_restart_instance "$id"
       continue

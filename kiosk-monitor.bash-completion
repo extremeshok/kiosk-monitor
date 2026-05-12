@@ -9,7 +9,7 @@ _kiosk_monitor() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     local actions="--install --update --remove --configure --reconfig --reconfigure --status --doctor --discover-streams --logs --run --help --version --debug --config"
-    local install_opts="--url --url2 --mode --mode2 --output --output2 --gui-user --user --no-start --skip-apt --base-url --browser"
+    local install_opts="--url --url2 --mode --mode2 --output --output2 --gui-user --user --no-start --skip-apt --chrome-via-jsmpeg --no-chrome-via-jsmpeg --auto-chrome-via-jsmpeg --base-url --browser"
     local update_opts="--check --local --force --skip-apt --base-url --gui-user --user --mode --browser --no-restart"
     local remove_opts="--purge"
     local logs_opts="--follow --no-follow --lines --all"

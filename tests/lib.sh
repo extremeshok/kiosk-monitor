@@ -31,12 +31,43 @@ fi
 # Pull a single function definition (function NAME() { … }) out of the
 # script and eval it in the current shell. Multiple calls accumulate.
 # Useful for unit-testing pure helpers without running the main flow.
+#
+# Function termination is detected by tracking heredocs and brace
+# nesting at column 0 — a line that is exactly "}" while we're not
+# inside an open heredoc closes the function. The earlier naive
+# variant exited on the first "}" line it saw, which broke for any
+# function with a heredoc containing a single-"}" line in its body
+# (CSS, JSON, JS blocks emitted by ensure_frigate_extension).
 load_function() {
   local name=$1 def
   def=$(awk -v fn="$name" '
-    $0 ~ "^"fn"\\(\\) \\{" { in_fn = 1 }
-    in_fn { print }
-    in_fn && $0 == "}" { exit }
+    BEGIN { in_fn = 0; here = ""; depth = 0 }
+    {
+      # Detect start of the target function.
+      if (!in_fn && $0 ~ "^"fn"\\(\\) \\{") { in_fn = 1; depth = 1; print; next }
+      if (!in_fn) next
+      if (here != "") {
+        # Inside heredoc body: passes through verbatim until terminator.
+        print
+        # Heredoc terminator: line equals here-tag, possibly indented if <<-.
+        if ($0 == here || $0 == "\t"here) here = ""
+        next
+      }
+      # Look for `<<TAG` or `<<-TAG`. Strip a single quote/double-quote
+      # wrapper around the tag (bash allows ''$"" and ""$" forms).
+      m = match($0, /<<-?[[:space:]]*[\047"]?[A-Za-z_][A-Za-z0-9_]*[\047"]?/)
+      if (m > 0) {
+        tag = substr($0, m, RLENGTH)
+        sub(/^<<-?[[:space:]]*[\047"]?/, "", tag)
+        sub(/[\047"]?$/, "", tag)
+        here = tag
+        print
+        next
+      }
+      print
+      # End of function: a bare "}" at column 0 outside any heredoc.
+      if ($0 == "}") { exit }
+    }
   ' "$SCRIPT")
   if [ -z "$def" ]; then
     printf 'load_function: %q not found in %s\n' "$name" "$SCRIPT" >&2

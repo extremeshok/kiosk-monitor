@@ -54,6 +54,9 @@ case "\$url" in
   http://test-go2rtc-direct/api/streams)        cat "$FIXTURES_DIR/go2rtc-api-streams.json" ;;
   # Completely down host
   http://test-down/api/go2rtc/streams|http://test-down/api/config|http://test-down/api/streams) exit 7 ;;
+  # Frigate with birdseye.restream=false (v6.11 advisory path)
+  http://test-frigate-bs-false/api/go2rtc/streams) cat "$FIXTURES_DIR/frigate-api-go2rtc-streams.json" ;;
+  http://test-frigate-bs-false/api/config)         cat "$FIXTURES_DIR/frigate-api-config-birdseye-restream-false.json" ;;
   *) exit 22 ;;
 esac
 EOF
@@ -193,5 +196,27 @@ assert_succeeds "case branch present" grep -q 'discover)  _tui_discover_streams'
 
 test_case "TUI: _tui_discover_streams uses discover_frigate_streams"
 assert_succeeds "delegation present" bash -c "sed -n '/^_tui_discover_streams() {\$/,/^}\$/p' \"$SCRIPT\" | grep -q discover_frigate_streams"
+
+# ---- birdseye.restream advisory (v6.11 chrome-via-jsmpeg path) ----------
+
+test_case "birdseye NOTE: restream=true triggers both-recipes advisory"
+# test-frigate-docker uses frigate-api-config.json which has
+# birdseye.enabled=true + birdseye.restream=true.
+run_kiosk --discover-streams http://test-frigate-docker:30059
+assert_match 'NOTE: birdseye.restream is currently `true`' "$LAST_STDOUT"
+assert_match 'CHROME_VIA_JSMPEG' "$LAST_STDOUT"
+assert_match 'birdseye.restream: false' "$LAST_STDOUT"
+assert_match '/live/jsmpeg/birdseye' "$LAST_STDOUT"
+
+test_case "birdseye NOTE: restream=false steers operator at the freeze-free path"
+run_kiosk --discover-streams http://test-frigate-bs-false
+assert_match 'NOTE: birdseye.restream is currently `false`' "$LAST_STDOUT"
+assert_match 'freeze-free' "$LAST_STDOUT"
+
+test_case "birdseye NOTE: absent when fixture has no birdseye block"
+# test-frigate-proxy uses frigate-api-config-no-streams.json which
+# has no birdseye key at all → birdseye_enabled stays False → no NOTE.
+run_kiosk --discover-streams http://test-frigate-proxy
+assert_no_match 'birdseye.restream is currently' "$LAST_STDOUT"
 
 trap _summary EXIT

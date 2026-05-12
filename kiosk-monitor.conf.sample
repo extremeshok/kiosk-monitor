@@ -34,6 +34,21 @@ GUI_USER=""
 DEVTOOLS_AUTO_OPEN=false
 #DEVTOOLS_REMOTE_PORT=9222
 
+# CHROME_VIA_JSMPEG controls whether the kiosk-monitor Chromium
+# extension injects its MAIN-world MSE-bypass shim into Frigate
+# Birdseye pages. The shim makes Frigate's React app pick its native
+# JSMpeg player (canvas) instead of MSE — sidesteps the Chromium 147
+# chunk-demuxer freeze documented in extremeshok/kiosk-monitor#1
+# without touching Frigate's server-side config (RTSP via go2rtc keeps
+# working for VLC/HomeKit).
+#   auto  — probe each Frigate target's /api/config at startup; if any
+#           reports birdseye.restream:true, enable the shim. (default,
+#           recommended)
+#   true  — always enable the shim.
+#   false — never enable the shim (chrome uses Frigate's default
+#           player choice, MSE when restream:true → freeze risk).
+CHROME_VIA_JSMPEG=auto
+
 # ---- Frigate helper (applies to chrome instances pointed at Frigate) -----
 # Smart defaults: when the URL contains "?birdseye", these values are
 # auto-applied: FRIGATE_BIRDSEYE_AUTO_FILL=true, FRIGATE_DARK_MODE=Dark,

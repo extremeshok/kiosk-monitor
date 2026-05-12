@@ -52,4 +52,19 @@ counts=$(_parse_summary "$LAST_STDOUT")
 # values (CI/dev boxes will have missing-chromium errors and similar).
 assert_match '^[0-9]+ [0-9]+$' "$counts"
 
+# ---- TUI integration (v6.11): doctor reachable from the menu --------
+
+test_case "TUI: _tui_doctor function exists"
+assert_succeeds "function declared" grep -q '^_tui_doctor() {$' "$SCRIPT"
+
+test_case "TUI: main menu lists 'doctor' entry"
+assert_succeeds "menu entry present" grep -q '"doctor"     "Run read-only diagnostic checks' "$SCRIPT"
+
+test_case "TUI: main-menu case statement dispatches to _tui_doctor"
+assert_succeeds "case branch present" grep -q 'doctor)    _tui_doctor' "$SCRIPT"
+
+test_case "TUI: _tui_doctor forks the script with --doctor (no shared-state clobber)"
+assert_succeeds "subprocess invocation present" \
+  bash -c "sed -n '/^_tui_doctor() {\$/,/^}\$/p' \"$SCRIPT\" | grep -q -- '--doctor'"
+
 trap _summary EXIT

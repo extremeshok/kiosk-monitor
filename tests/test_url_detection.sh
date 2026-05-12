@@ -30,6 +30,18 @@ assert_fails "api/config" is_frigate_birdseye_url "http://192.168.3.92:30059/api
 test_case "is_frigate_birdseye_url: live-mode query is not Birdseye"
 assert_fails "live=jsmpeg" is_frigate_birdseye_url "http://192.168.3.92:30059/?live=jsmpeg"
 
+test_case "is_frigate_birdseye_url: #birdseye hash-route (Frigate's native form)"
+assert_succeeds "hash birdseye" is_frigate_birdseye_url "http://192.168.3.92:30059/#birdseye"
+
+test_case "is_frigate_birdseye_url: #birdseye/sub path"
+assert_succeeds "hash birdseye sub" is_frigate_birdseye_url "http://192.168.3.92:30059/#birdseye/grid"
+
+test_case "is_frigate_birdseye_url: #birdseye? with query"
+assert_succeeds "hash birdseye qs" is_frigate_birdseye_url "http://192.168.3.92:30059/#birdseye?camera=1"
+
+test_case "is_frigate_birdseye_url: #birdwatch (not Birdseye)"
+assert_fails "hash birdwatch" is_frigate_birdseye_url "http://192.168.3.92:30059/#birdwatch"
+
 # ---- _url_looks_like_media_for_vlc ------------------------------------
 
 test_case "vlc-media: HTML root is NOT media"

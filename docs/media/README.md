@@ -19,7 +19,8 @@ This file is the asset inventory plus the refresh checklist.
 
 4. `docs/media/frigate-menu.png`
    The **Frigate helper** submenu — dark mode, theme, Birdseye
-   auto-fill width/height, margin.
+   auto-fill, the v6.11 *Chrome → JSMpeg (bypass MSE)* tristate
+   (auto / true / false), Birdseye grid size, auto-size margin.
 
 5. `docs/media/kiosk-monitor-demo.gif`
    Short animation that cycles through main menu → service submenu →
@@ -143,3 +144,21 @@ sudo apt install wtype grim lxterminal whiptail
   to placeholders before capturing if you're documenting from a live
   deployment.
 - Re-run the crop + GIF build so every asset is regenerated consistently.
+
+## v6.11 refresh action item
+
+Two TUI changes in v6.11 invalidate the current captures:
+
+1. The Frigate helper submenu gained a new entry: *Chrome → JSMpeg
+   (bypass MSE)* with an auto/true/false picker. The current
+   `frigate-menu.png` (captured 2026-04) does not show it.
+2. The main menu gained a new entry: *Run read-only diagnostic checks
+   (--doctor)* between Discover and Editor. The current
+   `main-menu.png` does not show it, and the cursor-offset comments in
+   the capture recipe still match (the new entry lands after the
+   service entry, so the 5-down/5-up paths to service and instance1
+   are unchanged).
+
+The capture recipe above and `record-tui.sh` have been updated for the
+post-v6.11 menu layout. Re-run the recipe on the next available Pi 5 +
+v6.11 deployment to regenerate the four PNGs and the GIF.

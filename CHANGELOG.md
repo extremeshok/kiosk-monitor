@@ -4,6 +4,162 @@ All notable changes to kiosk-monitor are recorded here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.11.0] — 2026-05-11
+
+Closes the longest-running issue in this project: the Frigate Birdseye
+freeze on Chromium kiosks (#1). v6.11 is built on a definitive
+re-diagnosis via Chromium DevTools Protocol Media-domain instrumentation
+and an empirical pass through every plausible recipe on a live
+Frigate 0.17.1 instance. Root cause and two viable remediation paths
+are baked into code, docs, and the `--doctor` / `--discover-streams`
+advisory output.
+
+### Root cause (re-confirmed)
+
+The freeze symptom (page alive, Birdseye video frozen, sidebar
+animations still moving) was previously attributed to libva-i965 +
+VAAPI quirks (v6.8.7). The CDP Media-domain trace shows the actual
+mechanism: Chromium 147's `ChunkDemuxer` reports `DEMUXER_UNDERFLOW` in
+a ~1 Hz loop while the `SourceBuffer` still holds data ahead of
+`currentTime`. The demuxer can't feed the decoder from its own buffered
+range, the pipeline wedges, and the renderer stays stuck on the last
+decoded frame. Reproduced on hardware as different as Pi 5 V3D
+(Wayland, no libva) and Haswell i965 (X11). This rules out a
+VAAPI-stack origin; the bug is in Chromium's MSE pipeline against the
+fmp4 stream go2rtc emits when Frigate runs with `birdseye.restream: true`.
+
+### Added
+
+- **`CHROME_VIA_JSMPEG` config knob (tristate: `auto` / `true` /
+  `false`; default `auto`; `--chrome-via-jsmpeg`,
+  `--no-chrome-via-jsmpeg`, `--auto-chrome-via-jsmpeg` install flags).**
+  When effectively `true` AND a chrome instance points at a Frigate
+  Birdseye URL, the existing kiosk-monitor Chromium extension grows a
+  second content-script entry — `force-jsmpeg.js`, running in
+  `world: "MAIN"` at `document_start` — that intercepts the page's
+  `fetch()` and `XMLHttpRequest` responses for `/api/config` and
+  rewrites `birdseye.restream` to `false` before Frigate's React app
+  reads it. Frigate's `LiveBirdseyeView.tsx` then takes its
+  `restream === false → "jsmpeg"` branch, mounting Frigate's own
+  JSMpeg canvas player. MSE is never invoked, so the chunk-demuxer
+  freeze can't trigger. Server-side config is untouched —
+  `rtsp://host:8554/birdseye` keeps working for VLC/HomeKit in
+  parallel.
+- **Auto-detect (`CHROME_VIA_JSMPEG=auto`, the default).** During
+  `prepare_runtime_state` (so also on SIGHUP reload), kiosk-monitor
+  probes each chrome+birdseye instance's Frigate `/api/config` for
+  `birdseye.restream`. If any matching Frigate reports `restream:true`,
+  the shim auto-enables; if all report `false`, the shim stays off
+  (Frigate's WebUI picks JSMpeg natively at that setting, no freeze
+  risk); if probes fail, the shim stays off and the doctor warns the
+  operator to investigate. `--doctor` distinguishes all four outcomes
+  with context-aware messages. Operator can override with
+  `CHROME_VIA_JSMPEG=true|false` to skip the probe.
+- **Freeze-detection auto-recovery.** Reactive safety net for the
+  cases the startup probe can't see: the operator flipped Frigate to
+  `birdseye.restream:true` *after* the watchdog started, or the
+  startup probe failed (network blip, Frigate cold-boot) and we
+  defaulted to off. When the existing screen-freeze watchdog detects
+  a stalled chrome+birdseye instance, kiosk-monitor re-probes Frigate
+  `/api/config`; if `restream:true` is now observed, it flips
+  `CHROME_VIA_JSMPEG="true"` in-memory (the operator's on-disk config
+  isn't touched) and the imminent chrome relaunch regenerates the
+  extension with the force-jsmpeg.js shim active. `--doctor` reports
+  this with a distinct `freeze-auto-recover` reason. Explicit
+  `CHROME_VIA_JSMPEG=false` (operator opt-out) is always respected —
+  the freeze still triggers a normal restart but the shim is never
+  auto-enabled against the operator's setting.
+- Empirically verified end-to-end against a live Frigate
+  0.17.1-416a9b7 running on the Pi 5 viewport3 fleet:
+    * With `birdseye.restream: true` server-side and
+      `CHROME_VIA_JSMPEG=auto` on kiosk-monitor, auto-detect logs
+      "enabling JSMpeg shim", the page mounts a single 1920×1080
+      `<canvas>` and the JSMpeg player paints frames from
+      `/live/jsmpeg/birdseye`. Doctor reports "extension JSMpeg shim
+      active — MSE chunk-demuxer freeze bypassed".
+    * With `birdseye.restream: false` (the older recipe), auto-detect
+      logs "WebUI picks JSMpeg natively, no freeze risk" and the
+      doctor reports OK without any shim.
+    * With the flag explicitly off and `restream:true`, the same page
+      mounts `<video>` (MSE) and freezes as before — the doctor warns
+      the operator.
+- `is_frigate_birdseye_url()` now also matches the `#birdseye` hash
+  route (Frigate's React WebUI uses that natively). The previous
+  `?birdseye` and `&birdseye` matchers are retained.
+- `--remote-allow-origins=*` is now passed automatically whenever
+  `DEVTOOLS_REMOTE_PORT` is set. Chromium 147 enforces remote origin
+  allow-listing by default, breaking DevTools CDP attach without it.
+  Discovered during the v6.11 diagnostic work.
+- TUI gains a "Chrome → JSMpeg (bypass MSE)" toggle under the Frigate
+  helper menu, with the current state surfaced on the main-menu
+  summary line. `--status` also reports `chrome-via-jsmpeg`.
+- TUI gains a "Run read-only diagnostic checks (--doctor)" entry on the
+  main menu. Forks the same `--doctor` the CLI runs and shows the
+  output in a whiptail msgbox so operators don't have to drop to a
+  shell to read the resolved CHROME_VIA_JSMPEG state, the screen-output
+  map, the validate-config breadcrumbs, etc. If the TUI has unsaved
+  edits when invoked, it offers to Save first so the probe reflects
+  what would actually run on the next service restart.
+- `--discover-streams` now reads `birdseye.enabled` and
+  `birdseye.restream` from Frigate's `/api/config` and emits a NOTE
+  guiding the operator to one of the two viable paths
+  (`restream: false` for chrome-only, or `CHROME_VIA_JSMPEG=true` for
+  chrome + VLC).
+
+### Changed
+
+- `--doctor` chrome-on-Frigate-Birdseye check rewritten. Was scoped to
+  legacy i965 VAAPI hardware and recommended VLC + RTSP as the
+  primary remediation. Now fires on `chrome + Frigate Birdseye`
+  regardless of hardware (it's a Chromium MSE issue, not a VAAPI one)
+  and recommends the two viable fixes by name. When
+  `CHROME_VIA_JSMPEG=true` is already set on a matching instance, the
+  check reports OK instead of warning.
+
+### Fixed
+
+- Removed the i965 → `--disable-features=UseChromeOSDirectVideoDecoder`
+  conditional introduced in v6.8.7. Live testing on Pi 5 V3D showed
+  forcing that disable made the freeze *faster*, and
+  `--disable-accelerated-video-decode` made the renderer stop at the
+  first frame. The original v6.8.7 reasoning was based on the
+  now-disproven VAAPI hypothesis.
+
+### Docs
+
+- New "Have both Chrome AND VLC on /birdseye?" section in the Frigate
+  kiosk guide, with the two viable recipes side-by-side and the two
+  dead-end approaches documented (so the next operator who tries the
+  obvious "manual `go2rtc.streams.birdseye-rtsp` entry" finds an
+  explanation of why it can't work without patching Frigate's source).
+- README updated with the new flag and recipe summary.
+
+### Tests
+
+- New `tests/test_jsmpeg.sh` (28 cases): force-jsmpeg.js generation
+  (fetch+XHR overrides, /api/config scope, restream rewrite, MIT
+  attribution preserved), manifest assembly (world:MAIN entry, two-
+  entry case when autofill is also on, match pattern carry-through),
+  and auto-resolver behaviour (operator-set passthrough, restream:true
+  → enable, restream:false → no-op, probe failure handling, mixed-
+  target precedence). The auto-resolver tests use a `curl` shim to
+  serve canned Frigate responses, so they run offline.
+- `tests/test_discover_streams.sh` extended (now 49 cases): three new
+  cases covering the birdseye-restream NOTE, plus a fresh fixture
+  (`frigate-api-config-birdseye-restream-false.json`).
+- `tests/test_url_detection.sh` extended (now 22 cases) for the new
+  `#birdseye` hash-route matcher.
+- `tests/lib.sh` `load_function` extractor made brace+heredoc-aware so
+  larger functions (notably ensure_frigate_extension, which emits CSS
+  and JSON heredocs with single-"}" lines) can be loaded for testing.
+  Previously the extractor exited on the first heredoc-internal "}".
+- Freeze-detection auto-recovery tests (9 cases): the no-op gates
+  (non-chrome, non-birdseye, already-true, operator-set-false), the
+  flip cases (Frigate now restream:true; startup probe failed but
+  Frigate now reachable), and the safe-no-flip cases (Frigate still
+  restream:false, Frigate unreachable).
+- Total harness: 151 cases across 8 files (up from 99 in v6.10.3).
+
 ## [6.10.3] — 2026-05-10
 
 ### Added
