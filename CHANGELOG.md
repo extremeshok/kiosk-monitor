@@ -4,6 +4,40 @@ All notable changes to kiosk-monitor are recorded here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.12.1] — 2026-06-17
+
+### Fixed
+
+- Dual-VLC Wayland routing race on a late-mapping stream: with two VLC
+  instances (one per HDMI), the smaller display could be left showing the
+  desktop while its feed's window stacked on the other output. VLC sets its
+  `xdg_toplevel` title *after* its surface maps, so labwc's title-match
+  window rule misses the initial map and only routes the window on a
+  relayout-nudge (the v6.11.2 fix). An **HEVC** camera makes this worse: VLC
+  can't create its surface until the first keyframe carrying VPS/SPS/PPS
+  arrives (observed `hevc: Waiting for VPS/SPS/PPS` ×36 before the surface
+  appeared), so the surface maps *seconds after* launch — after the launch-time
+  nudge — and a post-nudge surface lands on the default output, stranding its
+  display on the desktop until the next restart.
+- Fix: re-assert labwc window-rule routing after launch instead of only once.
+  `relaunch_all_instances` now runs a short blocking "settle"
+  (`wayland_settle_reroute`) that re-nudges `WAYLAND_REROUTE_SETTLE_TICKS`
+  times at `WAYLAND_REROUTE_SETTLE_INTERVAL`s spacing, and the watchdog loop
+  re-nudges once per tick for `WAYLAND_REROUTE_GRACE` seconds after each
+  (re)launch. Wayland + multi-output only; no-op on X11 (wmctrl already
+  re-routes every tick). For an HEVC sub-camera, pairing with the lower-GOP
+  sub-stream makes the surface map fast enough that the launch-time nudge
+  catches it outright.
+
+### Added
+
+- `WAYLAND_REROUTE_GRACE` (default `60`) — seconds after each (re)launch during
+  which the watchdog re-asserts labwc routing each tick; `0` disables.
+- `WAYLAND_REROUTE_SETTLE_TICKS` (default `3`) / `WAYLAND_REROUTE_SETTLE_INTERVAL`
+  (default `4`) — count/spacing of the post-launch settle re-nudges.
+- `tests/test_wayland_reroute.sh` — coverage for the settle helper's gating and
+  re-nudge counts.
+
 ## [6.12.0] — 2026-06-17
 
 ### Fixed

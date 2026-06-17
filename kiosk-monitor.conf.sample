@@ -123,6 +123,13 @@ VLC_STALL_RETRIES=20            # identical-frame hashes before restarting vlc
 OUTPUT_MISS_GRACE=3             # consecutive missed display polls before pausing
                                 #   an instance (× HEALTH_INTERVAL seconds);
                                 #   debounces transient wlr-randr false-negatives
+# Wayland dual-output VLC routing. VLC titles its window after the surface
+# maps, and an HEVC stream maps its surface seconds after launch (it waits for
+# the first keyframe), potentially after the launch-time labwc relayout-nudge —
+# leaving its display on the desktop. Re-assert routing after launch.
+WAYLAND_REROUTE_GRACE=60        # seconds post-(re)launch to re-nudge each tick; 0 = off
+WAYLAND_REROUTE_SETTLE_TICKS=3  # extra re-nudges in the post-launch settle
+WAYLAND_REROUTE_SETTLE_INTERVAL=4   # seconds between settle re-nudges
 SCREEN_DELAY=120                # skip freeze checks for first N seconds of runtime
 SCREEN_SAMPLE_MODE="sample"     # "sample" (top-left 50%) or "full"
 SCREEN_SAMPLE_BYTES=524288

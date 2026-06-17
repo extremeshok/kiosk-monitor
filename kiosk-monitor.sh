@@ -28,7 +28,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.12.0"
+SCRIPT_VERSION="6.12.1"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -234,6 +234,18 @@ VLC_STALL_RETRIES="${VLC_STALL_RETRIES:-20}"
 # disconnected" and blank the feed to the desktop for the whole blip. With the
 # default HEALTH_INTERVAL=30s, 3 ticks demands a genuine ~90s absence.
 OUTPUT_MISS_GRACE="${OUTPUT_MISS_GRACE:-3}"
+# Wayland dual-output VLC routing. VLC sets its xdg_toplevel title *after* its
+# surface maps, and an HEVC stream maps its surface seconds after launch (it
+# waits for the first keyframe carrying VPS/SPS/PPS) — potentially after the
+# launch-time labwc relayout-nudge. A surface that maps after the nudge lands
+# on the default output, stranding its own display on the desktop. We re-assert
+# the labwc window-rule routing right after launch (a short blocking "settle")
+# and again every tick for WAYLAND_REROUTE_GRACE seconds after each (re)launch.
+# Wayland + multi-output only; 0 disables. No-op on X11 (wmctrl re-routes there
+# every tick already).
+WAYLAND_REROUTE_GRACE="${WAYLAND_REROUTE_GRACE:-60}"
+WAYLAND_REROUTE_SETTLE_TICKS="${WAYLAND_REROUTE_SETTLE_TICKS:-3}"
+WAYLAND_REROUTE_SETTLE_INTERVAL="${WAYLAND_REROUTE_SETTLE_INTERVAL:-4}"
 
 # Log rotation (in-process, copy-truncate so the tee fd stays valid)
 LOG_MAX_BYTES="${LOG_MAX_BYTES:-2097152}"     # 2 MiB
@@ -363,6 +375,7 @@ declare -A INSTANCE_MATCH=()
 declare -A INSTANCE_STALL_THRESHOLD=()
 declare -A INSTANCE_PAUSED=()
 declare -A INSTANCE_OUTPUT_MISS=()
+declare -A INSTANCE_LAUNCHED_AT=()
 # INSTANCE_FIRST_FRAME_SEEN[id]: "yes" once the watchdog has observed a
 # capture_output_hash transition (i.e. evidence the player rendered at
 # least one different frame). Connect-grace gate for stall detection —
@@ -1932,11 +1945,34 @@ reload_labwc_window_rules() {
 
 launch_instance() {
   local id=$1
+  # Stamp the (re)launch time so the Wayland re-route grace window
+  # (see wayland_settle_reroute / the watchdog loop) knows this instance's
+  # surface may still be mapping.
+  INSTANCE_LAUNCHED_AT[$id]=$(date +%s)
   case "${INSTANCE_MODE[$id]}" in
     chrome) launch_chrome_instance "$id" ;;
     vlc)    launch_vlc_instance "$id" ;;
     *)      log_instance "$id" "Unknown mode: ${INSTANCE_MODE[$id]}"; return 1 ;;
   esac
+}
+
+# wayland_settle_reroute: re-assert labwc window-rule routing a few times over
+# a short window right after launching instances. A VLC surface can map late
+# (HEVC waiting for its first keyframe) — after the launch-time nudge — and a
+# surface that maps post-nudge lands on the default output, stranding its
+# display on the desktop. Re-nudging a handful of times catches the late map.
+# Wayland + multi-output only; calls reload_labwc_window_rules (itself a no-op
+# off Wayland / when labwc isn't running). Tunable via WAYLAND_REROUTE_SETTLE_*.
+wayland_settle_reroute() {
+  [ "${SESSION_TYPE:-}" = "wayland" ] || return 0
+  reload_labwc_window_rules                      # immediate (covers fast H.264 maps)
+  [ "${#INSTANCES[@]}" -ge 2 ] || return 0
+  local n="${WAYLAND_REROUTE_SETTLE_TICKS:-3}" i=0
+  while [ "$i" -lt "$n" ]; do
+    sleep "${WAYLAND_REROUTE_SETTLE_INTERVAL:-4}"
+    reload_labwc_window_rules
+    i=$((i + 1))
+  done
 }
 
 stop_instance() {
@@ -2864,6 +2900,10 @@ EOF
     emit_config_line RESTART_WINDOW "${RESTART_WINDOW:-600}"
     emit_config_line MAX_RESTARTS "${MAX_RESTARTS:-10}"
     emit_config_line CLEAN_RESET "${CLEAN_RESET:-600}"
+    emit_config_line OUTPUT_MISS_GRACE "${OUTPUT_MISS_GRACE:-3}"
+    emit_config_line WAYLAND_REROUTE_GRACE "${WAYLAND_REROUTE_GRACE:-60}"
+    emit_config_line WAYLAND_REROUTE_SETTLE_TICKS "${WAYLAND_REROUTE_SETTLE_TICKS:-3}"
+    emit_config_line WAYLAND_REROUTE_SETTLE_INTERVAL "${WAYLAND_REROUTE_SETTLE_INTERVAL:-4}"
     emit_config_line FRIGATE_BIRDSEYE_AUTO_FILL "${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
     emit_config_line FRIGATE_BIRDSEYE_WIDTH  "${FRIGATE_BIRDSEYE_WIDTH:-}"
     emit_config_line FRIGATE_BIRDSEYE_HEIGHT "${FRIGATE_BIRDSEYE_HEIGHT:-}"
@@ -5206,12 +5246,13 @@ relaunch_all_instances() {
   done
   # After all instances are mapped, nudge labwc to re-apply window rules
   # against the now-fully-titled surfaces. The per-instance call in
-  # launch_vlc_instance handles single-VLC scenarios; this second call
-  # catches the dual-VLC case where the first VLC's late-arriving title
-  # can land its window on the second VLC's target output (because both
-  # rules match an empty title and labwc picks the first matching rule).
-  # Wayland-only; no-op on X11.
-  reload_labwc_window_rules
+  # launch_vlc_instance handles single-VLC scenarios; this catches the
+  # dual-VLC case where the first VLC's late-arriving title can land its
+  # window on the second VLC's target output (because both rules match an
+  # empty title and labwc picks the first matching rule). The settle wrapper
+  # re-nudges a few times so a VLC surface that maps late (HEVC keyframe wait)
+  # still gets routed. Wayland-only; no-op on X11.
+  wayland_settle_reroute
 }
 
 reload_instances() {
@@ -5282,6 +5323,20 @@ while true; do
   rotate_log_if_needed
   refresh_outputs || true
   now=$(date +%s)
+  # Wayland multi-output: re-assert labwc window-rule routing for a grace
+  # window after each (re)launch. A VLC surface can map seconds after launch
+  # (HEVC waiting for its first keyframe) — after the launch-time/settle nudge
+  # — and a surface that maps post-nudge lands on the default output,
+  # stranding its display on the desktop. Re-nudge (once per tick, globally)
+  # until the grace window expires. No-op on X11 (wmctrl re-routes per tick).
+  if [ "${SESSION_TYPE:-}" = "wayland" ] && [ "${#INSTANCES[@]}" -ge 2 ] && [ "${WAYLAND_REROUTE_GRACE:-0}" -gt 0 ]; then
+    for _rid in "${INSTANCES[@]}"; do
+      if [ "$((now - ${INSTANCE_LAUNCHED_AT[$_rid]:-0}))" -le "$WAYLAND_REROUTE_GRACE" ]; then
+        reload_labwc_window_rules
+        break
+      fi
+    done
+  fi
   for id in "${INSTANCES[@]}"; do
     pid="${INSTANCE_PID[$id]:-}"
 
