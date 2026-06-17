@@ -248,6 +248,38 @@ your Frigate, plus a one-line snippet you can paste into
 `birdseye.restream` setting and recommends the right recipe (A, B,
 or C) for your workflow.
 
+#### When the VLC camera wall flashes grey, then footage returns
+
+The restreamed birdseye (a go2rtc `libx264 -tune zerolatency` re-encode of
+`/tmp/cache/birdseye`) delivers frames with an uneven cadence. VLC's PCR
+arrives "late", it grows `pts_delay` (default `--clock-jitter` is 5000ms) and
+periodically **resets its reference clock** to the stream's RTCP clock — the
+reset stops frame output for a beat and the display goes solid grey until it
+re-locks. The tell in `/tmp/kiosk-monitor-vlc-<id>.log`:
+
+```
+ES_OUT_SET_(GROUP_)PCR is called too late (pts_delay increased to … ms)
+buffer deadlock prevented
+Timestamp conversion failed … no reference clock
+Could not get display date for timestamp 0
+```
+
+`ffmpeg -rtsp_transport tcp -i <url> -t 60 -f null -` decoding the same stream
+cleanly for 60s (no discontinuities) confirms the feed is fine and the fault is
+VLC's RTSP clock handling.
+
+Since **v6.12.0** kiosk-monitor hardens live-stream URLs automatically
+(`VLC_RTSP_HARDENING=auto`): `--clock-jitter=0` (stop the `pts_delay` runaway),
+`--clock-synchro=0` (free-run on VLC's own clock instead of resetting to the
+stream's — kills the grey flash), `--rtsp-tcp`, and a 1500ms
+`--network-caching` jitter buffer. All overridable via `VLC_EXTRA_ARGS`; set
+`VLC_CLOCK_SYNCHRO=-1` to restore VLC's default if the added latency bothers
+you on a low-latency wall.
+
+Source-side complement (optional): set `birdseye.idle_heartbeat_fps` to a small
+non-zero value so the stream keeps emitting frames during idle stretches and
+never goes quiet in the first place.
+
 #### Why the obvious "manual go2rtc.streams entry" doesn't work
 
 If you've read Frigate's docs you might be tempted to keep

@@ -28,7 +28,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.11.2"
+SCRIPT_VERSION="6.12.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -165,6 +165,21 @@ VLC_LOOP="${VLC_LOOP:-true}"
 VLC_NO_AUDIO="${VLC_NO_AUDIO:-false}"
 VLC_EXTRA_ARGS="${VLC_EXTRA_ARGS:-}"
 VLC_NETWORK_CACHING="${VLC_NETWORK_CACHING:-}"
+# Live-stream hardening (Frigate birdseye / IP-camera RTSP). A restreamed
+# birdseye delivers frames with an uneven cadence — during idle stretches the
+# producer emits few/no frames, VLC's PCR arrives "late", and it grows
+# pts_delay (default --clock-jitter window is 5000ms) until it loses the
+# reference clock and stops painting → the screen goes grey until frames
+# resume. These defaults pin a jitter buffer, force TCP transport, and disable
+# the pts_delay runaway. auto = apply for rtsp/rtsps/rtmp/rtmps/udp URLs.
+VLC_RTSP_HARDENING="${VLC_RTSP_HARDENING:-auto}"   # auto | true | false
+VLC_CLOCK_JITTER="${VLC_CLOCK_JITTER:-0}"          # ms; 0 disables pts_delay growth
+# VLC --clock-synchro: -1 = VLC default (lock to the stream's reference clock,
+# which periodically RESETS on a go2rtc/RTCP feed and flashes the screen grey),
+# 0 = disabled (free-run on VLC's own clock — no reset freeze, slightly higher
+# latency), 1 = enabled. 0 is the kiosk default; set -1 to restore VLC default.
+VLC_CLOCK_SYNCHRO="${VLC_CLOCK_SYNCHRO:-0}"
+VLC_NETWORK_CACHING_DEFAULT="${VLC_NETWORK_CACHING_DEFAULT:-1500}"  # used when VLC_NETWORK_CACHING unset
 
 # Profiles / caching
 PROFILE_ROOT="${PROFILE_ROOT:-}"
@@ -206,7 +221,19 @@ HEALTH_RETRIES="${HEALTH_RETRIES:-6}"
 RESTART_WINDOW="${RESTART_WINDOW:-600}"
 MAX_RESTARTS="${MAX_RESTARTS:-10}"
 CLEAN_RESET="${CLEAN_RESET:-600}"
-VLC_STALL_RETRIES="${VLC_STALL_RETRIES:-6}"
+# A live RTSP camera/mosaic (e.g. Frigate birdseye in motion mode) legitimately
+# renders byte-identical frames for long stretches at low motion. At 6 ticks
+# (~3 min) the screen-hash watchdog mistook that for a frozen decoder and
+# restart-looped VLC, flicking the screen to the desktop. 20 ticks (~10 min of
+# truly unchanging output) still catches a genuinely wedged decoder while no
+# longer firing on idle cameras. Set lower if you prefer faster freeze recovery.
+VLC_STALL_RETRIES="${VLC_STALL_RETRIES:-20}"
+# Consecutive watchdog ticks an instance's requested output must be reported
+# absent before we pause/kill it. A single missed wlr-randr poll (transient IPC
+# hiccup, compositor reload from a SIGHUP relayout) used to read as "HDMI
+# disconnected" and blank the feed to the desktop for the whole blip. With the
+# default HEALTH_INTERVAL=30s, 3 ticks demands a genuine ~90s absence.
+OUTPUT_MISS_GRACE="${OUTPUT_MISS_GRACE:-3}"
 
 # Log rotation (in-process, copy-truncate so the tee fd stays valid)
 LOG_MAX_BYTES="${LOG_MAX_BYTES:-2097152}"     # 2 MiB
@@ -335,6 +362,7 @@ declare -A INSTANCE_PROFILE_DIR=()
 declare -A INSTANCE_MATCH=()
 declare -A INSTANCE_STALL_THRESHOLD=()
 declare -A INSTANCE_PAUSED=()
+declare -A INSTANCE_OUTPUT_MISS=()
 # INSTANCE_FIRST_FRAME_SEEN[id]: "yes" once the watchdog has observed a
 # capture_output_hash transition (i.e. evidence the player rendered at
 # least one different frame). Connect-grace gate for stall detection —
@@ -752,10 +780,12 @@ as_gui() {
 }
 
 _refresh_outputs_x11() {
-  OUTPUTS_NAMES=()
-  OUTPUT_GEOMETRY=()
   command -v xrandr >/dev/null 2>&1 || return 1
-  local line
+  # Build into locals so a transient xrandr failure can't blank the global
+  # output list (see the note in refresh_outputs); commit only on success.
+  local -a _names=()
+  local -A _geom=()
+  local line rest
   while IFS= read -r line; do
     # lines like:  "HDMI-1 connected primary 1920x1080+0+0 ..."
     #        or:  "HDMI-2 connected 1280x720+1920+0 ..."
@@ -769,13 +799,20 @@ _refresh_outputs_x11() {
     h="${rest%%+*}"; rest="${rest#*+}"
     x="${rest%%+*}"
     y="${rest#*+}"
-    OUTPUTS_NAMES+=( "$name" )
-    OUTPUT_GEOMETRY["$name"]="$x $y $w $h"
+    _names+=( "$name" )
+    _geom["$name"]="$x $y $w $h"
   done < <(as_gui xrandr --query 2>/dev/null)
-  if [ "${#OUTPUTS_NAMES[@]}" -gt 1 ]; then
-    mapfile -t OUTPUTS_NAMES < <(printf '%s\n' "${OUTPUTS_NAMES[@]}" | LC_ALL=C sort)
+  [ "${#_names[@]}" -gt 0 ] || return 1
+  if [ "${#_names[@]}" -gt 1 ]; then
+    mapfile -t _names < <(printf '%s\n' "${_names[@]}" | LC_ALL=C sort)
   fi
-  [ "${#OUTPUTS_NAMES[@]}" -gt 0 ]
+  OUTPUTS_NAMES=( "${_names[@]}" )
+  OUTPUT_GEOMETRY=()
+  local n
+  for n in "${_names[@]}"; do
+    OUTPUT_GEOMETRY["$n"]="${_geom[$n]}"
+  done
+  return 0
 }
 
 refresh_outputs() {
@@ -783,8 +820,13 @@ refresh_outputs() {
     _refresh_outputs_x11
     return $?
   fi
-  OUTPUTS_NAMES=()
-  OUTPUT_GEOMETRY=()
+  # IMPORTANT: do NOT clear OUTPUTS_NAMES/OUTPUT_GEOMETRY up front. A transient
+  # wlr-randr or python3 failure must not masquerade as "all outputs gone" —
+  # that false-negative used to kill a running instance and blank the feed to
+  # the desktop until a later poll happened to succeed. We build into locals
+  # and only commit to the globals once we have a trustworthy, non-empty
+  # reading; on any failure path we return non-zero leaving the last-known-good
+  # output list intact.
   command -v wlr-randr >/dev/null 2>&1 || return 1
   local json
   json=$(as_gui wlr-randr --json 2>/dev/null) || return 1
@@ -818,18 +860,29 @@ for o in data:
     print(f"{name}\t{x}\t{y}\t{w}\t{h}")
 ' 2>/dev/null)
   [ -z "$parsed" ] && return 1
+  local -a _names=()
+  local -A _geom=()
+  local name x y w h
   while IFS=$'\t' read -r name x y w h; do
     [ -n "$name" ] || continue
-    OUTPUTS_NAMES+=( "$name" )
-    OUTPUT_GEOMETRY["$name"]="$x $y $w $h"
+    _names+=( "$name" )
+    _geom["$name"]="$x $y $w $h"
   done <<< "$parsed"
+  # Empty parse = untrustworthy reading; keep the previous good list.
+  [ "${#_names[@]}" -gt 0 ] || return 1
   # Sort alphabetically so HDMI-A-1 precedes HDMI-A-2 regardless of the
   # order wlr-randr happened to enumerate them in. This keeps the auto-pick
   # deterministic and the primary display first.
-  if [ "${#OUTPUTS_NAMES[@]}" -gt 1 ]; then
-    mapfile -t OUTPUTS_NAMES < <(printf '%s\n' "${OUTPUTS_NAMES[@]}" | LC_ALL=C sort)
+  if [ "${#_names[@]}" -gt 1 ]; then
+    mapfile -t _names < <(printf '%s\n' "${_names[@]}" | LC_ALL=C sort)
   fi
-  [ "${#OUTPUTS_NAMES[@]}" -gt 0 ]
+  # Commit the trustworthy reading atomically.
+  OUTPUTS_NAMES=( "${_names[@]}" )
+  OUTPUT_GEOMETRY=()
+  for name in "${_names[@]}"; do
+    OUTPUT_GEOMETRY["$name"]="${_geom[$name]}"
+  done
+  return 0
 }
 
 pick_output_for_instance() {
@@ -1709,6 +1762,40 @@ launch_chrome_instance() {
   return 0
 }
 
+# Print VLC live-stream hardening flags (one per line) for $1=url, honoring
+# VLC_RTSP_HARDENING / VLC_CLOCK_JITTER / VLC_NETWORK_CACHING /
+# VLC_NETWORK_CACHING_DEFAULT. Prints nothing when hardening is off or N/A.
+#
+# A restreamed Frigate birdseye (go2rtc re-encode) delivers frames with an
+# uneven cadence; during idle stretches VLC's PCR arrives "late", it inflates
+# pts_delay (default --clock-jitter is 5000ms) until it loses the reference
+# clock and stops painting → grey screen until frames resume. These flags pin
+# a jitter buffer, force RTSP-over-TCP (go2rtc serves rtsp+tcp), and disable
+# the pts_delay runaway. Emitted before VLC_NETWORK_CACHING / VLC_EXTRA_ARGS in
+# the launcher so an explicit value or an override flag appears later and wins.
+vlc_hardening_flags() {
+  local url=$1 harden="no"
+  case "${VLC_RTSP_HARDENING:-auto}" in
+    true|yes|1) harden="yes" ;;
+    auto)
+      case "$url" in
+        rtsp://*|rtsps://*|rtmp://*|rtmps://*|udp://*) harden="yes" ;;
+      esac
+      ;;
+  esac
+  [ "$harden" = "yes" ] || return 0
+  printf '%s\n' "--clock-jitter=${VLC_CLOCK_JITTER:-0}"
+  # --clock-synchro=0 stops VLC resetting to the stream's (RTCP) reference
+  # clock, the reset that flashes the screen grey on a go2rtc birdseye feed.
+  # VLC_CLOCK_SYNCHRO=-1 restores VLC's default (re-enables the reset).
+  [ "${VLC_CLOCK_SYNCHRO:-0}" != "-1" ] && printf '%s\n' "--clock-synchro=${VLC_CLOCK_SYNCHRO:-0}"
+  case "$url" in
+    rtsp://*|rtsps://*) printf '%s\n' "--rtsp-tcp" ;;
+  esac
+  [ -z "${VLC_NETWORK_CACHING:-}" ] && printf '%s\n' "--network-caching=${VLC_NETWORK_CACHING_DEFAULT:-1500}"
+  return 0
+}
+
 launch_vlc_instance() {
   local id=$1
   local vlc
@@ -1751,6 +1838,14 @@ launch_vlc_instance() {
   )
   [ "$VLC_LOOP" = "true" ] && flags+=( --loop )
   [ "$VLC_NO_AUDIO" = "true" ] && flags+=( --no-audio )
+
+  # Live-stream hardening (see vlc_hardening_flags / VLC_RTSP_HARDENING).
+  # Emitted BEFORE VLC_NETWORK_CACHING / VLC_EXTRA_ARGS so an explicit value or
+  # a flag in VLC_EXTRA_ARGS (e.g. --no-rtsp-tcp) appears later and wins.
+  local -a _hflags=()
+  mapfile -t _hflags < <(vlc_hardening_flags "$url")
+  [ "${#_hflags[@]}" -gt 0 ] && flags+=( "${_hflags[@]}" )
+
   if [ -n "$VLC_NETWORK_CACHING" ]; then
     flags+=( "--network-caching=$VLC_NETWORK_CACHING" )
   fi
@@ -2094,6 +2189,7 @@ setup_instances() {
     INSTANCE_LAST_GOOD[$id]=$(date +%s)
     INSTANCE_RESTART_LOG[$id]=""
     INSTANCE_PAUSED[$id]="no"
+    INSTANCE_OUTPUT_MISS[$id]=0
     INSTANCE_ON_WAITING_PAGE[$id]="no"
     # Window identifier used by launch flags and labwc window rules
     INSTANCE_CLASS[$id]="kiosk-monitor-${INSTANCE_MODE[$id]}-$id"
@@ -2196,6 +2292,19 @@ instance_output_present() {
   local name
   for name in "${OUTPUTS_NAMES[@]}"; do
     [ "$name" = "$req" ] && return 0
+  done
+  # wlr-randr/xrandr didn't list it. Before declaring the output gone — which
+  # kills the feed and shows the desktop — consult the kernel's DRM connector
+  # status. That's ground truth a compositor or wlr-randr stall can't fool: on
+  # vc4-kms the connector name matches the Wayland output (e.g. HDMI-A-2 ->
+  # /sys/class/drm/card1-HDMI-A-2/status). If it still reads "connected", treat
+  # the output as present. (No-op when names don't match, e.g. xrandr's HDMI-1
+  # vs DRM's HDMI-A-1, so this never makes a real disconnect look present.)
+  # KIOSK_DRM_DIR is a test-only override for the /sys base.
+  local drm_dir="${KIOSK_DRM_DIR:-/sys/class/drm}" f
+  for f in "$drm_dir"/card*-"$req"/status; do
+    [ -r "$f" ] || continue
+    [ "$(cat "$f" 2>/dev/null)" = "connected" ] && return 0
   done
   return 1
 }
@@ -2716,6 +2825,10 @@ EOF
     emit_config_line VLC_LOOP     "${VLC_LOOP:-true}"
     emit_config_line VLC_NO_AUDIO "${VLC_NO_AUDIO:-false}"
     emit_config_line VLC_NETWORK_CACHING "${VLC_NETWORK_CACHING:-}"
+    emit_config_line VLC_RTSP_HARDENING "${VLC_RTSP_HARDENING:-auto}"
+    emit_config_line VLC_CLOCK_JITTER "${VLC_CLOCK_JITTER:-0}"
+    emit_config_line VLC_CLOCK_SYNCHRO "${VLC_CLOCK_SYNCHRO:-0}"
+    emit_config_line VLC_NETWORK_CACHING_DEFAULT "${VLC_NETWORK_CACHING_DEFAULT:-1500}"
     emit_config_line VLC_EXTRA_ARGS "${VLC_EXTRA_ARGS:-}"
     emit_config_line PROFILE_ROOT "${PROFILE_ROOT:-}"
     emit_config_line PROFILE_TMPFS "${PROFILE_TMPFS:-false}"
@@ -5174,13 +5287,28 @@ while true; do
 
     # 0. HDMI hotplug: pause when the instance's requested output is gone;
     #    resume when it returns. Instances with no explicit OUTPUT skip this.
+    #    Debounced: a single missing poll is NOT enough. A transient
+    #    wlr-randr/compositor hiccup used to read as "disconnected" and kill
+    #    the feed to the desktop for the whole blip, then self-resume on the
+    #    next good poll. Require OUTPUT_MISS_GRACE consecutive misses
+    #    (≈ grace × HEALTH_INTERVAL seconds) before pausing; reset on presence.
     if [ -n "${INSTANCE_OUTPUT[$id]:-}" ] && ! instance_output_present "$id"; then
-      if [ "${INSTANCE_PAUSED[$id]:-no}" != "yes" ]; then
-        log_instance "$id" "output '${INSTANCE_OUTPUT[$id]}' not connected — pausing"
+      if [ "${INSTANCE_PAUSED[$id]:-no}" = "yes" ]; then
+        # Already paused and still gone — nothing to do but keep waiting.
+        continue
+      fi
+      INSTANCE_OUTPUT_MISS[$id]=$(( ${INSTANCE_OUTPUT_MISS[$id]:-0} + 1 ))
+      if [ "${INSTANCE_OUTPUT_MISS[$id]}" -ge "$OUTPUT_MISS_GRACE" ]; then
+        log_instance "$id" "output '${INSTANCE_OUTPUT[$id]}' not connected (${INSTANCE_OUTPUT_MISS[$id]} consecutive checks) — pausing"
         stop_instance "$id"
         INSTANCE_PAUSED[$id]="yes"
+        continue
       fi
-      continue
+      # Under the grace threshold: leave the (still-running) instance alone and
+      # fall through to the normal liveness/health/freeze checks this tick.
+      debug_instance "$id" "output '${INSTANCE_OUTPUT[$id]}' missing ${INSTANCE_OUTPUT_MISS[$id]}/${OUTPUT_MISS_GRACE} — not pausing yet"
+    else
+      INSTANCE_OUTPUT_MISS[$id]=0
     fi
     if [ "${INSTANCE_PAUSED[$id]:-no}" = "yes" ]; then
       log_instance "$id" "output '${INSTANCE_OUTPUT[$id]}' reconnected — resuming"

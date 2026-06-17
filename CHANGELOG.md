@@ -4,6 +4,92 @@ All notable changes to kiosk-monitor are recorded here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.12.0] — 2026-06-17
+
+### Fixed
+
+- Intermittent "feed drops to the bare desktop for minutes, then recovers on
+  its own" on a dual-display kiosk, even though the HDMI link never physically
+  dropped (no kernel hotplug event). Root cause was a false-negative in the
+  watchdog's output detection: `refresh_outputs` cleared `OUTPUTS_NAMES` up
+  front, so a single transient `wlr-randr`/`python3` failure (an IPC hiccup, or
+  a compositor reload provoked by the relaunch-time labwc SIGHUP) left the list
+  empty. The caller (`refresh_outputs || true`) read that as "every output
+  disconnected", so `instance_output_present` returned false and the instance
+  was paused — VLC killed, desktop wallpaper shown — until a later poll happened
+  to succeed. There was no debounce (one bad tick paused) and no cap on how long
+  the paused state could persist.
+- Fix, three complementary layers:
+  - `refresh_outputs` (both the wlr-randr and xrandr paths) is now
+    non-destructive on failure: it builds into locals and only commits to
+    `OUTPUTS_NAMES`/`OUTPUT_GEOMETRY` on a trustworthy, non-empty reading. A
+    transient poll failure returns non-zero and leaves the last-known-good list
+    intact instead of blanking it.
+  - `instance_output_present` consults the kernel's DRM connector status
+    (`/sys/class/drm/card*-<output>/status`) as ground truth when wlr-randr
+    doesn't list the output. If the connector still reads `connected`, the
+    output is treated as present — a compositor/wlr-randr stall can no longer
+    fake a disconnect. No-op when output and DRM connector names differ.
+  - The pause gate is debounced via the new `OUTPUT_MISS_GRACE` (default 3):
+    the requested output must read absent on that many consecutive ticks
+    (≈ `OUTPUT_MISS_GRACE` × `HEALTH_INTERVAL` seconds) before the instance is
+    paused. The instance keeps running normally during the grace window.
+- Intermittent "grey screen, then footage returns" on a VLC RTSP feed. A
+  restreamed Frigate birdseye (go2rtc re-encode) delivers frames with an uneven
+  cadence — during idle stretches the producer emits few/no frames, so VLC's
+  PCR arrives "late" and it keeps growing `pts_delay` (the default
+  `--clock-jitter` window is 5000ms) until it loses the reference clock and
+  stops painting. The output shows a solid grey until frames resume. VLC logged
+  the signature repeatedly: `ES_OUT_SET_(GROUP_)PCR is called too late
+  (pts_delay increased to …)`, `buffer deadlock prevented`,
+  `no reference clock`, `Could not get display date for timestamp 0`.
+- Fix: live-stream hardening is now applied automatically (see *Added* /
+  `VLC_RTSP_HARDENING`). For `rtsp/rtsps/rtmp/rtmps/udp` URLs the launcher now
+  passes `--clock-jitter=0` (disables the `pts_delay` runaway),
+  `--clock-synchro=0` (free-run on VLC's own clock instead of periodically
+  resetting to the stream's RTCP reference clock — that reset is what flashes
+  the screen grey; verified against a structurally-clean source that `ffmpeg`
+  decodes for 60s with zero discontinuities while VLC still loses its reference
+  clock ~once a minute), `--rtsp-tcp` for `rtsp/rtsps` (reliable transport;
+  go2rtc serves `rtsp+tcp`), and a default `--network-caching` jitter buffer.
+  All overridable. Optionally pair with the Frigate-side
+  `birdseye.idle_heartbeat_fps` (a small non-zero value) to keep frames flowing
+  during idle.
+
+### Changed
+
+- `VLC_STALL_RETRIES` default raised from 6 to 20. A live RTSP camera/mosaic
+  (e.g. Frigate birdseye at low motion) legitimately renders byte-identical
+  frames for long stretches; at 6 ticks (~3 min) the screen-hash watchdog
+  mistook that for a wedged decoder and restart-looped VLC, flicking the screen
+  to the desktop roughly once a day. 20 ticks (~10 min of truly unchanging
+  output) still catches a genuinely frozen decoder while no longer firing on
+  idle cameras. Pair with Frigate birdseye `mode: continuous` to eliminate the
+  static-frame condition at the source.
+- VLC live streams now default to a 1500ms network cache
+  (`VLC_NETWORK_CACHING_DEFAULT`) when `VLC_NETWORK_CACHING` is unset. An
+  explicit `VLC_NETWORK_CACHING` still takes precedence, and anything in
+  `VLC_EXTRA_ARGS` is appended last and overrides the hardening defaults.
+
+### Added
+
+- `OUTPUT_MISS_GRACE` config knob (default 3) — consecutive missed output polls
+  required before pausing an instance whose display is reported gone.
+- `VLC_RTSP_HARDENING` (default `auto`) — apply VLC live-stream hardening for
+  `rtsp/rtsps/rtmp/rtmps/udp` URLs (`auto`), always (`true`), or never
+  (`false`).
+- `VLC_CLOCK_JITTER` (default `0`) — VLC `--clock-jitter` value applied by the
+  hardening; `0` disables the `pts_delay` growth that ends in a grey-out.
+- `VLC_CLOCK_SYNCHRO` (default `0`) — VLC `--clock-synchro` value applied by the
+  hardening; `0` free-runs on VLC's own clock (no grey clock-reset), `-1`
+  restores VLC's default, `1` forces synchronization on.
+- `VLC_NETWORK_CACHING_DEFAULT` (default `1500`) — network cache used for live
+  streams when `VLC_NETWORK_CACHING` is unset.
+- `tests/test_output_presence.sh` — regression coverage for the non-destructive
+  `refresh_outputs` and the `instance_output_present` DRM-status fallback.
+- `tests/test_vlc_flags.sh` — coverage for the VLC live-stream hardening flag
+  builder (auto-detection by URL scheme, override precedence, opt-out).
+
 ## [6.11.2] — 2026-05-12
 
 ### Fixed

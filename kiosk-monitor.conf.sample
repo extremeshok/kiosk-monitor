@@ -69,8 +69,25 @@ FRIGATE_THEME=""                  # "", "None", "Default", "Blue", "Green", "Nor
 #VLC_BIN="/usr/bin/vlc"
 VLC_LOOP=true
 VLC_NO_AUDIO=false
-VLC_NETWORK_CACHING=1500      # ms; raised for flaky RTSP streams
-VLC_EXTRA_ARGS="--avcodec-hw=any"
+
+# Live-stream hardening. A restreamed Frigate birdseye (or any IP-camera RTSP)
+# delivers frames with an uneven cadence; during idle stretches VLC's PCR
+# arrives "late", it inflates pts_delay (default --clock-jitter is 5000ms)
+# until it loses the reference clock and stops painting — the screen goes grey
+# until frames resume. With VLC_RTSP_HARDENING=auto the launcher pins a jitter
+# buffer, forces RTSP-over-TCP, and sets --clock-jitter=0 for rtsp/rtsps/rtmp/
+# rtmps/udp URLs. Set to false to opt out, true to force on for any URL.
+VLC_RTSP_HARDENING=auto
+VLC_CLOCK_JITTER=0                  # ms; 0 disables VLC's pts_delay growth
+VLC_CLOCK_SYNCHRO=0                 # 0 = free-run (no grey clock-reset); -1 = VLC default; 1 = force on
+# Network jitter buffer. VLC_NETWORK_CACHING (if set) always wins; otherwise
+# hardening applies VLC_NETWORK_CACHING_DEFAULT for live streams.
+#VLC_NETWORK_CACHING=1500           # explicit override (ms), all stream types
+VLC_NETWORK_CACHING_DEFAULT=1500    # ms; used when VLC_NETWORK_CACHING is unset
+
+# Extra raw VLC args, appended LAST so they override the hardening defaults
+# above (e.g. "--no-rtsp-tcp" or a different "--clock-jitter=N").
+#VLC_EXTRA_ARGS="--avcodec-hw=any"
 
 # ---- Profile / cache -----------------------------------------------------
 #PROFILE_ROOT=""                # default: /home/<GUI_USER>/.local/share/kiosk-monitor
@@ -100,7 +117,12 @@ HEALTH_CONNECT_TIMEOUT=3
 HEALTH_TOTAL_TIMEOUT=8
 HEALTH_RETRIES=6                # failed http probes before restarting
 STALL_RETRIES=3                 # identical-frame hashes before restarting chrome
-VLC_STALL_RETRIES=6             # identical-frame hashes before restarting vlc
+VLC_STALL_RETRIES=20            # identical-frame hashes before restarting vlc
+                                #   (a live camera/birdseye can be static for
+                                #    minutes; lower => faster freeze recovery)
+OUTPUT_MISS_GRACE=3             # consecutive missed display polls before pausing
+                                #   an instance (× HEALTH_INTERVAL seconds);
+                                #   debounces transient wlr-randr false-negatives
 SCREEN_DELAY=120                # skip freeze checks for first N seconds of runtime
 SCREEN_SAMPLE_MODE="sample"     # "sample" (top-left 50%) or "full"
 SCREEN_SAMPLE_BYTES=524288
