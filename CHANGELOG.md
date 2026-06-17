@@ -4,6 +4,35 @@ All notable changes to kiosk-monitor are recorded here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [6.12.2] — 2026-06-17
+
+### Fixed
+
+- Dual-display routing of a **fullscreen** VLC actually works now. 6.12.1's
+  relayout-nudge could not move the second VLC: labwc's `MoveToOutput` action
+  is **a no-op on fullscreen windows** (per labwc-actions docs), so the title
+  window-rule never relocated a `--fullscreen` VLC and the second display sat
+  on the desktop. Confirmed on a 4K + 1600×900 rig where the camera feed
+  stayed stranded on the desktop regardless of how many times the rule was
+  re-applied.
+- Fix: route fullscreen windows by **placement** instead of by moving them.
+  The managed `rc.xml` now sets `<placement><policy>cursor</policy></placement>`,
+  and before launching each instance the watchdog warps the pointer onto that
+  instance's output (`warp_cursor_to_output`, via `wlrctl`), so the surface
+  maps fullscreen on the correct HDMI. The cursor is parked in the primary
+  output's corner once placement settles. Wayland + multi-output only; opt out
+  with `WAYLAND_CURSOR_ROUTING=false`. The `MoveToOutput` rules are kept as a
+  backup for non-fullscreen windows.
+
+### Added
+
+- `WAYLAND_CURSOR_ROUTING` (default `auto`) — place fullscreen windows on their
+  output via cursor warping (`auto` = on for multi-output Wayland with `wlrctl`
+  present; `true`/`false` to force).
+- `wlrctl` is now installed by `--install`/`--update` (Wayland cursor routing).
+- `tests/test_cursor_routing.sh` — coverage for the cursor-routing gating and
+  pointer-target geometry.
+
 ## [6.12.1] — 2026-06-17
 
 ### Fixed

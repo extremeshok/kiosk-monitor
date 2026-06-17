@@ -28,7 +28,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.12.1"
+SCRIPT_VERSION="6.12.2"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -246,6 +246,12 @@ OUTPUT_MISS_GRACE="${OUTPUT_MISS_GRACE:-3}"
 WAYLAND_REROUTE_GRACE="${WAYLAND_REROUTE_GRACE:-60}"
 WAYLAND_REROUTE_SETTLE_TICKS="${WAYLAND_REROUTE_SETTLE_TICKS:-3}"
 WAYLAND_REROUTE_SETTLE_INTERVAL="${WAYLAND_REROUTE_SETTLE_INTERVAL:-4}"
+# Route fullscreen windows to their output by warping the pointer there before
+# launch (labwc placement policy "cursor"). Required because labwc's
+# MoveToOutput action is a no-op on fullscreen windows, so the window rule
+# alone cannot move a fullscreen VLC to the second HDMI. auto = enable on
+# multi-output Wayland when wlrctl is installed. Needs the `wlrctl` package.
+WAYLAND_CURSOR_ROUTING="${WAYLAND_CURSOR_ROUTING:-auto}"   # auto | true | false
 
 # Log rotation (in-process, copy-truncate so the tee fd stays valid)
 LOG_MAX_BYTES="${LOG_MAX_BYTES:-2097152}"     # 2 MiB
@@ -1949,6 +1955,13 @@ launch_instance() {
   # (see wayland_settle_reroute / the watchdog loop) knows this instance's
   # surface may still be mapping.
   INSTANCE_LAUNCHED_AT[$id]=$(date +%s)
+  # Wayland multi-output: warp the cursor onto this instance's output so its
+  # (fullscreen) window maps there (placement policy "cursor"). The cursor
+  # stays put until the next launch / park, so a late-mapping HEVC surface
+  # still lands on the right output.
+  if [ "${#INSTANCES[@]}" -ge 2 ] && [ -n "${INSTANCE_OUTPUT[$id]:-}" ]; then
+    warp_cursor_to_output "${INSTANCE_OUTPUT[$id]}"
+  fi
   case "${INSTANCE_MODE[$id]}" in
     chrome) launch_chrome_instance "$id" ;;
     vlc)    launch_vlc_instance "$id" ;;
@@ -1973,6 +1986,42 @@ wayland_settle_reroute() {
     reload_labwc_window_rules
     i=$((i + 1))
   done
+}
+
+# cursor_routing_enabled: true when we should place windows by warping the
+# pointer (Wayland, not disabled, wlrctl available).
+cursor_routing_enabled() {
+  [ "${SESSION_TYPE:-}" = "wayland" ] || return 1
+  [ "${WAYLAND_CURSOR_ROUTING:-auto}" != "false" ] || return 1
+  command -v wlrctl >/dev/null 2>&1 || return 1
+  return 0
+}
+
+# warp_cursor_to_output: move the pointer onto OUTPUT so the next window opens
+# there (labwc placement policy "cursor"). This is how a fullscreen VLC is
+# routed to its HDMI — labwc's MoveToOutput action is a no-op on fullscreen
+# windows. Best-effort: never fails hard. wlrctl pointer move is relative, so
+# we reset toward the global origin first, then step to just inside the
+# output's top-left corner (enough to land the pointer on the output while
+# leaving the resting cursor in a corner rather than mid-feed).
+warp_cursor_to_output() {
+  local out=$1
+  cursor_routing_enabled || return 0
+  local geo="${OUTPUT_GEOMETRY[$out]:-}"; [ -n "$geo" ] || return 0
+  local x y w h; read -r x y w h <<< "$geo"
+  [ -n "${w:-}" ] && [ "$w" -gt 0 ] 2>/dev/null || return 0
+  local tx=$(( x + 8 )) ty=$(( y + 8 ))
+  as_gui wlrctl pointer move -20000 -20000 >/dev/null 2>&1 || true
+  as_gui wlrctl pointer move "$tx" "$ty" >/dev/null 2>&1 || true
+  return 0
+}
+
+# park_cursor: stash the pointer in the global top-left corner (primary output)
+# so it isn't resting in the middle of a feed once placement has settled.
+park_cursor() {
+  cursor_routing_enabled || return 0
+  as_gui wlrctl pointer move -20000 -20000 >/dev/null 2>&1 || true
+  return 0
 }
 
 stop_instance() {
@@ -2450,6 +2499,13 @@ ensure_labwc_window_rules() {
     printf '<?xml version="1.0" encoding="UTF-8"?>\n'
     printf '<!-- %s — remove this comment to opt out of auto-management -->\n' "$marker"
     printf '<labwc_config>\n'
+    # Window placement policy "cursor" opens new windows on the output under
+    # the pointer. This is how we route a *fullscreen* VLC to its HDMI: labwc's
+    # MoveToOutput action (below) is a no-op on fullscreen windows, so before
+    # launching each instance we warp the cursor onto its target output
+    # (warp_cursor_to_output) and the surface maps fullscreen there. The
+    # MoveToOutput rules are kept as a backup for non-fullscreen windows.
+    printf '  <placement><policy>cursor</policy></placement>\n'
     printf '  <windowRules>\n'
     for id in "${INSTANCES[@]}"; do
       local out="${INSTANCE_OUTPUT[$id]:-}"
@@ -2460,11 +2516,9 @@ ensure_labwc_window_rules() {
       # which labwc matches via 'identifier'. VLC's wayland surface
       # doesn't expose a per-launch app_id we can pin (Qt sets the
       # app_id to a fixed 'vlc' regardless of argv[0]), so we route VLC
-      # by its window title (set via --video-title). NOTE: VLC's
-      # xdg_toplevel.set_title may arrive *after* the surface is mapped
-      # in rare cases — labwc evaluates the title rule at map time, so
-      # the rule can miss and VLC stays on the default output. The
-      # post-launch reload in launch_vlc_instance closes that race.
+      # by its window title (set via --video-title). Cross-output routing
+      # of fullscreen windows is done by cursor placement (see above), not
+      # this rule — MoveToOutput cannot move a fullscreen window in labwc.
       if [ "$mode" = "vlc" ]; then
         printf '    <windowRule title="%s" serverDecoration="no" skipTaskbar="yes" skipWindowSwitcher="yes">\n' "$cls"
       else
@@ -2904,6 +2958,7 @@ EOF
     emit_config_line WAYLAND_REROUTE_GRACE "${WAYLAND_REROUTE_GRACE:-60}"
     emit_config_line WAYLAND_REROUTE_SETTLE_TICKS "${WAYLAND_REROUTE_SETTLE_TICKS:-3}"
     emit_config_line WAYLAND_REROUTE_SETTLE_INTERVAL "${WAYLAND_REROUTE_SETTLE_INTERVAL:-4}"
+    emit_config_line WAYLAND_CURSOR_ROUTING "${WAYLAND_CURSOR_ROUTING:-auto}"
     emit_config_line FRIGATE_BIRDSEYE_AUTO_FILL "${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
     emit_config_line FRIGATE_BIRDSEYE_WIDTH  "${FRIGATE_BIRDSEYE_WIDTH:-}"
     emit_config_line FRIGATE_BIRDSEYE_HEIGHT "${FRIGATE_BIRDSEYE_HEIGHT:-}"
@@ -2998,6 +3053,7 @@ ensure_apt_dependencies() {
     [curl]=curl
     [grim]=grim
     [wlr-randr]=wlr-randr
+    [wlrctl]=wlrctl
     [python3]=python3
     [whiptail]=whiptail
     [flock]=util-linux
@@ -5253,6 +5309,10 @@ relaunch_all_instances() {
   # re-nudges a few times so a VLC surface that maps late (HEVC keyframe wait)
   # still gets routed. Wayland-only; no-op on X11.
   wayland_settle_reroute
+  # Placement done — park the cursor in the primary output's corner so it
+  # isn't resting in the middle of a feed. Safe now: every surface has had the
+  # settle window to map under its launch-time cursor position.
+  park_cursor
 }
 
 reload_instances() {

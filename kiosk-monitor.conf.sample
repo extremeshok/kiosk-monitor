@@ -130,6 +130,10 @@ OUTPUT_MISS_GRACE=3             # consecutive missed display polls before pausin
 WAYLAND_REROUTE_GRACE=60        # seconds post-(re)launch to re-nudge each tick; 0 = off
 WAYLAND_REROUTE_SETTLE_TICKS=3  # extra re-nudges in the post-launch settle
 WAYLAND_REROUTE_SETTLE_INTERVAL=4   # seconds between settle re-nudges
+# labwc MoveToOutput is a no-op on FULLSCREEN windows, so a fullscreen VLC is
+# routed to its HDMI by warping the pointer there before launch (placement
+# policy "cursor"). Needs the `wlrctl` package (installed by --install/--update).
+WAYLAND_CURSOR_ROUTING=auto     # auto | true | false
 SCREEN_DELAY=120                # skip freeze checks for first N seconds of runtime
 SCREEN_SAMPLE_MODE="sample"     # "sample" (top-left 50%) or "full"
 SCREEN_SAMPLE_BYTES=524288
