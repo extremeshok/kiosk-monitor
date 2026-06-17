@@ -28,7 +28,7 @@
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="6.12.2"
+SCRIPT_VERSION="6.12.3"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 
 # ------------------------------------------------------------------
@@ -252,6 +252,10 @@ WAYLAND_REROUTE_SETTLE_INTERVAL="${WAYLAND_REROUTE_SETTLE_INTERVAL:-4}"
 # alone cannot move a fullscreen VLC to the second HDMI. auto = enable on
 # multi-output Wayland when wlrctl is installed. Needs the `wlrctl` package.
 WAYLAND_CURSOR_ROUTING="${WAYLAND_CURSOR_ROUTING:-auto}"   # auto | true | false
+# Max seconds to wait for an instance's window to map before launching the next
+# one (so a slow/late map can't land on the next instance's output). Sized for
+# an HEVC stream's first-keyframe wait + software-decode spin-up.
+WAYLAND_MAP_TIMEOUT="${WAYLAND_MAP_TIMEOUT:-25}"
 
 # Log rotation (in-process, copy-truncate so the tee fd stays valid)
 LOG_MAX_BYTES="${LOG_MAX_BYTES:-2097152}"     # 2 MiB
@@ -1962,11 +1966,22 @@ launch_instance() {
   if [ "${#INSTANCES[@]}" -ge 2 ] && [ -n "${INSTANCE_OUTPUT[$id]:-}" ]; then
     warp_cursor_to_output "${INSTANCE_OUTPUT[$id]}"
   fi
+  local rc=0
   case "${INSTANCE_MODE[$id]}" in
-    chrome) launch_chrome_instance "$id" ;;
-    vlc)    launch_vlc_instance "$id" ;;
+    chrome) launch_chrome_instance "$id"; rc=$? ;;
+    vlc)    launch_vlc_instance "$id"; rc=$? ;;
     *)      log_instance "$id" "Unknown mode: ${INSTANCE_MODE[$id]}"; return 1 ;;
   esac
+  # Block until this window has actually mapped (under the cursor we just set)
+  # before the caller warps the cursor for the NEXT instance. Without this, a
+  # slow-mapping window (HEVC keyframe wait, slow RTSP connect, software-decode
+  # spin-up) maps only after the cursor has already moved on — and lands on the
+  # next instance's output, piling both feeds onto one screen and leaving the
+  # other on the desktop. Best-effort; bounded by WAYLAND_MAP_TIMEOUT.
+  if [ "${#INSTANCES[@]}" -ge 2 ] && [ -n "${INSTANCE_OUTPUT[$id]:-}" ]; then
+    wait_for_window_mapped "$id"
+  fi
+  return "$rc"
 }
 
 # wayland_settle_reroute: re-assert labwc window-rule routing a few times over
@@ -2021,6 +2036,21 @@ warp_cursor_to_output() {
 park_cursor() {
   cursor_routing_enabled || return 0
   as_gui wlrctl pointer move -20000 -20000 >/dev/null 2>&1 || true
+  return 0
+}
+
+# wait_for_window_mapped: block until the instance's toplevel exists, so the
+# caller can warp the cursor for the next instance without this (possibly
+# late-mapping) surface landing on the wrong output. wlrctl 'waitfor' returns
+# immediately if a match already exists; bounded by WAYLAND_MAP_TIMEOUT so a
+# window that never appears can't wedge startup. Wayland + cursor-routing only.
+wait_for_window_mapped() {
+  local id=$1
+  cursor_routing_enabled || return 0
+  local cls="${INSTANCE_CLASS[$id]:-}"; [ -n "$cls" ] || return 0
+  local match
+  if [ "${INSTANCE_MODE[$id]}" = "vlc" ]; then match="title:$cls"; else match="app_id:$cls"; fi
+  as_gui timeout "${WAYLAND_MAP_TIMEOUT:-25}" wlrctl toplevel waitfor "$match" >/dev/null 2>&1 || true
   return 0
 }
 
@@ -2959,6 +2989,7 @@ EOF
     emit_config_line WAYLAND_REROUTE_SETTLE_TICKS "${WAYLAND_REROUTE_SETTLE_TICKS:-3}"
     emit_config_line WAYLAND_REROUTE_SETTLE_INTERVAL "${WAYLAND_REROUTE_SETTLE_INTERVAL:-4}"
     emit_config_line WAYLAND_CURSOR_ROUTING "${WAYLAND_CURSOR_ROUTING:-auto}"
+    emit_config_line WAYLAND_MAP_TIMEOUT "${WAYLAND_MAP_TIMEOUT:-25}"
     emit_config_line FRIGATE_BIRDSEYE_AUTO_FILL "${FRIGATE_BIRDSEYE_AUTO_FILL:-false}"
     emit_config_line FRIGATE_BIRDSEYE_WIDTH  "${FRIGATE_BIRDSEYE_WIDTH:-}"
     emit_config_line FRIGATE_BIRDSEYE_HEIGHT "${FRIGATE_BIRDSEYE_HEIGHT:-}"

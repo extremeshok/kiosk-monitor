@@ -4,7 +4,7 @@ All notable changes to kiosk-monitor are recorded here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [6.12.2] — 2026-06-17
+## [6.12.3] — 2026-06-17
 
 ### Fixed
 
@@ -23,15 +23,24 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   output's corner once placement settles. Wayland + multi-output only; opt out
   with `WAYLAND_CURSOR_ROUTING=false`. The `MoveToOutput` rules are kept as a
   backup for non-fullscreen windows.
+- Serialized placement so multiple instances can't pile onto one screen. Each
+  launch now blocks (via `wlrctl toplevel waitfor`, bounded by
+  `WAYLAND_MAP_TIMEOUT`) until its window has mapped under the cursor before the
+  next instance's cursor warp. Without this, a slow-mapping window (HEVC
+  keyframe wait, software-decode spin-up) mapped only after the cursor had moved
+  on, landing on the next instance's output — both feeds on one screen, the
+  other left on the desktop.
 
 ### Added
 
 - `WAYLAND_CURSOR_ROUTING` (default `auto`) — place fullscreen windows on their
   output via cursor warping (`auto` = on for multi-output Wayland with `wlrctl`
   present; `true`/`false` to force).
+- `WAYLAND_MAP_TIMEOUT` (default `25`) — max seconds to wait for an instance's
+  window to map before launching the next one.
 - `wlrctl` is now installed by `--install`/`--update` (Wayland cursor routing).
-- `tests/test_cursor_routing.sh` — coverage for the cursor-routing gating and
-  pointer-target geometry.
+- `tests/test_cursor_routing.sh` — coverage for the cursor-routing gating,
+  pointer-target geometry, and the map-wait serialization.
 
 ## [6.12.1] — 2026-06-17
 

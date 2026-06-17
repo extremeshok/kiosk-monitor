@@ -15,11 +15,14 @@
 
 # shellcheck source=lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-load_functions cursor_routing_enabled warp_cursor_to_output park_cursor
+load_functions cursor_routing_enabled warp_cursor_to_output park_cursor wait_for_window_mapped
 
 declare -A OUTPUT_GEOMETRY=( [HDMI-A-1]="0 0 3840 2160" [HDMI-A-2]="3840 0 1600 900" )
+declare -A INSTANCE_CLASS=( [1]="kiosk-monitor-vlc-1" [2]="kiosk-monitor-vlc-2" [3]="kiosk-monitor-chrome-3" )
+declare -A INSTANCE_MODE=( [1]="vlc" [2]="vlc" [3]="chrome" )
 SESSION_TYPE="wayland"
 WAYLAND_CURSOR_ROUTING="auto"
+WAYLAND_MAP_TIMEOUT="25"
 
 # stub wlrctl so `command -v wlrctl` succeeds (as_gui is mocked, so it's never run)
 FAKEBIN=$(mktemp -d); printf '#!/usr/bin/env bash\n' >"$FAKEBIN/wlrctl"; chmod +x "$FAKEBIN/wlrctl"
@@ -74,5 +77,24 @@ assert_eq "wlrctl pointer move -20000 -20000" "$(last_call)"
 
 test_case "park is a no-op when routing disabled"
 WAYLAND_CURSOR_ROUTING="false"; reset; park_cursor
+assert_eq "0" "${#AS_GUI_CALLS[@]}"
+WAYLAND_CURSOR_ROUTING="auto"
+
+# --- wait_for_window_mapped -------------------------------------------
+test_case "wait matches a vlc instance by title with a timeout"
+reset; wait_for_window_mapped 2
+assert_eq "timeout 25 wlrctl toplevel waitfor title:kiosk-monitor-vlc-2" "$(last_call)"
+
+test_case "wait matches a chrome instance by app_id"
+reset; wait_for_window_mapped 3
+assert_eq "timeout 25 wlrctl toplevel waitfor app_id:kiosk-monitor-chrome-3" "$(last_call)"
+
+test_case "wait honors WAYLAND_MAP_TIMEOUT"
+WAYLAND_MAP_TIMEOUT="40"; reset; wait_for_window_mapped 1
+assert_eq "timeout 40 wlrctl toplevel waitfor title:kiosk-monitor-vlc-1" "$(last_call)"
+WAYLAND_MAP_TIMEOUT="25"
+
+test_case "wait is a no-op when routing disabled"
+WAYLAND_CURSOR_ROUTING="false"; reset; wait_for_window_mapped 2
 assert_eq "0" "${#AS_GUI_CALLS[@]}"
 WAYLAND_CURSOR_ROUTING="auto"
